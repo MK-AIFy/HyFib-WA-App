@@ -6,7 +6,7 @@ COPY package.json pnpm-workspace.yaml tsconfig.base.json ./
 COPY packages ./packages
 COPY services/conversation-service ./services/conversation-service
 
-RUN pnpm install --no-frozen-lockfile --filter @hyfib/conversation-service...
+RUN pnpm install --no-frozen-lockfile
 RUN pnpm --filter @hyfib/conversation-service... build
 
 FROM node:24-alpine
@@ -15,8 +15,7 @@ RUN addgroup -S app && adduser -S app -G app
 
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/packages ./packages
-COPY --from=build /app/services/conversation-service/package.json ./services/conversation-service/package.json
-COPY --from=build /app/services/conversation-service/dist ./services/conversation-service/dist
+COPY --from=build /app/services/conversation-service ./services/conversation-service
 
 USER app
 CMD ["node", "services/conversation-service/dist/index.js"]

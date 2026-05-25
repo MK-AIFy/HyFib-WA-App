@@ -44,13 +44,16 @@ cp .env.example .env
 2. Build and run:
 
 ```bash
-docker compose up --build
+docker compose up --build -d
+docker compose ps
 ```
 
 3. Check health:
 
 ```bash
-curl http://localhost:8080/health
+curl http://localhost:18080/health
+curl http://localhost:3001/health
+curl -A "Mozilla/5.0" http://localhost/health
 ```
 
 4. Open the web app:
@@ -58,6 +61,13 @@ curl http://localhost:8080/health
 ```bash
 open http://localhost
 ```
+
+5. Follow full onboarding and validation runbook:
+
+- [`docs/runbooks/whatsapp-marketing-number-onboarding.md`](docs/runbooks/whatsapp-marketing-number-onboarding.md)
+- Optional helper scripts:
+  - `scripts/bootstrap-marketing-number.sh`
+  - `scripts/local-runbook-e2e.sh`
 
 ## Important limitations
 
@@ -77,3 +87,4 @@ open http://localhost
 ## Automation Helper
 
 - `scripts/bootstrap-marketing-number.sh` bootstraps WABA subscribe/register/channel attach flow for a tenant.
+- `scripts/local-runbook-e2e.sh` runs local startup, tenant onboarding, WhatsApp onboarding, campaign dispatch, and validations.

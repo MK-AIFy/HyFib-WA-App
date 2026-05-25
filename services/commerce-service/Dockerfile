@@ -6,7 +6,7 @@ COPY package.json pnpm-workspace.yaml tsconfig.base.json ./
 COPY packages ./packages
 COPY services/commerce-service ./services/commerce-service
 
-RUN pnpm install --no-frozen-lockfile --filter @hyfib/commerce-service...
+RUN pnpm install --no-frozen-lockfile
 RUN pnpm --filter @hyfib/commerce-service... build
 
 FROM node:24-alpine
@@ -15,8 +15,7 @@ RUN addgroup -S app && adduser -S app -G app
 
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/packages ./packages
-COPY --from=build /app/services/commerce-service/package.json ./services/commerce-service/package.json
-COPY --from=build /app/services/commerce-service/dist ./services/commerce-service/dist
+COPY --from=build /app/services/commerce-service ./services/commerce-service
 
 USER app
 CMD ["node", "services/commerce-service/dist/index.js"]

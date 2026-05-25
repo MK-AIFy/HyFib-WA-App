@@ -6,7 +6,7 @@ COPY package.json pnpm-workspace.yaml tsconfig.base.json ./
 COPY packages ./packages
 COPY services/api-gateway ./services/api-gateway
 
-RUN pnpm install --no-frozen-lockfile --filter @hyfib/api-gateway...
+RUN pnpm install --no-frozen-lockfile
 RUN pnpm --filter @hyfib/api-gateway... build
 
 FROM node:24-alpine
@@ -15,8 +15,7 @@ RUN addgroup -S app && adduser -S app -G app
 
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/packages ./packages
-COPY --from=build /app/services/api-gateway/package.json ./services/api-gateway/package.json
-COPY --from=build /app/services/api-gateway/dist ./services/api-gateway/dist
+COPY --from=build /app/services/api-gateway ./services/api-gateway
 
 USER app
 CMD ["node", "services/api-gateway/dist/index.js"]

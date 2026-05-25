@@ -29,63 +29,45 @@ services:
     restart: unless-stopped
 
   postgres-primary:
-    image: bitnami/postgresql-repmgr:16
+    image: postgres:16-alpine
     container_name: postgres-primary
     environment:
-      - POSTGRESQL_POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - POSTGRESQL_USERNAME=${POSTGRES_USER}
-      - POSTGRESQL_PASSWORD=${POSTGRES_PASSWORD}
-      - POSTGRESQL_DATABASE=${POSTGRES_DB}
-      - REPMGR_PASSWORD=${POSTGRES_PASSWORD}
-      - REPMGR_PRIMARY_HOST=postgres-primary
-      - REPMGR_NODE_NAME=postgres-primary
-      - REPMGR_NODE_NETWORK_NAME=postgres-primary
-      - REPMGR_PARTNER_NODES=postgres-primary,postgres-standby,postgres-replica
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     volumes:
-      - pg_primary_data:/bitnami/postgresql
+      - pg_primary_data:/var/lib/postgresql/data
       - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
     networks:
       - data-net
     restart: unless-stopped
 
   postgres-standby:
-    image: bitnami/postgresql-repmgr:16
+    image: postgres:16-alpine
     container_name: postgres-standby
     environment:
-      - POSTGRESQL_POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - POSTGRESQL_USERNAME=${POSTGRES_USER}
-      - POSTGRESQL_PASSWORD=${POSTGRES_PASSWORD}
-      - POSTGRESQL_DATABASE=${POSTGRES_DB}
-      - REPMGR_PASSWORD=${POSTGRES_PASSWORD}
-      - REPMGR_PRIMARY_HOST=postgres-primary
-      - REPMGR_NODE_NAME=postgres-standby
-      - REPMGR_NODE_NETWORK_NAME=postgres-standby
-      - REPMGR_PARTNER_NODES=postgres-primary,postgres-standby,postgres-replica
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     depends_on:
       - postgres-primary
     volumes:
-      - pg_standby_data:/bitnami/postgresql
+      - pg_standby_data:/var/lib/postgresql/data
     networks:
       - data-net
     restart: unless-stopped
 
   postgres-replica:
-    image: bitnami/postgresql-repmgr:16
+    image: postgres:16-alpine
     container_name: postgres-replica
     environment:
-      - POSTGRESQL_POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - POSTGRESQL_USERNAME=${POSTGRES_USER}
-      - POSTGRESQL_PASSWORD=${POSTGRES_PASSWORD}
-      - POSTGRESQL_DATABASE=${POSTGRES_DB}
-      - REPMGR_PASSWORD=${POSTGRES_PASSWORD}
-      - REPMGR_PRIMARY_HOST=postgres-primary
-      - REPMGR_NODE_NAME=postgres-replica
-      - REPMGR_NODE_NETWORK_NAME=postgres-replica
-      - REPMGR_PARTNER_NODES=postgres-primary,postgres-standby,postgres-replica
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     depends_on:
       - postgres-primary
     volumes:
-      - pg_replica_data:/bitnami/postgresql
+      - pg_replica_data:/var/lib/postgresql/data
     networks:
       - data-net
     restart: unless-stopped
@@ -163,7 +145,7 @@ services:
     restart: unless-stopped
 
   minio:
-    image: minio/minio:RELEASE.2026-02-15T00-00-00Z
+    image: minio/minio:latest
     container_name: minio
     command: server /data --console-address ":9001"
     environment:
@@ -278,7 +260,7 @@ services:
       - notification-worker
       - meta-adapter
     ports:
-      - "8080:8080"
+      - "18080:8080"
     networks:
       - app-net
       - data-net

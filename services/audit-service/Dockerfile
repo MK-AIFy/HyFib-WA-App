@@ -6,7 +6,7 @@ COPY package.json pnpm-workspace.yaml tsconfig.base.json ./
 COPY packages ./packages
 COPY services/audit-service ./services/audit-service
 
-RUN pnpm install --no-frozen-lockfile --filter @hyfib/audit-service...
+RUN pnpm install --no-frozen-lockfile
 RUN pnpm --filter @hyfib/audit-service... build
 
 FROM node:24-alpine
@@ -15,8 +15,7 @@ RUN addgroup -S app && adduser -S app -G app
 
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/packages ./packages
-COPY --from=build /app/services/audit-service/package.json ./services/audit-service/package.json
-COPY --from=build /app/services/audit-service/dist ./services/audit-service/dist
+COPY --from=build /app/services/audit-service ./services/audit-service
 
 USER app
 CMD ["node", "services/audit-service/dist/index.js"]

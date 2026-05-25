@@ -6,7 +6,7 @@ COPY package.json pnpm-workspace.yaml tsconfig.base.json ./
 COPY packages ./packages
 COPY services/template-service ./services/template-service
 
-RUN pnpm install --no-frozen-lockfile --filter @hyfib/template-service...
+RUN pnpm install --no-frozen-lockfile
 RUN pnpm --filter @hyfib/template-service... build
 
 FROM node:24-alpine
@@ -15,8 +15,7 @@ RUN addgroup -S app && adduser -S app -G app
 
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/packages ./packages
-COPY --from=build /app/services/template-service/package.json ./services/template-service/package.json
-COPY --from=build /app/services/template-service/dist ./services/template-service/dist
+COPY --from=build /app/services/template-service ./services/template-service
 
 USER app
 CMD ["node", "services/template-service/dist/index.js"]
