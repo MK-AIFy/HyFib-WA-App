@@ -1,0 +1,459 @@
+services:
+  edge-proxy:
+    image: nginx:1.27-alpine
+    container_name: edge-proxy
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - api-gateway
+      - web-portal
+    networks:
+      - dmz-net
+      - app-net
+    restart: unless-stopped
+
+  web-portal:
+    build:
+      context: .
+      dockerfile: services/web-portal/Dockerfile
+    container_name: web-portal
+    env_file:
+      - .env
+    ports:
+      - "3001:3000"
+    networks:
+      - app-net
+    restart: unless-stopped
+
+  postgres-primary:
+    image: bitnami/postgresql-repmgr:16
+    container_name: postgres-primary
+    environment:
+      - POSTGRESQL_POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRESQL_USERNAME=${POSTGRES_USER}
+      - POSTGRESQL_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRESQL_DATABASE=${POSTGRES_DB}
+      - REPMGR_PASSWORD=${POSTGRES_PASSWORD}
+      - REPMGR_PRIMARY_HOST=postgres-primary
+      - REPMGR_NODE_NAME=postgres-primary
+      - REPMGR_NODE_NETWORK_NAME=postgres-primary
+      - REPMGR_PARTNER_NODES=postgres-primary,postgres-standby,postgres-replica
+    volumes:
+      - pg_primary_data:/bitnami/postgresql
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - data-net
+    restart: unless-stopped
+
+  postgres-standby:
+    image: bitnami/postgresql-repmgr:16
+    container_name: postgres-standby
+    environment:
+      - POSTGRESQL_POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRESQL_USERNAME=${POSTGRES_USER}
+      - POSTGRESQL_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRESQL_DATABASE=${POSTGRES_DB}
+      - REPMGR_PASSWORD=${POSTGRES_PASSWORD}
+      - REPMGR_PRIMARY_HOST=postgres-primary
+      - REPMGR_NODE_NAME=postgres-standby
+      - REPMGR_NODE_NETWORK_NAME=postgres-standby
+      - REPMGR_PARTNER_NODES=postgres-primary,postgres-standby,postgres-replica
+    depends_on:
+      - postgres-primary
+    volumes:
+      - pg_standby_data:/bitnami/postgresql
+    networks:
+      - data-net
+    restart: unless-stopped
+
+  postgres-replica:
+    image: bitnami/postgresql-repmgr:16
+    container_name: postgres-replica
+    environment:
+      - POSTGRESQL_POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRESQL_USERNAME=${POSTGRES_USER}
+      - POSTGRESQL_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRESQL_DATABASE=${POSTGRES_DB}
+      - REPMGR_PASSWORD=${POSTGRES_PASSWORD}
+      - REPMGR_PRIMARY_HOST=postgres-primary
+      - REPMGR_NODE_NAME=postgres-replica
+      - REPMGR_NODE_NETWORK_NAME=postgres-replica
+      - REPMGR_PARTNER_NODES=postgres-primary,postgres-standby,postgres-replica
+    depends_on:
+      - postgres-primary
+    volumes:
+      - pg_replica_data:/bitnami/postgresql
+    networks:
+      - data-net
+    restart: unless-stopped
+
+  redis-master:
+    image: redis:7.4-alpine
+    container_name: redis-master
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}"]
+    volumes:
+      - redis_master_data:/data
+    networks:
+      - data-net
+    restart: unless-stopped
+
+  redis-replica:
+    image: redis:7.4-alpine
+    container_name: redis-replica
+    command: ["redis-server", "--replicaof", "redis-master", "6379", "--masterauth", "${REDIS_PASSWORD}", "--requirepass", "${REDIS_PASSWORD}"]
+    depends_on:
+      - redis-master
+    volumes:
+      - redis_replica_data:/data
+    networks:
+      - data-net
+    restart: unless-stopped
+
+  redis-sentinel-1:
+    image: redis:7.4-alpine
+    container_name: redis-sentinel-1
+    command: ["sh", "-c", "redis-sentinel /etc/redis/sentinel.conf"]
+    volumes:
+      - ./infra/redis/sentinel.conf:/etc/redis/sentinel.conf:ro
+    depends_on:
+      - redis-master
+    networks:
+      - data-net
+    restart: unless-stopped
+
+  redis-sentinel-2:
+    image: redis:7.4-alpine
+    container_name: redis-sentinel-2
+    command: ["sh", "-c", "redis-sentinel /etc/redis/sentinel.conf"]
+    volumes:
+      - ./infra/redis/sentinel.conf:/etc/redis/sentinel.conf:ro
+    depends_on:
+      - redis-master
+    networks:
+      - data-net
+    restart: unless-stopped
+
+  redis-sentinel-3:
+    image: redis:7.4-alpine
+    container_name: redis-sentinel-3
+    command: ["sh", "-c", "redis-sentinel /etc/redis/sentinel.conf"]
+    volumes:
+      - ./infra/redis/sentinel.conf:/etc/redis/sentinel.conf:ro
+    depends_on:
+      - redis-master
+    networks:
+      - data-net
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    ports:
+      - "15672:15672"
+    networks:
+      - data-net
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:RELEASE.2026-02-15T00-00-00Z
+    container_name: minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    networks:
+      - data-net
+    restart: unless-stopped
+
+  opensearch:
+    image: opensearchproject/opensearch:2.18.0
+    container_name: opensearch
+    environment:
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+      - DISABLE_SECURITY_PLUGIN=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+    ports:
+      - "9200:9200"
+    networks:
+      - data-net
+    restart: unless-stopped
+
+  vault:
+    image: hashicorp/vault:1.18
+    container_name: vault
+    cap_add:
+      - IPC_LOCK
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_DEV_ROOT_TOKEN_ID}
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    command: vault server -dev
+    ports:
+      - "8200:8200"
+    networks:
+      - app-net
+      - data-net
+    restart: unless-stopped
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.1
+    container_name: keycloak
+    command: start-dev
+    environment:
+      KC_DB: postgres
+      KC_DB_URL_HOST: postgres-primary
+      KC_DB_URL_DATABASE: ${POSTGRES_DB}
+      KC_DB_USERNAME: ${POSTGRES_USER}
+      KC_DB_PASSWORD: ${POSTGRES_PASSWORD}
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+    ports:
+      - "8081:8080"
+    depends_on:
+      - postgres-primary
+    networks:
+      - app-net
+      - data-net
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    container_name: prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - app-net
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: grafana
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    networks:
+      - app-net
+    restart: unless-stopped
+
+  api-gateway:
+    build:
+      context: .
+      dockerfile: services/api-gateway/Dockerfile
+    container_name: api-gateway
+    env_file:
+      - .env
+    depends_on:
+      - rabbitmq
+      - redis-master
+      - postgres-primary
+      - campaign-service
+      - webhook-ingestor
+      - notification-worker
+      - meta-adapter
+    ports:
+      - "8080:8080"
+    networks:
+      - app-net
+      - data-net
+    restart: unless-stopped
+
+  auth-service:
+    build:
+      context: .
+      dockerfile: services/auth-service/Dockerfile
+    env_file:
+      - .env
+    networks:
+      - app-net
+    restart: unless-stopped
+
+  tenant-service:
+    build:
+      context: .
+      dockerfile: services/tenant-service/Dockerfile
+    env_file:
+      - .env
+    networks:
+      - app-net
+      - data-net
+    restart: unless-stopped
+
+  contact-service:
+    build:
+      context: .
+      dockerfile: services/contact-service/Dockerfile
+    env_file:
+      - .env
+    networks:
+      - app-net
+      - data-net
+    restart: unless-stopped
+
+  conversation-service:
+    build:
+      context: .
+      dockerfile: services/conversation-service/Dockerfile
+    env_file:
+      - .env
+    networks:
+      - app-net
+      - data-net
+    restart: unless-stopped
+
+  campaign-service:
+    build:
+      context: .
+      dockerfile: services/campaign-service/Dockerfile
+    env_file:
+      - .env
+    depends_on:
+      - rabbitmq
+    networks:
+      - app-net
+      - data-net
+    restart: unless-stopped
+
+  template-service:
+    build:
+      context: .
+      dockerfile: services/template-service/Dockerfile
+    env_file:
+      - .env
+    networks:
+      - app-net
+      - data-net
+    restart: unless-stopped
+
+  commerce-service:
+    build:
+      context: .
+      dockerfile: services/commerce-service/Dockerfile
+    env_file:
+      - .env
+    networks:
+      - app-net
+      - data-net
+    restart: unless-stopped
+
+  billing-usage-service:
+    build:
+      context: .
+      dockerfile: services/billing-usage-service/Dockerfile
+    env_file:
+      - .env
+    networks:
+      - app-net
+      - data-net
+    restart: unless-stopped
+
+  reporting-service:
+    build:
+      context: .
+      dockerfile: services/reporting-service/Dockerfile
+    env_file:
+      - .env
+    networks:
+      - app-net
+      - data-net
+    restart: unless-stopped
+
+  audit-service:
+    build:
+      context: .
+      dockerfile: services/audit-service/Dockerfile
+    env_file:
+      - .env
+    networks:
+      - app-net
+      - data-net
+    restart: unless-stopped
+
+  meta-adapter:
+    build:
+      context: .
+      dockerfile: services/meta-adapter/Dockerfile
+    env_file:
+      - .env
+    networks:
+      - app-net
+      - data-net
+    restart: unless-stopped
+
+  webhook-ingestor:
+    build:
+      context: .
+      dockerfile: services/webhook-ingestor/Dockerfile
+    env_file:
+      - .env
+    networks:
+      - app-net
+      - data-net
+    restart: unless-stopped
+
+  notification-worker:
+    build:
+      context: .
+      dockerfile: services/notification-worker/Dockerfile
+    env_file:
+      - .env
+    depends_on:
+      - rabbitmq
+    networks:
+      - app-net
+      - data-net
+    restart: unless-stopped
+
+  ai-intelligence-service:
+    build:
+      context: .
+      dockerfile: services/ai-intelligence-service/Dockerfile
+    env_file:
+      - .env
+    networks:
+      - app-net
+      - data-net
+    restart: unless-stopped
+
+networks:
+  dmz-net:
+  app-net:
+  data-net:
+
+volumes:
+  pg_primary_data:
+  pg_standby_data:
+  pg_replica_data:
+  redis_master_data:
+  redis_replica_data:
+  rabbitmq_data:
+  minio_data:
+  opensearch_data:
+  prometheus_data:
+  grafana_data:

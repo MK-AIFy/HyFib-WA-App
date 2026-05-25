@@ -1,0 +1,15 @@
+node_modules
+.pnpm-store
+.env
+.env.*
+!.env.example
+dist
+coverage
+.tmp
+.vscode
+.DS_Store
+.idea
+*.log
+infra/certs/*.key
+infra/certs/*.crt
+infra/certs/*.pem

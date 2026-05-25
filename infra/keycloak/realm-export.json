@@ -1,0 +1,15 @@
+{
+  "realm": "hyfib-wa",
+  "enabled": true,
+  "roles": {
+    "realm": [
+      { "name": "platform_owner" },
+      { "name": "tenant_admin" },
+      { "name": "marketing_manager" },
+      { "name": "sales_agent" },
+      { "name": "support_agent" },
+      { "name": "analyst" },
+      { "name": "compliance_auditor" }
+    ]
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "name": "@hyfib/policy-engine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test",
+    "lint": "echo 'No lint configured for @hyfib/policy-engine'"
+  },
+  "dependencies": {
+    "@hyfib/shared-core": "workspace:*"
+  }
+}
