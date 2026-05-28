@@ -18,4 +18,6 @@ COPY --from=build /app/packages ./packages
 COPY --from=build /app/services/notification-worker ./services/notification-worker
 
 USER app
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=5 \
+  CMD node -e "fetch('http://127.0.0.1:8094/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 CMD ["node", "services/notification-worker/dist/index.js"]

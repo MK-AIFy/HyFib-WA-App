@@ -1,6 +1,7 @@
 {
   "realm": "hyfib-wa",
   "enabled": true,
+  "sslRequired": "external",
   "roles": {
     "realm": [
       { "name": "platform_owner" },
@@ -11,5 +12,47 @@
       { "name": "analyst" },
       { "name": "compliance_auditor" }
     ]
-  }
+  },
+  "clients": [
+    {
+      "clientId": "hyfib-platform",
+      "name": "HyFib WhatsApp Platform",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": false,
+      "redirectUris": ["*"],
+      "webOrigins": ["+"],
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
+      "protocolMappers": [
+        {
+          "name": "audience-hyfib-platform",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.client.audience": "hyfib-platform",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        },
+        {
+          "name": "tenant-id",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "config": {
+            "user.attribute": "tenant_id",
+            "claim.name": "tenant_id",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ]
 }

@@ -1,0 +1,21 @@
+{
+  "name": "@hyfib/persistence",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test",
+    "lint": "echo 'No lint configured for @hyfib/persistence'"
+  },
+  "dependencies": {
+    "@hyfib/config": "workspace:*",
+    "@hyfib/shared-core": "workspace:*",
+    "pg": "8.13.1"
+  },
+  "devDependencies": {
+    "@types/pg": "8.11.10"
+  }
+}

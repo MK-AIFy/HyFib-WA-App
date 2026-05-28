@@ -13,3 +13,6 @@ coverage
 infra/certs/*.key
 infra/certs/*.crt
 infra/certs/*.pem
+infra/nginx/certs/*.key
+infra/nginx/certs/*.crt
+infra/nginx/certs/*.pem

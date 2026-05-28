@@ -13,7 +13,9 @@
     "lint": "echo 'No lint configured for @hyfib/api-gateway'"
   },
   "dependencies": {
+    "@hyfib/auth": "workspace:*",
     "@hyfib/config": "workspace:*",
+    "@hyfib/persistence": "workspace:*",
     "@hyfib/policy-engine": "workspace:*",
     "@hyfib/shared-core": "workspace:*"
   }

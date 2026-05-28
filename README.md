@@ -33,34 +33,61 @@ Web entrypoint:
 
 - `/` via `web-portal` (proxied by `edge-proxy`)
 
+## Architecture (consolidated)
+
+Real logic is concentrated in a small set of services that are simple to run
+and secure on a single on-prem host:
+
+- `api-gateway` — authenticated, PostgreSQL-backed core API (tenants, users,
+  channels, templates, campaigns, contacts, orders, analytics, audit, webhooks).
+- `meta-adapter` — WhatsApp Cloud API integration.
+- `webhook-ingestor` — inbound webhook ingestion with HMAC verification.
+- `notification-worker` — template send execution.
+- `ai-intelligence-service` — internal backoffice intelligence.
+- `web-portal` — operator UI.
+
+Authentication is performed against **Keycloak (OIDC/JWT)**; the gateway derives
+tenant and roles from signed token claims (no header trust). All tenant data is
+stored in PostgreSQL with **row-level security**, enforced by connecting as a
+dedicated non-superuser role (`hyfib_app`).
+
 ## Quick start
 
-1. Copy configuration:
+1. Copy configuration and set non-default secrets (required in production):
 
 ```bash
 cp .env.example .env
+# Edit .env: set POSTGRES_PASSWORD, POSTGRES_APP_PASSWORD, REDIS_PASSWORD,
+# META_APP_SECRET, WEBHOOK_VERIFY_TOKEN, KEYCLOAK_ADMIN_PASSWORD, etc.
 ```
 
-2. Build and run:
+2. Generate a TLS certificate for the edge proxy (self-signed for local use;
+   provision a CA-signed cert for production):
+
+```bash
+./scripts/generate-dev-tls-cert.sh
+```
+
+3. Build and run:
 
 ```bash
 docker compose up --build -d
 docker compose ps
 ```
 
-3. Check health:
+4. Check health:
 
 ```bash
-curl http://localhost:18080/health
-curl http://localhost:3001/health
-curl -A "Mozilla/5.0" http://localhost/health
+curl -k https://localhost/health        # via edge proxy (TLS)
+curl http://localhost:18080/health      # api-gateway direct (DB-backed)
 ```
 
-4. Open the web app:
+5. Open the web app: `https://localhost`
 
-```bash
-open http://localhost
-```
+> Note: `/api/v1/*` endpoints require a valid Keycloak bearer token
+> (`Authorization: Bearer <jwt>`) carrying realm roles and a `tenant_id` claim.
+> For local development only, set `AUTH_ENABLED=false` to fall back to
+> `x-role` / `x-tenant-id` headers — never do this in production.
 
 5. Follow full onboarding and validation runbook:
 
@@ -71,9 +98,19 @@ open http://localhost
 
 ## Important limitations
 
-- This repo provides a production-ready foundation and contracts, not a complete finished business workflow for every vertical.
-- Database HA topology in Compose is reference-oriented for lab/staging and must be hardened for your real on-prem environment.
-- Integrations (Meta, Keycloak, Vault, SIEM, SMTP, payment providers) require environment-specific credentials and network controls.
+- The core platform (auth + persistence + WhatsApp marketing dispatch) is
+  implemented and tested at the unit level. End-to-end validation requires a
+  running stack (PostgreSQL, Keycloak, Meta credentials).
+- Inter-service eventing still uses an in-memory bus; `RabbitMqEventBus` is a
+  placeholder pending durable-transport wiring (see operational gaps doc).
+- Database HA topology in Compose is reference-oriented for lab/staging and must
+  be hardened for your real on-prem environment.
+- Vault runs in dev mode and Keycloak in `start-dev`; both must be moved to
+  production modes (integrated storage / `start`) before go-live.
+- Integrations (Meta, Keycloak, Vault, SIEM, SMTP, payment providers) require
+  environment-specific credentials and network controls.
+- The helper scripts under `scripts/` predate JWT auth and assume
+  `AUTH_ENABLED=false`; update them to obtain a Keycloak token before use.
 
 ## Documentation
 

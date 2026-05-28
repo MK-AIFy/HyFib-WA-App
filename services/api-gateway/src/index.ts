@@ -1,7 +1,23 @@
-import { createServer } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { evaluateOutboundPolicy } from "@hyfib/policy-engine";
 import { loadConfig } from "@hyfib/config";
+import { createAuthenticator, hasAnyRole, AuthError, type AuthContext } from "@hyfib/auth";
+import {
+  auditRepository,
+  campaignRepository,
+  channelRepository,
+  closePool,
+  contactRepository,
+  conversationRepository,
+  healthCheck,
+  orderRepository,
+  templateRepository,
+  tenantAnalytics,
+  tenantRepository,
+  userRepository,
+  type CampaignWithTemplate
+} from "@hyfib/persistence";
 import {
   IdempotencyStore,
   Logger,
@@ -12,14 +28,8 @@ import {
   requestContext,
   sendJson,
   verifyMetaSignature,
-  type AuditEvent,
-  type Campaign,
-  type Contact,
   type Role,
-  type Template,
-  type Tenant,
-  type User,
-  type WhatsAppChannel
+  type Template
 } from "@hyfib/shared-core";
 
 interface CreateTenantRequest {
@@ -48,9 +58,6 @@ interface CreateTemplateRequest {
 interface CreateCampaignRequest {
   name: string;
   templateId: string;
-  templateName: string;
-  templateLanguage: string;
-  templateCategory: "marketing" | "utility" | "authentication" | "service";
 }
 
 interface DispatchCampaignRequest {
@@ -88,137 +95,104 @@ interface CreateOrderRequest {
 
 const config = loadConfig();
 const logger = new Logger("api-gateway", config.logLevel as "debug" | "info" | "warn" | "error");
-
+const authenticator = createAuthenticator(config);
 const webhookIdempotency = new IdempotencyStore(24 * 60 * 60 * 1000);
 
-const tenants = new Map<string, Tenant>();
-const users = new Map<string, User>();
-const channels = new Map<string, WhatsAppChannel>();
-const templates = new Map<string, Template>();
-const campaigns = new Map<string, Campaign & { templateName: string; templateLanguage: string }>();
-const contacts = new Map<string, Contact>();
-const orders = new Map<string, Record<string, unknown>>();
-const auditEvents: AuditEvent[] = [];
+const E164 = /^\+[1-9]\d{7,14}$/;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-function requireRole(rawRoleHeader: string | string[] | undefined, allowed: Role[]): { allowed: boolean; role?: Role } {
-  const role = typeof rawRoleHeader === "string" ? (rawRoleHeader as Role) : undefined;
-  if (!role || !allowed.includes(role)) {
-    return { allowed: false };
+if (!config.authEnabled) {
+  logger.warn("auth_disabled_dev_mode", {
+    message: "AUTH_ENABLED=false — caller identity is taken from headers. Never use this in production."
+  });
+}
+
+function applySecurityHeaders(res: ServerResponse): void {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Strict-Transport-Security", "max-age=63072000; includeSubDomains");
+  res.setHeader("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'");
+  res.setHeader("Cache-Control", "no-store");
+}
+
+/**
+ * Resolves the caller identity. In normal operation this verifies the
+ * Keycloak-issued JWT and derives tenant + roles from signed claims. The
+ * header-based path is only reachable when AUTH_ENABLED=false (local dev).
+ */
+async function resolveAuth(req: IncomingMessage): Promise<AuthContext> {
+  if (config.authEnabled) {
+    return authenticator.authenticate(req.headers["authorization"]);
   }
-  return { allowed: true, role };
+  const roleHeader = req.headers["x-role"];
+  const roles = (typeof roleHeader === "string" ? roleHeader.split(",") : [])
+    .map((value) => value.trim())
+    .filter((value): value is Role => value.length > 0) as Role[];
+  const tenantId = typeof req.headers["x-tenant-id"] === "string" ? (req.headers["x-tenant-id"] as string) : undefined;
+  const actorId = typeof req.headers["x-actor-id"] === "string" ? (req.headers["x-actor-id"] as string) : undefined;
+  return { subject: actorId ?? "dev-subject", tenantId, roles };
 }
 
-function generateId(prefix: string): string {
-  return `${prefix}_${randomUUID().replace(/-/g, "")}`;
+function asActorUuid(subject: string): string | undefined {
+  return UUID.test(subject) ? subject : undefined;
 }
 
-function addAudit(event: Omit<AuditEvent, "id" | "createdAt">): void {
-  auditEvents.push({
-    ...event,
-    id: generateId("audit"),
-    createdAt: new Date().toISOString()
-  });
-}
-
-function tenantRecords<T extends { tenantId: string }>(map: Map<string, T>, tenantId: string): T[] {
-  return [...map.values()].filter((item) => item.tenantId === tenantId);
-}
-
-async function forwardWebhook(rawBody: string, signature: string, tenantId?: string): Promise<Response> {
-  return fetch(`${config.webhookIngestorUrl}/internal/v1/webhooks/meta/whatsapp`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-request-id": randomUUID()
-    },
-    body: JSON.stringify({
-      rawBody,
-      signature,
-      tenantId
-    })
-  });
+async function audit(
+  tenantId: string,
+  ctx: AuthContext,
+  event: { action: string; resourceType: string; resourceId?: string; payload: Record<string, unknown> }
+): Promise<void> {
+  try {
+    await auditRepository.add(tenantId, { actorId: asActorUuid(ctx.subject), ...event });
+  } catch (error) {
+    logger.error("audit_write_failed", {
+      action: event.action,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
 }
 
 async function dispatchCampaign(
   tenantId: string,
-  campaignId: string,
-  payload: DispatchCampaignRequest,
+  campaign: CampaignWithTemplate,
   template: Template,
-  campaign: Campaign & { templateName: string; templateLanguage: string }
+  payload: DispatchCampaignRequest
 ): Promise<{ status: number; body: Record<string, unknown> }> {
+  // Defence in depth: honour the opt-out we have on record regardless of the caller's flag.
+  const knownContact = await contactRepository.findByPhone(tenantId, payload.contactPhoneE164);
+  const isOptedOut = payload.isOptedOut || (knownContact?.optedOut ?? false);
+
   const policy = evaluateOutboundPolicy({
     hasActiveConsent: payload.hasActiveConsent,
     isInside24hWindow: payload.isInside24hWindow,
     template,
     requestedCategory: campaign.templateCategory,
-    isOptedOut: payload.isOptedOut,
+    isOptedOut,
     currentHourLocal: payload.currentHourLocal,
     quietHours: payload.quietHours,
     frequencyCap: payload.frequencyCap
   });
 
   if (!policy.allowed) {
-    return {
-      status: 422,
-      body: {
-        error: "campaign_blocked_by_policy",
-        reason: policy.reason
-      }
-    };
+    return { status: 422, body: { error: "campaign_blocked_by_policy", reason: policy.reason } };
   }
 
-  const selectedChannel = tenantRecords(channels, tenantId)[0];
-  if (!selectedChannel) {
-    return {
-      status: 409,
-      body: {
-        error: "No WhatsApp channel configured for tenant"
-      }
-    };
+  const channel = await channelRepository.firstActive(tenantId);
+  if (!channel) {
+    return { status: 409, body: { error: "No active WhatsApp channel configured for tenant" } };
   }
 
-  const campaignDispatchResponse = await fetch(`${config.campaignServicePort ? "http://campaign-service:" + config.campaignServicePort : "http://campaign-service:8086"}/internal/v1/campaigns/${campaignId}/dispatch`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-tenant-id": tenantId,
-      "x-request-id": randomUUID()
-    },
-    body: JSON.stringify({
-      channelId: selectedChannel.id,
-      contactPhoneE164: payload.contactPhoneE164,
-      parameters: payload.parameters ?? [],
-      hasActiveConsent: payload.hasActiveConsent,
-      isOptedOut: payload.isOptedOut,
-      isInside24hWindow: payload.isInside24hWindow,
-      currentHourLocal: payload.currentHourLocal,
-      quietHours: payload.quietHours,
-      frequencyCap: payload.frequencyCap
-    })
-  });
-
-  const campaignDispatchBody = (await campaignDispatchResponse.json()) as Record<string, unknown>;
-
-  if (!campaignDispatchResponse.ok) {
-    return {
-      status: campaignDispatchResponse.status,
-      body: {
-        error: "campaign_service_rejected",
-        details: campaignDispatchBody
-      }
-    };
-  }
-
-  const workerResponse = await fetch(`${config.notificationWorkerPort ? "http://notification-worker:" + config.notificationWorkerPort : "http://notification-worker:8094"}/internal/v1/dispatch/campaign`, {
+  const workerResponse = await fetch(`${config.notificationWorkerUrl}/internal/v1/dispatch/campaign`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "x-request-id": randomUUID()
     },
     body: JSON.stringify({
-      campaignId,
+      campaignId: campaign.id,
       tenantId,
-      channelId: selectedChannel.id,
+      channelId: channel.id,
       templateName: campaign.templateName,
       templateLanguage: campaign.templateLanguage,
       templateCategory: campaign.templateCategory,
@@ -228,575 +202,419 @@ async function dispatchCampaign(
   });
 
   const workerBody = (await workerResponse.json()) as Record<string, unknown>;
+  if (workerResponse.ok) {
+    await campaignRepository.setStatus(tenantId, campaign.id, "running");
+  }
 
   return {
     status: workerResponse.status,
-    body: {
-      status: "dispatch_triggered",
-      campaign: campaignDispatchBody,
-      notification: workerBody
-    }
+    body: { status: "dispatch_triggered", notification: workerBody }
   };
 }
 
-const server = createServer(async (req, res) => {
+async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const method = req.method ?? "GET";
   const path = parseUrlPath(req.url);
   const ctx = requestContext(req);
-  const roleCheck = requireRole(req.headers["x-role"], [
-    "platform_owner",
-    "tenant_admin",
-    "marketing_manager",
-    "sales_agent",
-    "support_agent",
-    "analyst",
-    "compliance_auditor"
-  ]);
 
   if (path === "/health") {
-    sendJson(res, 200, {
+    let db = false;
+    try {
+      db = await healthCheck();
+    } catch {
+      db = false;
+    }
+    sendJson(res, db ? 200 : 503, {
       service: "api-gateway",
-      status: "ok",
-      timestamp: new Date().toISOString(),
-      tenants: tenants.size,
-      users: users.size
+      status: db ? "ok" : "degraded",
+      database: db,
+      timestamp: new Date().toISOString()
     });
     return;
   }
 
+  // Webhook verification handshake (Meta calls this with a verify token).
   if (path === "/api/v1/webhooks/meta/whatsapp" && method === "GET") {
     const query = parseQuery(req.url);
-    const mode = query.get("hub.mode");
-    const token = query.get("hub.verify_token");
-    const challenge = query.get("hub.challenge");
-
-    if (mode === "subscribe" && token === config.webhookVerifyToken && challenge) {
+    if (
+      query.get("hub.mode") === "subscribe" &&
+      query.get("hub.verify_token") === config.webhookVerifyToken &&
+      query.get("hub.challenge")
+    ) {
       res.statusCode = 200;
       res.setHeader("Content-Type", "text/plain; charset=utf-8");
-      res.end(challenge);
+      res.end(query.get("hub.challenge")!);
       return;
     }
-
-    sendJson(res, 403, {
-      error: "Webhook verification failed"
-    });
+    sendJson(res, 403, { error: "Webhook verification failed" });
     return;
   }
 
+  // Inbound webhook: authenticated by HMAC signature, not by JWT.
   if (path === "/api/v1/webhooks/meta/whatsapp" && method === "POST") {
     const signature = req.headers["x-hub-signature-256"];
     const normalizedSignature = typeof signature === "string" ? signature : undefined;
-
     if (!normalizedSignature) {
       sendJson(res, 401, { error: "Missing x-hub-signature-256 header" });
       return;
     }
-
     const rawBody = await readRawBody(req);
-
     if (!verifyMetaSignature(rawBody, normalizedSignature, config.metaAppSecret)) {
       sendJson(res, 401, { error: "Invalid webhook signature" });
       return;
     }
-
-    const idempotencyKey = `webhook:${normalizedSignature}`;
-    if (webhookIdempotency.isDuplicate(idempotencyKey)) {
-      sendJson(res, 200, {
-        status: "duplicate_ignored"
-      });
+    if (webhookIdempotency.isDuplicate(`webhook:${normalizedSignature}`)) {
+      sendJson(res, 200, { status: "duplicate_ignored" });
       return;
     }
-
-    const proxyResponse = await forwardWebhook(rawBody, normalizedSignature);
-    const proxyBody = (await proxyResponse.json()) as Record<string, unknown>;
-
-    sendJson(res, proxyResponse.ok ? 200 : 502, {
-      requestId: ctx.requestId,
-      upstream: proxyBody
+    const proxyResponse = await fetch(`${config.webhookIngestorUrl}/internal/v1/webhooks/meta/whatsapp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-request-id": randomUUID() },
+      body: JSON.stringify({ rawBody, signature: normalizedSignature })
     });
+    const proxyBody = (await proxyResponse.json()) as Record<string, unknown>;
+    sendJson(res, proxyResponse.ok ? 200 : 502, { requestId: ctx.requestId, upstream: proxyBody });
     return;
   }
 
-  if (path.startsWith("/api/v1/") && !roleCheck.allowed) {
-    sendJson(res, 403, {
-      error: "Missing or unauthorized x-role"
-    });
+  if (!path.startsWith("/api/v1/")) {
+    sendJson(res, 404, { error: "route_not_found", method, path, requestId: ctx.requestId });
+    return;
+  }
+
+  // Everything under /api/v1 requires an authenticated, role-bearing caller.
+  let auth: AuthContext;
+  try {
+    auth = await resolveAuth(req);
+  } catch (error) {
+    const status = error instanceof AuthError ? error.status : 401;
+    sendJson(res, status, { error: "unauthenticated", detail: error instanceof Error ? error.message : "auth failed" });
+    return;
+  }
+
+  if (auth.roles.length === 0) {
+    sendJson(res, 403, { error: "no_roles_assigned" });
     return;
   }
 
   if (path === "/api/v1/tenants") {
     if (method === "GET") {
-      sendJson(res, 200, { items: [...tenants.values()] });
+      if (!hasAnyRole(auth, ["platform_owner"])) {
+        sendJson(res, 403, { error: "Only platform_owner can list tenants" });
+        return;
+      }
+      sendJson(res, 200, { items: await tenantRepository.list() });
       return;
     }
-
     if (method === "POST") {
-      const createCheck = requireRole(req.headers["x-role"], ["platform_owner"]);
-      if (!createCheck.allowed) {
+      if (!hasAnyRole(auth, ["platform_owner"])) {
         sendJson(res, 403, { error: "Only platform_owner can create tenants" });
         return;
       }
-
       const payload = await readJsonBody<CreateTenantRequest>(req);
-      if (!payload.name) {
+      if (!payload.name?.trim()) {
         sendJson(res, 400, { error: "name is required" });
         return;
       }
-
-      const tenant: Tenant = {
-        id: generateId("tenant"),
-        name: payload.name,
-        status: "active",
-        createdAt: new Date().toISOString()
-      };
-
-      tenants.set(tenant.id, tenant);
-      addAudit({
-        tenantId: tenant.id,
-        actorId: ctx.actorId,
+      const tenant = await tenantRepository.create(payload.name.trim());
+      await audit(tenant.id, auth, {
         action: "tenant.created",
         resourceType: "Tenant",
         resourceId: tenant.id,
-        payload: payload as unknown as Record<string, unknown>
+        payload: { name: tenant.name }
       });
-
-      sendJson(res, 201, tenant as unknown as Record<string, unknown>);
+      sendJson(res, 201, { ...tenant });
       return;
     }
-
     sendJson(res, 405, { error: "Method not allowed" });
     return;
   }
 
+  // Remaining routes operate within the caller's tenant, taken from the token.
+  const tenantId = auth.tenantId;
+  if (!tenantId) {
+    sendJson(res, 403, { error: "Token is missing tenant_id claim" });
+    return;
+  }
+
   if (path === "/api/v1/users") {
-    const tenantId = ctx.tenantId;
-    if (!tenantId) {
-      sendJson(res, 400, { error: "Missing x-tenant-id" });
-      return;
-    }
-
     if (method === "GET") {
-      sendJson(res, 200, { items: tenantRecords(users, tenantId) });
+      sendJson(res, 200, { items: await userRepository.list(tenantId) });
       return;
     }
-
     if (method === "POST") {
-      const createCheck = requireRole(req.headers["x-role"], ["platform_owner", "tenant_admin"]);
-      if (!createCheck.allowed) {
+      if (!hasAnyRole(auth, ["platform_owner", "tenant_admin"])) {
         sendJson(res, 403, { error: "Only platform_owner/tenant_admin can create users" });
         return;
       }
-
       const payload = await readJsonBody<CreateUserRequest>(req);
-      if (!payload.email || !payload.displayName || !payload.roles?.length) {
+      if (!payload.email?.trim() || !payload.displayName?.trim() || !payload.roles?.length) {
         sendJson(res, 400, { error: "email, displayName, and roles are required" });
         return;
       }
-
-      const user: User = {
-        id: generateId("user"),
-        tenantId,
-        email: payload.email,
-        displayName: payload.displayName,
-        roles: payload.roles,
-        status: "active"
-      };
-
-      users.set(user.id, user);
-      addAudit({
-        tenantId,
-        actorId: ctx.actorId,
+      const user = await userRepository.create(tenantId, {
+        email: payload.email.trim(),
+        displayName: payload.displayName.trim(),
+        roles: payload.roles
+      });
+      await audit(tenantId, auth, {
         action: "user.created",
         resourceType: "User",
         resourceId: user.id,
-        payload: payload as unknown as Record<string, unknown>
+        payload: { email: user.email, roles: user.roles }
       });
-
-      sendJson(res, 201, user as unknown as Record<string, unknown>);
+      sendJson(res, 201, { ...user });
       return;
     }
-
     sendJson(res, 405, { error: "Method not allowed" });
     return;
   }
 
   if (path === "/api/v1/channels/whatsapp") {
-    const tenantId = ctx.tenantId;
-    if (!tenantId) {
-      sendJson(res, 400, { error: "Missing x-tenant-id" });
-      return;
-    }
-
     if (method === "GET") {
-      sendJson(res, 200, { items: tenantRecords(channels, tenantId) });
+      sendJson(res, 200, { items: await channelRepository.list(tenantId) });
       return;
     }
-
     if (method === "POST") {
+      if (!hasAnyRole(auth, ["platform_owner", "tenant_admin"])) {
+        sendJson(res, 403, { error: "Only platform_owner/tenant_admin can register channels" });
+        return;
+      }
       const payload = await readJsonBody<CreateChannelRequest>(req);
       if (!payload.wabaId || !payload.phoneNumberId || !payload.displayPhoneNumber) {
         sendJson(res, 400, { error: "wabaId, phoneNumberId, displayPhoneNumber are required" });
         return;
       }
-
-      const channel: WhatsAppChannel = {
-        id: generateId("wa_channel"),
-        tenantId,
-        wabaId: payload.wabaId,
-        phoneNumberId: payload.phoneNumberId,
-        displayPhoneNumber: payload.displayPhoneNumber,
-        qualityRating: "unknown",
-        status: "active",
-        createdAt: new Date().toISOString()
-      };
-
-      channels.set(channel.id, channel);
-      addAudit({
-        tenantId,
-        actorId: ctx.actorId,
+      const channel = await channelRepository.create(tenantId, payload);
+      await audit(tenantId, auth, {
         action: "channel.whatsapp.created",
         resourceType: "WhatsAppChannel",
         resourceId: channel.id,
-        payload: payload as unknown as Record<string, unknown>
+        payload: { phoneNumberId: channel.phoneNumberId }
       });
-
-      sendJson(res, 201, channel as unknown as Record<string, unknown>);
+      sendJson(res, 201, { ...channel });
       return;
     }
-
     sendJson(res, 405, { error: "Method not allowed" });
     return;
   }
 
   if (path === "/api/v1/templates") {
-    const tenantId = ctx.tenantId;
-    if (!tenantId) {
-      sendJson(res, 400, { error: "Missing x-tenant-id" });
-      return;
-    }
-
     if (method === "GET") {
-      sendJson(res, 200, { items: tenantRecords(templates, tenantId) });
+      sendJson(res, 200, { items: await templateRepository.list(tenantId) });
       return;
     }
-
     if (method === "POST") {
+      if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager"])) {
+        sendJson(res, 403, { error: "Insufficient role to create templates" });
+        return;
+      }
       const payload = await readJsonBody<CreateTemplateRequest>(req);
       if (!payload.name || !payload.category || !payload.language || !payload.body) {
         sendJson(res, 400, { error: "name, category, language, body are required" });
         return;
       }
-
-      const template: Template = {
-        id: generateId("template"),
-        tenantId,
+      const template = await templateRepository.create(tenantId, {
         name: payload.name,
         category: payload.category,
         language: payload.language,
-        status: "approved",
-        body: payload.body
-      };
-
-      templates.set(template.id, template);
-      addAudit({
-        tenantId,
-        actorId: ctx.actorId,
+        body: payload.body,
+        status: "pending"
+      });
+      await audit(tenantId, auth, {
         action: "template.created",
         resourceType: "Template",
         resourceId: template.id,
-        payload: payload as unknown as Record<string, unknown>
+        payload: { name: template.name, category: template.category }
       });
-
-      sendJson(res, 201, template as unknown as Record<string, unknown>);
+      sendJson(res, 201, { ...template });
       return;
     }
-
     sendJson(res, 405, { error: "Method not allowed" });
     return;
   }
 
   if (path === "/api/v1/campaigns") {
-    const tenantId = ctx.tenantId;
-    if (!tenantId) {
-      sendJson(res, 400, { error: "Missing x-tenant-id" });
-      return;
-    }
-
     if (method === "GET") {
-      sendJson(res, 200, { items: tenantRecords(campaigns, tenantId) });
+      sendJson(res, 200, { items: await campaignRepository.list(tenantId) });
       return;
     }
-
     if (method === "POST") {
+      if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager"])) {
+        sendJson(res, 403, { error: "Insufficient role to create campaigns" });
+        return;
+      }
       const payload = await readJsonBody<CreateCampaignRequest>(req);
-      if (!payload.name || !payload.templateId || !payload.templateName || !payload.templateLanguage) {
-        sendJson(res, 400, { error: "name, templateId, templateName, templateLanguage are required" });
+      if (!payload.name?.trim() || !payload.templateId) {
+        sendJson(res, 400, { error: "name and templateId are required" });
         return;
       }
-
-      if (payload.templateCategory !== "marketing") {
-        sendJson(res, 422, {
-          error: "Only marketing template category is allowed in this endpoint"
-        });
+      const template = await templateRepository.getById(tenantId, payload.templateId);
+      if (!template) {
+        sendJson(res, 422, { error: "templateId does not reference a known template" });
         return;
       }
-
-      const id = generateId("campaign");
-      const campaign: Campaign & { templateName: string; templateLanguage: string } = {
-        id,
-        tenantId,
-        name: payload.name,
-        templateId: payload.templateId,
-        templateCategory: payload.templateCategory,
-        status: "draft",
-        createdAt: new Date().toISOString(),
-        templateName: payload.templateName,
-        templateLanguage: payload.templateLanguage
-      };
-
-      campaigns.set(id, campaign);
-      addAudit({
-        tenantId,
-        actorId: ctx.actorId,
+      if (template.category !== "marketing") {
+        sendJson(res, 422, { error: "Only marketing templates are allowed for campaigns" });
+        return;
+      }
+      const campaign = await campaignRepository.create(tenantId, { name: payload.name.trim(), templateId: payload.templateId });
+      await audit(tenantId, auth, {
         action: "campaign.created",
         resourceType: "Campaign",
         resourceId: campaign.id,
-        payload: payload as unknown as Record<string, unknown>
+        payload: { name: campaign.name, templateId: campaign.templateId }
       });
-
-      await fetch(`http://campaign-service:${config.campaignServicePort}/internal/v1/campaigns`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-tenant-id": tenantId,
-          "x-request-id": randomUUID()
-        },
-        body: JSON.stringify(payload)
-      }).catch((error: unknown) => {
-        logger.warn("campaign_service_seed_failed", {
-          error: error instanceof Error ? error.message : String(error)
-        });
-      });
-
-      sendJson(res, 201, campaign as unknown as Record<string, unknown>);
+      sendJson(res, 201, { ...campaign });
       return;
     }
-
     sendJson(res, 405, { error: "Method not allowed" });
     return;
   }
 
   if (path.startsWith("/api/v1/campaigns/") && path.endsWith("/dispatch") && method === "POST") {
-    const tenantId = ctx.tenantId;
-    if (!tenantId) {
-      sendJson(res, 400, { error: "Missing x-tenant-id" });
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager"])) {
+      sendJson(res, 403, { error: "Insufficient role to dispatch campaigns" });
       return;
     }
-
     const campaignId = path.replace("/api/v1/campaigns/", "").replace("/dispatch", "").trim();
-    const campaign = campaigns.get(campaignId);
-    if (!campaign || campaign.tenantId !== tenantId) {
+    if (!UUID.test(campaignId)) {
+      sendJson(res, 400, { error: "Invalid campaign id" });
+      return;
+    }
+    const campaign = await campaignRepository.getById(tenantId, campaignId);
+    if (!campaign) {
       sendJson(res, 404, { error: "Campaign not found" });
       return;
     }
-
-    const template = templates.get(campaign.templateId);
+    const template = await templateRepository.getById(tenantId, campaign.templateId);
     if (!template) {
       sendJson(res, 409, { error: "Template not found" });
       return;
     }
-
     const payload = await readJsonBody<DispatchCampaignRequest>(req);
-    const result = await dispatchCampaign(tenantId, campaignId, payload, template, campaign);
-
-    addAudit({
-      tenantId,
-      actorId: ctx.actorId,
+    if (!E164.test(payload.contactPhoneE164 ?? "")) {
+      sendJson(res, 400, { error: "contactPhoneE164 must be E.164 formatted" });
+      return;
+    }
+    const result = await dispatchCampaign(tenantId, campaign, template, payload);
+    await audit(tenantId, auth, {
       action: "campaign.dispatch.requested",
       resourceType: "Campaign",
       resourceId: campaignId,
-      payload: {
-        contactPhoneE164: payload.contactPhoneE164,
-        parametersCount: payload.parameters?.length ?? 0
-      }
+      payload: { parametersCount: payload.parameters?.length ?? 0 }
     });
-
     sendJson(res, result.status, result.body);
     return;
   }
 
   if (path === "/api/v1/contacts") {
-    const tenantId = ctx.tenantId;
-    if (!tenantId) {
-      sendJson(res, 400, { error: "Missing x-tenant-id" });
-      return;
-    }
-
     if (method === "GET") {
-      sendJson(res, 200, { items: tenantRecords(contacts, tenantId) });
+      sendJson(res, 200, { items: await contactRepository.list(tenantId) });
       return;
     }
-
     if (method === "POST") {
       const payload = await readJsonBody<CreateContactRequest>(req);
-      if (!payload.phoneE164) {
-        sendJson(res, 400, { error: "phoneE164 is required" });
+      if (!E164.test(payload.phoneE164 ?? "")) {
+        sendJson(res, 400, { error: "phoneE164 must be E.164 formatted" });
         return;
       }
-
-      const contact: Contact = {
-        id: generateId("contact"),
-        tenantId,
-        phoneE164: payload.phoneE164,
-        firstName: payload.firstName,
-        lastName: payload.lastName,
-        optedOut: false,
-        country: payload.country,
-        tags: payload.tags ?? []
-      };
-
-      contacts.set(contact.id, contact);
-      addAudit({
-        tenantId,
-        actorId: ctx.actorId,
+      const contact = await contactRepository.create(tenantId, payload);
+      await audit(tenantId, auth, {
         action: "contact.created",
         resourceType: "Contact",
         resourceId: contact.id,
-        payload: payload as unknown as Record<string, unknown>
+        payload: { phoneE164: contact.phoneE164 }
       });
-
-      sendJson(res, 201, contact as unknown as Record<string, unknown>);
+      sendJson(res, 201, { ...contact });
       return;
     }
-
     sendJson(res, 405, { error: "Method not allowed" });
     return;
   }
 
   if (path === "/api/v1/conversations" && method === "GET") {
-    const tenantId = ctx.tenantId;
-    if (!tenantId) {
-      sendJson(res, 400, { error: "Missing x-tenant-id" });
-      return;
-    }
-
-    sendJson(res, 200, {
-      items: tenantRecords(contacts, tenantId).map((contact) => ({
-        id: generateId("conv"),
-        tenantId,
-        contactId: contact.id,
-        channelId: tenantRecords(channels, tenantId)[0]?.id,
-        lastMessageAt: undefined
-      }))
-    });
+    sendJson(res, 200, { items: await conversationRepository.list(tenantId) });
     return;
   }
 
   if (path === "/api/v1/orders") {
-    const tenantId = ctx.tenantId;
-    if (!tenantId) {
-      sendJson(res, 400, { error: "Missing x-tenant-id" });
-      return;
-    }
-
     if (method === "GET") {
-      sendJson(res, 200, {
-        items: [...orders.values()].filter((item) => item.tenantId === tenantId)
-      });
+      sendJson(res, 200, { items: await orderRepository.list(tenantId) });
       return;
     }
-
     if (method === "POST") {
       const payload = await readJsonBody<CreateOrderRequest>(req);
       if (!payload.contactId || !payload.externalOrderId || !payload.amountMinor || !payload.currency) {
         sendJson(res, 400, { error: "contactId, externalOrderId, amountMinor and currency are required" });
         return;
       }
-
-      const orderId = generateId("order");
-      const order = {
-        id: orderId,
-        tenantId,
-        contactId: payload.contactId,
-        externalOrderId: payload.externalOrderId,
-        amountMinor: payload.amountMinor,
-        currency: payload.currency,
-        status: "created",
-        createdAt: new Date().toISOString()
-      };
-
-      orders.set(orderId, order);
-      addAudit({
-        tenantId,
-        actorId: ctx.actorId,
+      const order = await orderRepository.create(tenantId, payload);
+      await audit(tenantId, auth, {
         action: "order.created",
         resourceType: "Order",
-        resourceId: orderId,
-        payload: payload as unknown as Record<string, unknown>
+        resourceId: order.id,
+        payload: { externalOrderId: order.externalOrderId, amountMinor: order.amountMinor }
       });
-
-      sendJson(res, 201, order as unknown as Record<string, unknown>);
+      sendJson(res, 201, { ...order });
       return;
     }
-
     sendJson(res, 405, { error: "Method not allowed" });
     return;
   }
 
   if (path === "/api/v1/analytics" && method === "GET") {
-    const tenantId = ctx.tenantId;
-    if (!tenantId) {
-      sendJson(res, 400, { error: "Missing x-tenant-id" });
-      return;
-    }
-
-    const tenantTemplates = tenantRecords(templates, tenantId);
-    const tenantCampaigns = tenantRecords(campaigns, tenantId);
-    const tenantContacts = tenantRecords(contacts, tenantId);
-    const optOutCount = tenantContacts.filter((x) => x.optedOut).length;
-
-    sendJson(res, 200, {
-      tenantId,
-      totals: {
-        templates: tenantTemplates.length,
-        campaigns: tenantCampaigns.length,
-        contacts: tenantContacts.length,
-        optOutRate: tenantContacts.length ? Number((optOutCount / tenantContacts.length).toFixed(4)) : 0
-      }
-    });
+    const totals = await tenantAnalytics(tenantId);
+    sendJson(res, 200, { tenantId, totals });
     return;
   }
 
   if (path === "/api/v1/audit" && method === "GET") {
-    const tenantId = ctx.tenantId;
-    if (!tenantId) {
-      sendJson(res, 400, { error: "Missing x-tenant-id" });
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "compliance_auditor"])) {
+      sendJson(res, 403, { error: "Insufficient role to read audit log" });
       return;
     }
-
-    sendJson(res, 200, {
-      items: auditEvents.filter((event) => event.tenantId === tenantId)
-    });
+    sendJson(res, 200, { items: await auditRepository.list(tenantId) });
     return;
   }
 
-  sendJson(res, 404, {
-    error: "route_not_found",
-    method,
-    path,
-    requestId: ctx.requestId
+  sendJson(res, 404, { error: "route_not_found", method, path, requestId: ctx.requestId });
+}
+
+const server = createServer((req, res) => {
+  applySecurityHeaders(res);
+  handle(req, res).catch((error) => {
+    logger.error("request_failed", {
+      method: req.method,
+      url: req.url,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    if (!res.headersSent) {
+      sendJson(res, 500, { error: "internal_error" });
+    } else {
+      res.end();
+    }
   });
 });
 
 server.listen(config.apiGatewayPort, () => {
-  logger.info("service_started", {
-    port: config.apiGatewayPort,
-    nodeEnv: config.nodeEnv
-  });
+  logger.info("service_started", { port: config.apiGatewayPort, nodeEnv: config.nodeEnv, authEnabled: config.authEnabled });
 });
 
 server.on("error", (error) => {
-  logger.error("service_error", {
-    error: error instanceof Error ? error.message : String(error)
-  });
+  logger.error("service_error", { error: error instanceof Error ? error.message : String(error) });
 });
+
+async function shutdown(signal: string): Promise<void> {
+  logger.info("shutdown_started", { signal });
+  server.close(async () => {
+    await closePool().catch(() => undefined);
+    logger.info("shutdown_complete", { signal });
+    process.exit(0);
+  });
+  // Force-exit if connections do not drain in time.
+  setTimeout(() => process.exit(0), 10_000).unref();
+}
+
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
+process.on("SIGINT", () => void shutdown("SIGINT"));
