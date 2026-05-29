@@ -13,6 +13,7 @@ import {
   contactRepository,
   conversationRepository,
   healthCheck,
+  messageRepository,
   orderRepository,
   outboxRepository,
   templateRepository,
@@ -35,8 +36,10 @@ import {
   incCounter,
   verifyMetaSignature,
   EventTopics,
+  type MessageCategory,
   type Role,
-  type Template
+  type Template,
+  type WhatsAppMediaKind
 } from "@hyfib/shared-core";
 
 interface CreateTenantRequest {
@@ -53,6 +56,15 @@ interface CreateChannelRequest {
   wabaId: string;
   phoneNumberId: string;
   displayPhoneNumber: string;
+  /** Optional per-tenant access token; encrypted at rest when provided. */
+  accessToken?: string;
+}
+
+interface SendMessageRequest {
+  kind?: "text" | "media";
+  text?: string;
+  previewUrl?: boolean;
+  media?: { mediaType: WhatsAppMediaKind; link?: string; mediaId?: string; caption?: string; filename?: string };
 }
 
 interface CreateTemplateRequest {
@@ -223,6 +235,120 @@ async function dispatchCampaign(
   });
 
   return { status: 202, body: { status: "dispatch_enqueued", campaignId: campaign.id } };
+}
+
+const META_CATEGORIES: ReadonlySet<MessageCategory> = new Set(["marketing", "utility", "authentication", "service"]);
+
+interface MetaTemplateItem {
+  name: string;
+  language: string;
+  status: string;
+  category?: string;
+  body?: string;
+}
+
+/**
+ * Pulls the channel's templates from Meta (via meta-adapter) and reconciles the
+ * local catalogue, emitting template.status.updated for each change.
+ */
+async function syncTemplates(
+  tenantId: string,
+  channelId: string
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const channel = await channelRepository.getCredentials(tenantId, channelId);
+  if (!channel) {
+    return { status: 404, body: { error: "Channel not found" } };
+  }
+  const url = new URL(`${config.metaAdapterUrl}/internal/v1/whatsapp/templates`);
+  url.searchParams.set("wabaId", channel.wabaId);
+  if (channel.accessToken) {
+    url.searchParams.set("accessToken", channel.accessToken);
+  }
+  let items: MetaTemplateItem[];
+  try {
+    const response = await fetch(url, { headers: { "x-tenant-id": tenantId, "x-request-id": randomUUID() } });
+    const body = (await response.json()) as { items?: MetaTemplateItem[]; error?: string };
+    if (!response.ok) {
+      return { status: 502, body: { error: "template_sync_failed", detail: body.error ?? "meta error" } };
+    }
+    items = body.items ?? [];
+  } catch (error) {
+    return { status: 503, body: { error: "meta_adapter_unavailable", detail: error instanceof Error ? error.message : "failed" } };
+  }
+
+  let synced = 0;
+  for (const item of items) {
+    const category = (item.category && META_CATEGORIES.has(item.category as MessageCategory)
+      ? item.category
+      : "utility") as MessageCategory;
+    const status = (["approved", "rejected", "pending", "paused"].includes(item.status)
+      ? item.status
+      : "pending") as Template["status"];
+    const template = await templateRepository.upsertFromMeta(tenantId, {
+      name: item.name,
+      language: item.language,
+      status,
+      category,
+      body: item.body ?? ""
+    });
+    await eventBus.publish(
+      EventTopics.TemplateStatusUpdated,
+      { tenantId, templateId: template.id, name: template.name, language: template.language, status: template.status },
+      tenantId
+    );
+    synced += 1;
+  }
+  return { status: 200, body: { status: "synced", synced, items } };
+}
+
+/**
+ * Enqueues a free-form (session) outbound message to a conversation via the
+ * transactional outbox; the worker performs the actual send. Suppressed for
+ * opted-out contacts. Returns 202 Accepted (asynchronous like campaign dispatch).
+ */
+async function sendConversationMessage(
+  tenantId: string,
+  conversationId: string,
+  auth: AuthContext,
+  body: SendMessageRequest
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const conversation = await conversationRepository.getById(tenantId, conversationId);
+  if (!conversation) {
+    return { status: 404, body: { error: "Conversation not found" } };
+  }
+  const contact = await contactRepository.getById(tenantId, conversation.contactId);
+  if (!contact) {
+    return { status: 409, body: { error: "Conversation has no contact" } };
+  }
+  if (contact.optedOut) {
+    return { status: 422, body: { error: "contact_opted_out" } };
+  }
+
+  const kind = body.kind === "media" ? "media" : "text";
+  if (kind === "text" && !body.text?.trim()) {
+    return { status: 400, body: { error: "text is required" } };
+  }
+  if (kind === "media" && !body.media?.mediaType) {
+    return { status: 400, body: { error: "media.mediaType is required" } };
+  }
+
+  await withTenant(tenantId, async (client) => {
+    await outboxRepository.enqueue(client, tenantId, {
+      topic: EventTopics.WhatsAppOutboundRequested,
+      payload: {
+        tenantId,
+        channelId: conversation.channelId,
+        conversationId,
+        contactPhoneE164: contact.phoneE164,
+        kind,
+        text: body.text,
+        previewUrl: body.previewUrl,
+        media: body.media,
+        actorId: asActorUuid(auth.subject)
+      }
+    });
+  });
+  return { status: 202, body: { status: "message_enqueued", kind } };
 }
 
 /**
@@ -436,17 +562,53 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         sendJson(res, 400, { error: "wabaId, phoneNumberId, displayPhoneNumber are required" });
         return;
       }
-      const channel = await channelRepository.create(tenantId, payload);
+      let channel;
+      try {
+        channel = await channelRepository.create(tenantId, {
+          wabaId: payload.wabaId,
+          phoneNumberId: payload.phoneNumberId,
+          displayPhoneNumber: payload.displayPhoneNumber,
+          accessToken: payload.accessToken
+        });
+      } catch (error) {
+        // Most likely a missing CHANNEL_ENCRYPTION_KEY when a token was supplied.
+        sendJson(res, 400, { error: "channel_create_failed", detail: error instanceof Error ? error.message : "failed" });
+        return;
+      }
       await audit(tenantId, auth, {
         action: "channel.whatsapp.created",
         resourceType: "WhatsAppChannel",
         resourceId: channel.id,
-        payload: { phoneNumberId: channel.phoneNumberId }
+        payload: { phoneNumberId: channel.phoneNumberId, hasToken: Boolean(payload.accessToken) }
       });
       sendJson(res, 201, { ...channel });
       return;
     }
     sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+
+  // Reconcile local templates with Meta's source of truth for this channel's WABA.
+  if (path.startsWith("/api/v1/channels/whatsapp/") && path.endsWith("/sync-templates") && method === "POST") {
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager"])) {
+      sendJson(res, 403, { error: "Insufficient role to sync templates" });
+      return;
+    }
+    const channelId = path.replace("/api/v1/channels/whatsapp/", "").replace("/sync-templates", "").trim();
+    if (!UUID.test(channelId)) {
+      sendJson(res, 400, { error: "Invalid channel id" });
+      return;
+    }
+    const result = await syncTemplates(tenantId, channelId);
+    if (result.status === 200) {
+      await audit(tenantId, auth, {
+        action: "template.synced",
+        resourceType: "WhatsAppChannel",
+        resourceId: channelId,
+        payload: { synced: (result.body.synced as number) ?? 0 }
+      });
+    }
+    sendJson(res, result.status, result.body);
     return;
   }
 
@@ -659,6 +821,46 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 
   if (path === "/api/v1/conversations" && method === "GET") {
     sendJson(res, 200, { items: await conversationRepository.list(tenantId) });
+    return;
+  }
+
+  // Conversation thread (message history).
+  if (path.startsWith("/api/v1/conversations/") && path.endsWith("/messages")) {
+    const conversationId = path.replace("/api/v1/conversations/", "").replace("/messages", "").trim();
+    if (!UUID.test(conversationId)) {
+      sendJson(res, 400, { error: "Invalid conversation id" });
+      return;
+    }
+    if (method === "GET") {
+      const query = parseQuery(req.url);
+      const limit = Number(query.get("limit") ?? "50");
+      const before = query.get("before") ?? undefined;
+      const items = await messageRepository.listByConversation(tenantId, conversationId, {
+        limit: Number.isFinite(limit) ? limit : 50,
+        before
+      });
+      sendJson(res, 200, { items });
+      return;
+    }
+    // Agent reply: a free-form session (non-template) outbound message.
+    if (method === "POST") {
+      if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager", "sales_agent", "support_agent"])) {
+        sendJson(res, 403, { error: "Insufficient role to send a message" });
+        return;
+      }
+      const result = await sendConversationMessage(tenantId, conversationId, auth, await readJsonBody<SendMessageRequest>(req));
+      if (result.status === 202) {
+        await audit(tenantId, auth, {
+          action: "conversation.message.sent",
+          resourceType: "Conversation",
+          resourceId: conversationId,
+          payload: { kind: (result.body.kind as string) ?? "text" }
+        });
+      }
+      sendJson(res, result.status, result.body);
+      return;
+    }
+    sendJson(res, 405, { error: "Method not allowed" });
     return;
   }
 

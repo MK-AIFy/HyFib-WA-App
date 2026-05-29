@@ -629,6 +629,15 @@ export const conversationRepository = {
       return result.rows.map(mapConversation);
     });
   },
+  async getById(tenantId: string, id: string): Promise<Conversation | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<ConversationRow>(
+        `SELECT id, tenant_id, contact_id, channel_id, last_message_at FROM conversations WHERE id = $1`,
+        [id]
+      );
+      return result.rows[0] ? mapConversation(result.rows[0]) : undefined;
+    });
+  },
   async findOrCreate(tenantId: string, contactId: string, channelId: string): Promise<Conversation> {
     return withTenant(tenantId, async (client) => {
       const existing = await client.query<ConversationRow>(
