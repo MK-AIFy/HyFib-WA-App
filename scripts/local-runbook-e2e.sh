@@ -201,9 +201,35 @@ curl -fsS -X POST "${BASE_URL}/api/v1/webhooks/meta/whatsapp" \
   -d "${INBOUND_PAYLOAD}" | jq .
 sleep 3
 echo "Conversations for tenant (should contain the inbound message's conversation):"
-curl -fsS "${BASE_URL}/api/v1/conversations" \
+CONVERSATIONS="$(curl -fsS "${BASE_URL}/api/v1/conversations" \
   -H 'x-role: support_agent' \
-  -H "x-tenant-id: ${TENANT_ID}" | jq .
+  -H "x-tenant-id: ${TENANT_ID}")"
+echo "${CONVERSATIONS}" | jq .
+CONVERSATION_ID="$(echo "${CONVERSATIONS}" | jq -r '.items[0].id // empty')"
+
+echo "Simulate a signed inbound interactive button reply (full normalization):"
+BTN_PAYLOAD="$(jq -cn --arg pn "${WHATSAPP_PHONE_NUMBER_ID}" --arg from "${CONTACT_PHONE}" \
+  '{entry:[{id:"waba",changes:[{value:{metadata:{phone_number_id:$pn},contacts:[{wa_id:$from,profile:{name:"Test User"}}],messages:[{id:"wamid.LOCAL2",from:$from,type:"interactive",interactive:{type:"button_reply",button_reply:{id:"YES",title:"Yes"}},timestamp:"1700000100"}]}}]}]}')"
+BTN_SIG="sha256=$(printf '%s' "${BTN_PAYLOAD}" | openssl dgst -sha256 -hmac "${META_APP_SECRET}" | awk '{print $2}')"
+curl -fsS -X POST "${BASE_URL}/api/v1/webhooks/meta/whatsapp" \
+  -H 'content-type: application/json' \
+  -H "x-hub-signature-256: ${BTN_SIG}" \
+  -d "${BTN_PAYLOAD}" | jq .
+sleep 2
+
+if [ -n "${CONVERSATION_ID}" ]; then
+  echo "Agent free-form reply (POST /conversations/:id/messages, expect 202):"
+  curl -fsS -X POST "${BASE_URL}/api/v1/conversations/${CONVERSATION_ID}/messages" \
+    -H 'content-type: application/json' \
+    -H 'x-role: support_agent' \
+    -H "x-tenant-id: ${TENANT_ID}" \
+    -d '{"kind":"text","text":"Thanks for reaching out!"}' | jq .
+  sleep 2
+  echo "Conversation thread (history, oldest first):"
+  curl -fsS "${BASE_URL}/api/v1/conversations/${CONVERSATION_ID}/messages" \
+    -H 'x-role: support_agent' \
+    -H "x-tenant-id: ${TENANT_ID}" | jq .
+fi
 
 echo "[8/9] Validate analytics + audit"
 curl -fsS "${BASE_URL}/api/v1/analytics" \

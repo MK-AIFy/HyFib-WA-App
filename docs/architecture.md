@@ -22,10 +22,16 @@
   and the transactional-outbox relay.
 - `web-portal` — operator UI.
 - `meta-adapter` — WhatsApp Cloud API integration (resilient: retry/backoff +
-  circuit breaker).
-- `webhook-ingestor` — inbound webhook HMAC verification + event publication.
-- `notification-worker` (message-worker) — consumes campaign/inbound/status
-  events; sends templates and persists conversations + messages + statuses.
+  circuit breaker). Sends templates (positional or structured components),
+  free-form session text/media, interactive button/list menus, read receipts,
+  and lists templates for sync. Each call accepts a per-channel access token.
+- `webhook-ingestor` — inbound webhook HMAC verification + full payload
+  normalization (text, media, interactive/button replies, location, reactions,
+  contacts, referrals, context, profile name; status pricing/category/errors).
+- `notification-worker` (message-worker) — consumes campaign/outbound/inbound/
+  status events; sends templates and agent replies using the channel's number +
+  decrypted token, persists conversations + messages + enriched statuses, and
+  marks inbound messages read.
 - `ai-intelligence-service` — internal backoffice intelligence.
 
 The earlier per-domain microservices (`auth/tenant/contact/conversation/campaign/

@@ -159,12 +159,92 @@ export interface WebhookIngestRequest {
   signature?: string;
 }
 
+/**
+ * A structured WhatsApp template component (header/body/button). When omitted,
+ * the meta-adapter falls back to building a single body component from the
+ * positional `parameters` array for backward compatibility.
+ */
+export interface TemplateParameter {
+  type: "text" | "currency" | "date_time" | "image" | "document" | "video" | "payload";
+  text?: string;
+  payload?: string;
+  currency?: { fallback_value: string; code: string; amount_1000: number };
+  date_time?: { fallback_value: string };
+  image?: { link?: string; id?: string };
+  document?: { link?: string; id?: string; filename?: string };
+  video?: { link?: string; id?: string };
+}
+
+export interface TemplateComponent {
+  type: "header" | "body" | "button";
+  sub_type?: "url" | "quick_reply";
+  index?: number;
+  parameters: TemplateParameter[];
+}
+
 export interface WhatsAppSendRequest {
   phoneNumberId: string;
   to: string;
   templateName: string;
   templateLanguage: string;
   parameters: string[];
+  /** Optional structured components; when present they replace the positional body params. */
+  components?: TemplateComponent[];
+  /** Optional per-tenant access token; falls back to the env token when absent. */
+  accessToken?: string;
+}
+
+export type WhatsAppMediaKind = "image" | "video" | "audio" | "document" | "sticker";
+
+export interface WhatsAppTextSendRequest {
+  phoneNumberId: string;
+  to: string;
+  text: string;
+  previewUrl?: boolean;
+  accessToken?: string;
+}
+
+export interface WhatsAppMediaSendRequest {
+  phoneNumberId: string;
+  to: string;
+  mediaType: WhatsAppMediaKind;
+  link?: string;
+  mediaId?: string;
+  caption?: string;
+  filename?: string;
+  accessToken?: string;
+}
+
+export interface WhatsAppInteractiveButton {
+  id: string;
+  title: string;
+}
+
+export interface WhatsAppInteractiveRow {
+  id: string;
+  title: string;
+  description?: string;
+}
+
+export interface WhatsAppInteractiveSendRequest {
+  phoneNumberId: string;
+  to: string;
+  interactiveType: "button" | "list";
+  bodyText: string;
+  headerText?: string;
+  footerText?: string;
+  /** For interactiveType "button". */
+  buttons?: WhatsAppInteractiveButton[];
+  /** For interactiveType "list". */
+  buttonLabel?: string;
+  sections?: Array<{ title?: string; rows: WhatsAppInteractiveRow[] }>;
+  accessToken?: string;
+}
+
+export interface WhatsAppMarkReadRequest {
+  phoneNumberId: string;
+  messageId: string;
+  accessToken?: string;
 }
 
 export interface WhatsAppSendResult {
@@ -173,9 +253,35 @@ export interface WhatsAppSendResult {
   error?: string;
 }
 
+/** A WhatsApp message template as returned by Meta's message_templates endpoint. */
+export interface MetaTemplateSummary {
+  name: string;
+  language: string;
+  status: string;
+  category?: string;
+  body?: string;
+}
+
+/**
+ * Durable request to send an outbound session (non-template) message, enqueued
+ * by the gateway and consumed by the worker. Used for agent replies.
+ */
+export interface WhatsAppOutboundRequest {
+  tenantId: string;
+  channelId: string;
+  conversationId: string;
+  contactPhoneE164: string;
+  kind: "text" | "media" | "interactive";
+  text?: string;
+  previewUrl?: boolean;
+  media?: { mediaType: WhatsAppMediaKind; link?: string; mediaId?: string; caption?: string; filename?: string };
+  actorId?: string;
+}
+
 export const EventTopics = {
   WhatsAppInboundReceived: "whatsapp.inbound.received",
   WhatsAppStatusUpdated: "whatsapp.status.updated",
+  WhatsAppOutboundRequested: "whatsapp.outbound.requested",
   TemplateStatusUpdated: "template.status.updated",
   CampaignDispatchRequested: "campaign.dispatch.requested",
   CampaignDispatchResult: "campaign.dispatch.result",

@@ -1,4 +1,6 @@
 import { query, withTenant, type QueryClient } from "./db.js";
+import { loadConfig } from "@hyfib/config";
+import { decryptSecret, encryptSecret } from "@hyfib/shared-core";
 import type {
   AuditEvent,
   Campaign,
@@ -119,6 +121,13 @@ interface ChannelRow {
   created_at: Date;
 }
 
+interface ChannelCredentialRow extends ChannelRow {
+  access_token_encrypted: string | null;
+}
+
+const CHANNEL_COLUMNS =
+  "id, tenant_id, waba_id, phone_number_id, display_phone_number, quality_rating, is_active, created_at";
+
 function mapChannel(row: ChannelRow): WhatsAppChannel {
   return {
     id: row.id,
@@ -132,17 +141,43 @@ function mapChannel(row: ChannelRow): WhatsAppChannel {
   };
 }
 
+/** Resolved channel send credentials (number + optional per-tenant token). */
+export interface ChannelCredentials {
+  id: string;
+  wabaId: string;
+  phoneNumberId: string;
+  /** Decrypted per-channel access token, or undefined to fall back to the env token. */
+  accessToken?: string;
+}
+
+function encryptChannelToken(token: string): string {
+  const key = loadConfig().channelEncryptionKey;
+  if (!key) {
+    throw new Error("CHANNEL_ENCRYPTION_KEY must be set to register a channel with its own access token");
+  }
+  return encryptSecret(token, key);
+}
+
+function mapChannelCredentials(row: ChannelCredentialRow): ChannelCredentials {
+  let accessToken: string | undefined;
+  if (row.access_token_encrypted) {
+    accessToken = decryptSecret(row.access_token_encrypted, loadConfig().channelEncryptionKey);
+  }
+  return { id: row.id, wabaId: row.waba_id, phoneNumberId: row.phone_number_id, accessToken };
+}
+
 export const channelRepository = {
   async create(
     tenantId: string,
-    input: { wabaId: string; phoneNumberId: string; displayPhoneNumber: string }
+    input: { wabaId: string; phoneNumberId: string; displayPhoneNumber: string; accessToken?: string }
   ): Promise<WhatsAppChannel> {
+    const encryptedToken = input.accessToken ? encryptChannelToken(input.accessToken) : null;
     return withTenant(tenantId, async (client) => {
       const result = await client.query<ChannelRow>(
-        `INSERT INTO whatsapp_channels (tenant_id, waba_id, phone_number_id, display_phone_number, quality_rating, is_active)
-         VALUES ($1, $2, $3, $4, 'unknown', true)
-         RETURNING id, tenant_id, waba_id, phone_number_id, display_phone_number, quality_rating, is_active, created_at`,
-        [tenantId, input.wabaId, input.phoneNumberId, input.displayPhoneNumber]
+        `INSERT INTO whatsapp_channels (tenant_id, waba_id, phone_number_id, display_phone_number, quality_rating, is_active, access_token_encrypted)
+         VALUES ($1, $2, $3, $4, 'unknown', true, $5)
+         RETURNING ${CHANNEL_COLUMNS}`,
+        [tenantId, input.wabaId, input.phoneNumberId, input.displayPhoneNumber, encryptedToken]
       );
       return mapChannel(result.rows[0]!);
     });
@@ -150,8 +185,7 @@ export const channelRepository = {
   async list(tenantId: string): Promise<WhatsAppChannel[]> {
     return withTenant(tenantId, async (client) => {
       const result = await client.query<ChannelRow>(
-        `SELECT id, tenant_id, waba_id, phone_number_id, display_phone_number, quality_rating, is_active, created_at
-         FROM whatsapp_channels ORDER BY created_at DESC`
+        `SELECT ${CHANNEL_COLUMNS} FROM whatsapp_channels ORDER BY created_at DESC`
       );
       return result.rows.map(mapChannel);
     });
@@ -159,10 +193,19 @@ export const channelRepository = {
   async firstActive(tenantId: string): Promise<WhatsAppChannel | undefined> {
     return withTenant(tenantId, async (client) => {
       const result = await client.query<ChannelRow>(
-        `SELECT id, tenant_id, waba_id, phone_number_id, display_phone_number, quality_rating, is_active, created_at
-         FROM whatsapp_channels WHERE is_active = true ORDER BY created_at ASC LIMIT 1`
+        `SELECT ${CHANNEL_COLUMNS} FROM whatsapp_channels WHERE is_active = true ORDER BY created_at ASC LIMIT 1`
       );
       return result.rows[0] ? mapChannel(result.rows[0]) : undefined;
+    });
+  },
+  /** Loads a channel's send credentials (number + decrypted token) by id. */
+  async getCredentials(tenantId: string, channelId: string): Promise<ChannelCredentials | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<ChannelCredentialRow>(
+        `SELECT ${CHANNEL_COLUMNS}, access_token_encrypted FROM whatsapp_channels WHERE id = $1`,
+        [channelId]
+      );
+      return result.rows[0] ? mapChannelCredentials(result.rows[0]) : undefined;
     });
   }
 };
@@ -219,6 +262,26 @@ export const templateRepository = {
         [id]
       );
       return result.rows[0] ? mapTemplate(result.rows[0]) : undefined;
+    });
+  },
+  /**
+   * Upserts a template pulled from Meta, reconciling local status/category/body
+   * with the remote source of truth. Keyed by (tenant, name, language).
+   */
+  async upsertFromMeta(
+    tenantId: string,
+    input: { name: string; language: string; status: Template["status"]; category: MessageCategory; body: string }
+  ): Promise<Template> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<TemplateRow>(
+        `INSERT INTO templates (tenant_id, name, category, language, status, body)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (tenant_id, name, language) DO UPDATE
+           SET status = EXCLUDED.status, category = EXCLUDED.category, body = EXCLUDED.body
+         RETURNING id, tenant_id, name, category, language, status, body`,
+        [tenantId, input.name, input.category, input.language, input.status, input.body]
+      );
+      return mapTemplate(result.rows[0]!);
     });
   }
 };
@@ -566,6 +629,15 @@ export const conversationRepository = {
       return result.rows.map(mapConversation);
     });
   },
+  async getById(tenantId: string, id: string): Promise<Conversation | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<ConversationRow>(
+        `SELECT id, tenant_id, contact_id, channel_id, last_message_at FROM conversations WHERE id = $1`,
+        [id]
+      );
+      return result.rows[0] ? mapConversation(result.rows[0]) : undefined;
+    });
+  },
   async findOrCreate(tenantId: string, contactId: string, channelId: string): Promise<Conversation> {
     return withTenant(tenantId, async (client) => {
       const existing = await client.query<ConversationRow>(
@@ -649,12 +721,51 @@ export const messageRepository = {
     externalMessageId: string,
     status: Message["status"]
   ): Promise<boolean> {
+    return this.applyStatusUpdate(tenantId, externalMessageId, status);
+  },
+  /**
+   * Transitions a message's status by Meta message id and merges delivery
+   * metadata (pricing / conversation / error) into its JSONB payload.
+   */
+  async applyStatusUpdate(
+    tenantId: string,
+    externalMessageId: string,
+    status: Message["status"],
+    metaPatch?: Record<string, unknown>
+  ): Promise<boolean> {
     return withTenant(tenantId, async (client) => {
-      const result = await client.query("UPDATE messages SET status = $2 WHERE external_message_id = $1", [
-        externalMessageId,
-        status
-      ]);
+      const patch = metaPatch && Object.keys(metaPatch).length > 0 ? JSON.stringify(metaPatch) : null;
+      const result = await client.query(
+        `UPDATE messages
+         SET status = $2,
+             payload = CASE WHEN $3::jsonb IS NULL THEN payload ELSE payload || $3::jsonb END
+         WHERE external_message_id = $1`,
+        [externalMessageId, status, patch]
+      );
       return (result.rowCount ?? 0) > 0;
+    });
+  },
+  async listByConversation(
+    tenantId: string,
+    conversationId: string,
+    options: { limit?: number; before?: string } = {}
+  ): Promise<Message[]> {
+    const limit = Math.min(Math.max(options.limit ?? 50, 1), 200);
+    return withTenant(tenantId, async (client) => {
+      const params: unknown[] = [conversationId];
+      let where = "conversation_id = $1";
+      if (options.before) {
+        params.push(options.before);
+        where += ` AND created_at < $${params.length}`;
+      }
+      params.push(limit);
+      const result = await client.query<MessageRow>(
+        `SELECT id, tenant_id, conversation_id, direction, category, external_message_id, payload, status, created_at
+         FROM messages WHERE ${where} ORDER BY created_at DESC LIMIT $${params.length}`,
+        params
+      );
+      // Return chronological (oldest first) for natural thread rendering.
+      return result.rows.map(mapMessage).reverse();
     });
   }
 };

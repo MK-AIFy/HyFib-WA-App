@@ -5,13 +5,15 @@ import { loadConfig } from "@hyfib/config";
 import {
   campaignSendLog,
   campaignStatsRepository,
+  channelRepository,
   closePool,
   consentRepository,
   contactRepository,
   conversationRepository,
   healthCheck,
   messageRepository,
-  resolveChannelByPhoneNumberId
+  resolveChannelByPhoneNumberId,
+  type ChannelCredentials
 } from "@hyfib/persistence";
 import {
   EventTopics,
@@ -25,7 +27,8 @@ import {
   type CampaignDispatchRequest,
   type EventEnvelope,
   type Message,
-  type MessageCategory
+  type MessageCategory,
+  type WhatsAppOutboundRequest
 } from "@hyfib/shared-core";
 
 const config = loadConfig();
@@ -39,6 +42,15 @@ interface InboundEvent {
   text?: string;
   type?: string;
   timestamp?: string;
+  profileName?: string;
+  media?: Record<string, unknown>;
+  interactive?: Record<string, unknown>;
+  button?: Record<string, unknown>;
+  location?: Record<string, unknown>;
+  reaction?: Record<string, unknown>;
+  contacts?: unknown[];
+  referral?: Record<string, unknown>;
+  context?: Record<string, unknown>;
 }
 
 interface StatusEvent {
@@ -46,6 +58,9 @@ interface StatusEvent {
   messageId?: string;
   status?: string;
   recipientId?: string;
+  pricing?: Record<string, unknown>;
+  conversation?: Record<string, unknown>;
+  errors?: unknown[];
 }
 
 const META_STATUS_TO_MESSAGE: Record<string, Message["status"]> = {
@@ -55,23 +70,48 @@ const META_STATUS_TO_MESSAGE: Record<string, Message["status"]> = {
   failed: "failed"
 };
 
-async function sendTemplate(command: CampaignDispatchRequest): Promise<{ messageId?: string; accepted: boolean }> {
-  const response = await fetch(`${config.metaAdapterUrl}/internal/v1/whatsapp/send-template`, {
+/** POSTs a send request to a meta-adapter endpoint and returns the message id. */
+async function callMetaAdapter(
+  endpoint: string,
+  tenantId: string,
+  payload: Record<string, unknown>
+): Promise<{ messageId?: string; accepted: boolean }> {
+  const response = await fetch(`${config.metaAdapterUrl}${endpoint}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "x-tenant-id": command.tenantId, "x-request-id": randomUUID() },
-    body: JSON.stringify({
-      phoneNumberId: config.whatsappPhoneNumberId,
-      to: command.contactPhoneE164,
-      templateName: command.templateName,
-      templateLanguage: command.templateLanguage,
-      parameters: command.parameters
-    })
+    headers: { "Content-Type": "application/json", "x-tenant-id": tenantId, "x-request-id": randomUUID() },
+    body: JSON.stringify(payload)
   });
   const body = (await response.json()) as { result?: { messageId?: string; status?: string } };
   if (!response.ok) {
     throw new Error(`meta_adapter_rejected_${response.status}`);
   }
   return { messageId: body.result?.messageId, accepted: body.result?.status === "accepted" };
+}
+
+/**
+ * Resolves the sending channel's number + per-tenant token. Falls back to the
+ * env phone number id only when the channel cannot be loaded (legacy single-WABA).
+ */
+async function resolveSendChannel(tenantId: string, channelId: string): Promise<ChannelCredentials> {
+  const credentials = await channelRepository.getCredentials(tenantId, channelId);
+  if (credentials) {
+    return credentials;
+  }
+  return { id: channelId, wabaId: config.whatsappWabaId, phoneNumberId: config.whatsappPhoneNumberId };
+}
+
+async function sendTemplate(
+  command: CampaignDispatchRequest,
+  channel: ChannelCredentials
+): Promise<{ messageId?: string; accepted: boolean }> {
+  return callMetaAdapter("/internal/v1/whatsapp/send-template", command.tenantId, {
+    phoneNumberId: channel.phoneNumberId,
+    to: command.contactPhoneE164,
+    templateName: command.templateName,
+    templateLanguage: command.templateLanguage,
+    parameters: command.parameters,
+    accessToken: channel.accessToken
+  });
 }
 
 async function recordOutbound(
@@ -107,7 +147,8 @@ async function handleDispatch(event: EventEnvelope): Promise<void> {
     return;
   }
   try {
-    const result = await sendTemplate(command);
+    const channel = await resolveSendChannel(command.tenantId, command.channelId);
+    const result = await sendTemplate(command, channel);
     await recordOutbound(command, result.messageId, result.accepted);
     incCounter("whatsapp_messages_sent_total", "Outbound WhatsApp template sends.", {
       result: result.accepted ? "accepted" : "queued"
@@ -135,6 +176,76 @@ async function handleDispatch(event: EventEnvelope): Promise<void> {
   }
 }
 
+/**
+ * Sends an outbound session (non-template) message requested by an agent and
+ * persists it to the conversation. Uses the channel's number + per-tenant token.
+ */
+async function handleOutbound(event: EventEnvelope): Promise<void> {
+  incCounter("events_consumed_total", "Events consumed from the bus.", {
+    topic: EventTopics.WhatsAppOutboundRequested
+  });
+  const command = event.payload as WhatsAppOutboundRequest;
+  if (!command.tenantId || !command.channelId || !command.conversationId || !command.contactPhoneE164) {
+    logger.warn("outbound_invalid_command", { eventId: event.id });
+    return;
+  }
+  const channel = await resolveSendChannel(command.tenantId, command.channelId);
+
+  let result: { messageId?: string; accepted: boolean };
+  let payload: Record<string, unknown>;
+  if (command.kind === "media" && command.media) {
+    result = await callMetaAdapter("/internal/v1/whatsapp/send-media", command.tenantId, {
+      phoneNumberId: channel.phoneNumberId,
+      to: command.contactPhoneE164,
+      mediaType: command.media.mediaType,
+      link: command.media.link,
+      mediaId: command.media.mediaId,
+      caption: command.media.caption,
+      filename: command.media.filename,
+      accessToken: channel.accessToken
+    });
+    payload = { kind: "media", media: command.media, actorId: command.actorId };
+  } else {
+    result = await callMetaAdapter("/internal/v1/whatsapp/send-text", command.tenantId, {
+      phoneNumberId: channel.phoneNumberId,
+      to: command.contactPhoneE164,
+      text: command.text,
+      previewUrl: command.previewUrl,
+      accessToken: channel.accessToken
+    });
+    payload = { kind: "text", text: command.text, actorId: command.actorId };
+  }
+
+  await messageRepository.create(command.tenantId, {
+    conversationId: command.conversationId,
+    direction: "outbound",
+    status: result.accepted ? "sent" : "queued",
+    category: "service" as MessageCategory,
+    externalMessageId: result.messageId,
+    payload
+  });
+  incCounter("whatsapp_messages_sent_total", "Outbound WhatsApp template sends.", {
+    result: result.accepted ? "accepted" : "queued"
+  });
+  logger.info("outbound_sent", { conversationId: command.conversationId, externalMessageId: result.messageId });
+}
+
+/** Best-effort read receipt; never fails the inbound pipeline. */
+async function markRead(channel: ChannelCredentials, messageId: string | undefined, tenantId: string): Promise<void> {
+  if (!messageId) {
+    return;
+  }
+  try {
+    await fetch(`${config.metaAdapterUrl}/internal/v1/whatsapp/mark-read`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-tenant-id": tenantId, "x-request-id": randomUUID() },
+      body: JSON.stringify({ phoneNumberId: channel.phoneNumberId, messageId, accessToken: channel.accessToken })
+    });
+  } catch (error) {
+    logger.warn("mark_read_failed", { error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
 async function handleInbound(event: EventEnvelope): Promise<void> {
   incCounter("events_consumed_total", "Events consumed from the bus.", { topic: EventTopics.WhatsAppInboundReceived });
   const inbound = event.payload as InboundEvent;
@@ -148,14 +259,25 @@ async function handleInbound(event: EventEnvelope): Promise<void> {
   }
   const contact = await contactRepository.findOrCreateByPhone(channel.tenantId, inbound.from);
   const conversation = await conversationRepository.findOrCreate(channel.tenantId, contact.id, channel.channelId);
+  // Persist the full normalized message (text + any media/interactive/location/etc.).
+  const payload: Record<string, unknown> = { type: inbound.type, timestamp: inbound.timestamp };
+  for (const field of ["text", "profileName", "media", "interactive", "button", "location", "reaction", "contacts", "referral", "context"] as const) {
+    if (inbound[field] !== undefined) {
+      payload[field] = inbound[field];
+    }
+  }
   await messageRepository.create(channel.tenantId, {
     conversationId: conversation.id,
     direction: "inbound",
     status: "delivered",
     externalMessageId: inbound.messageId,
-    payload: { text: inbound.text, type: inbound.type, timestamp: inbound.timestamp }
+    payload
   });
-  logger.info("inbound_recorded", { tenantId: channel.tenantId, messageId: inbound.messageId });
+  logger.info("inbound_recorded", { tenantId: channel.tenantId, messageId: inbound.messageId, type: inbound.type });
+
+  // Send a read receipt (best-effort) using the resolved channel's credentials.
+  const sendChannel = await resolveSendChannel(channel.tenantId, channel.channelId);
+  await markRead(sendChannel, inbound.messageId, channel.tenantId);
 
   // Honour inbound STOP/START so opt-outs are respected automatically.
   if (isOptOutKeyword(inbound.text)) {
@@ -190,7 +312,17 @@ async function handleStatus(event: EventEnvelope): Promise<void> {
   if (!channel) {
     return;
   }
-  await messageRepository.updateStatusByExternalId(channel.tenantId, status.messageId, mapped);
+  const metaPatch: Record<string, unknown> = {};
+  if (status.pricing) {
+    metaPatch.pricing = status.pricing;
+  }
+  if (status.conversation) {
+    metaPatch.conversation = status.conversation;
+  }
+  if (mapped === "failed" && status.errors && status.errors.length > 0) {
+    metaPatch.error = status.errors[0];
+  }
+  await messageRepository.applyStatusUpdate(channel.tenantId, status.messageId, mapped, metaPatch);
 }
 
 interface DispatchResultEvent {
@@ -213,6 +345,7 @@ eventBus.subscribe(EventTopics.CampaignDispatchRequested, "campaign-dispatch", h
 eventBus.subscribe(EventTopics.CampaignDispatchResult, "campaign-results", handleDispatchResult);
 eventBus.subscribe(EventTopics.WhatsAppInboundReceived, "inbound-messages", handleInbound);
 eventBus.subscribe(EventTopics.WhatsAppStatusUpdated, "status-updates", handleStatus);
+eventBus.subscribe(EventTopics.WhatsAppOutboundRequested, "outbound-messages", handleOutbound);
 
 const server = createServer(async (req, res) => {
   const path = parseUrlPath(req.url);

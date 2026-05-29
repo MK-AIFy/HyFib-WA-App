@@ -15,33 +15,14 @@ import {
   incCounter,
   verifyMetaSignature
 } from "@hyfib/shared-core";
+import { normalizeInbound, normalizeStatus, type RawValue } from "./normalize.js";
 
 interface WebhookPayload {
   entry?: Array<{
     id?: string;
     changes?: Array<{
       field?: string;
-      value?: {
-        messaging_product?: string;
-        metadata?: {
-          phone_number_id?: string;
-        };
-        contacts?: Array<{ wa_id?: string }>;
-        messages?: Array<{
-          id?: string;
-          from?: string;
-          type?: string;
-          text?: { body?: string };
-          timestamp?: string;
-        }>;
-        statuses?: Array<{
-          id?: string;
-          status?: string;
-          recipient_id?: string;
-          timestamp?: string;
-          errors?: Array<{ code?: number; title?: string }>;
-        }>;
-      };
+      value?: RawValue;
     }>;
   }>;
 }
@@ -97,15 +78,7 @@ async function ingest(
         });
         await eventBus.publish(
           EventTopics.WhatsAppInboundReceived,
-          {
-            entryId: entry.id,
-            phoneNumberId: value.metadata?.phone_number_id,
-            messageId: message.id,
-            from: message.from,
-            text: message.text?.body,
-            timestamp: message.timestamp,
-            type: message.type
-          },
+          { ...normalizeInbound(value, message, entry.id) },
           tenantId
         );
       }
@@ -123,15 +96,7 @@ async function ingest(
         });
         await eventBus.publish(
           EventTopics.WhatsAppStatusUpdated,
-          {
-            entryId: entry.id,
-            phoneNumberId: value.metadata?.phone_number_id,
-            messageId: status.id,
-            status: status.status,
-            recipientId: status.recipient_id,
-            timestamp: status.timestamp,
-            errors: status.errors ?? []
-          },
+          { ...normalizeStatus(value, status, entry.id) },
           tenantId
         );
       }

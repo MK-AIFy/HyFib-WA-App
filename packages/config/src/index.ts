@@ -42,6 +42,7 @@ export interface PlatformConfig {
   whatsappPhoneNumberId: string;
   whatsappAccessToken: string;
   whatsappRegisterPin: string;
+  channelEncryptionKey: string;
   vaultAddr: string;
   anthropicModel: string;
   anthropicApiKey: string;
@@ -138,6 +139,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PlatformConfig
     whatsappPhoneNumberId: env.WHATSAPP_PHONE_NUMBER_ID ?? "",
     whatsappAccessToken: env.WHATSAPP_ACCESS_TOKEN ?? "",
     whatsappRegisterPin: env.WHATSAPP_REGISTER_PIN ?? "",
+    channelEncryptionKey: env.CHANNEL_ENCRYPTION_KEY ?? "",
     vaultAddr: env.VAULT_ADDR ?? "http://vault:8200",
     anthropicModel: env.ANTHROPIC_MODEL ?? "claude-opus-4-7",
     anthropicApiKey: env.ANTHROPIC_API_KEY ?? "",
