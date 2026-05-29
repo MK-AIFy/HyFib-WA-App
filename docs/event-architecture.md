@@ -39,9 +39,35 @@ idempotent.
 | Topic | Producer | Consumer | Effect |
 |-------|----------|----------|--------|
 | `campaign.dispatch.requested` | api-gateway (outbox) | notification-worker | send template, persist outbound message |
-| `campaign.dispatch.result` | notification-worker | (projection/metrics) | dispatch outcome |
-| `whatsapp.inbound.received` | webhook-ingestor | notification-worker | upsert contact/conversation, store inbound message |
-| `whatsapp.status.updated` | webhook-ingestor | notification-worker | update message status by external id |
+| `campaign.dispatch.result` | notification-worker | notification-worker (stats) | dispatch outcome → campaign tally |
+| `whatsapp.outbound.requested` | api-gateway (outbox) | notification-worker | send free-form session reply (text/media), persist outbound message |
+| `whatsapp.inbound.received` | webhook-ingestor | notification-worker | upsert contact/conversation, store full inbound message, mark read |
+| `whatsapp.status.updated` | webhook-ingestor | notification-worker | update message status + merge pricing/conversation/error metadata |
+| `template.status.updated` | api-gateway (template sync) | (projection/metrics) | local template reconciled with Meta |
+| `compliance.optout.event` | api-gateway / notification-worker | (projection) | contact opted out |
+
+## WhatsApp message coverage
+
+**Sending** (via `meta-adapter`, each call carrying the channel's number + token):
+
+- **Templates** — positional body params or structured components (header
+  text/media, body text/currency/date_time, button url/quick-reply).
+- **Session messages** — free-form `text` and `media` (image/video/audio/
+  document/sticker, by link or media id), plus `interactive` button/list menus.
+- **Read receipts** — `mark-read` is sent best-effort for each inbound message.
+
+**Receiving** — the webhook normalizer captures text, media (id/mime/sha256/
+caption/filename), interactive button & list replies, template quick-reply
+buttons, location, reactions, contacts, ad referrals and message context, plus
+the sender's WhatsApp profile name. A derived text summary keeps STOP/START
+opt-out detection working across every message type.
+
+**Per-tenant credentials** — `whatsapp_channels` may store an AES-256-GCM
+encrypted access token (`CHANNEL_ENCRYPTION_KEY`); the worker uses it per send,
+falling back to the env token when absent (single-WABA dev).
+
+**Template sync** — `POST /channels/whatsapp/:id/sync-templates` pulls the WABA's
+templates from Meta and reconciles local status/category/body.
 
 ## Idempotency
 
