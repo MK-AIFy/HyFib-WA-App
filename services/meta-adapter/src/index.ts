@@ -10,6 +10,7 @@ import {
   readJsonBody,
   requestContext,
   sendJson,
+  sendMetrics,
   type WhatsAppSendRequest,
   type WhatsAppSendResult
 } from "@hyfib/shared-core";
@@ -78,6 +79,11 @@ const server = createServer(async (req, res) => {
   const path = parseUrlPath(req.url);
   const method = req.method ?? "GET";
   const ctx = requestContext(req);
+
+  if (path === "/metrics") {
+    sendMetrics(res);
+    return;
+  }
 
   if (path === "/health") {
     sendJson(res, 200, {

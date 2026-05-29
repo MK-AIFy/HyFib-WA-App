@@ -24,6 +24,8 @@ export interface PlatformConfig {
   database: DatabaseConfig;
   keycloak: KeycloakConfig;
   authEnabled: boolean;
+  eventBus: "rabbitmq" | "memory";
+  rabbitmqUrl: string;
   apiGatewayPort: number;
   metaAdapterPort: number;
   webhookIngestorPort: number;
@@ -88,6 +90,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PlatformConfig
   const keycloakRealm = env.KEYCLOAK_REALM ?? "hyfib-wa";
   const keycloakIssuer = env.KEYCLOAK_ISSUER ?? `${keycloakBaseUrl}/realms/${keycloakRealm}`;
 
+  const rabbitUser = env.RABBITMQ_DEFAULT_USER ?? "platform";
+  const rabbitPass = env.RABBITMQ_DEFAULT_PASS ?? "";
+  const rabbitHost = env.RABBITMQ_HOST ?? "rabbitmq";
+  const rabbitPort = parseNumber("RABBITMQ_PORT", env.RABBITMQ_PORT, 5672);
+  const rabbitmqUrl =
+    env.RABBITMQ_URL ??
+    `amqp://${encodeURIComponent(rabbitUser)}:${encodeURIComponent(rabbitPass)}@${rabbitHost}:${rabbitPort}`;
+
   return {
     nodeEnv,
     logLevel: env.LOG_LEVEL ?? "info",
@@ -110,6 +120,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PlatformConfig
       audience: env.KEYCLOAK_AUDIENCE ?? "hyfib-platform"
     },
     authEnabled: parseBoolean(env.AUTH_ENABLED, true),
+    eventBus: (env.EVENT_BUS ?? "rabbitmq") === "memory" ? "memory" : "rabbitmq",
+    rabbitmqUrl,
     apiGatewayPort: parseNumber("API_GATEWAY_PORT", env.API_GATEWAY_PORT, 8080),
     metaAdapterPort: parseNumber("META_ADAPTER_PORT", env.META_ADAPTER_PORT, 8092),
     webhookIngestorPort: parseNumber("WEBHOOK_INGESTOR_PORT", env.WEBHOOK_INGESTOR_PORT, 8093),

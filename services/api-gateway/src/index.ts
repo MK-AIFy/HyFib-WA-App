@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { evaluateOutboundPolicy } from "@hyfib/policy-engine";
 import { loadConfig } from "@hyfib/config";
 import { createAuthenticator, hasAnyRole, AuthError, type AuthContext } from "@hyfib/auth";
+import { createEventBus, type EventBus } from "@hyfib/event-bus";
 import {
   auditRepository,
   campaignRepository,
@@ -12,10 +13,12 @@ import {
   conversationRepository,
   healthCheck,
   orderRepository,
+  outboxRepository,
   templateRepository,
   tenantAnalytics,
   tenantRepository,
   userRepository,
+  withTenant,
   type CampaignWithTemplate
 } from "@hyfib/persistence";
 import {
@@ -27,7 +30,10 @@ import {
   readRawBody,
   requestContext,
   sendJson,
+  sendMetrics,
+  incCounter,
   verifyMetaSignature,
+  EventTopics,
   type Role,
   type Template
 } from "@hyfib/shared-core";
@@ -96,6 +102,7 @@ interface CreateOrderRequest {
 const config = loadConfig();
 const logger = new Logger("api-gateway", config.logLevel as "debug" | "info" | "warn" | "error");
 const authenticator = createAuthenticator(config);
+const eventBus = createEventBus(config);
 const webhookIdempotency = new IdempotencyStore(24 * 60 * 60 * 1000);
 
 const E164 = /^\+[1-9]\d{7,14}$/;
@@ -153,6 +160,12 @@ async function audit(
   }
 }
 
+/**
+ * Validates policy, then durably enqueues the dispatch via the transactional
+ * outbox (atomic with the campaign status update). The outbox relay publishes
+ * it to RabbitMQ and the message-worker performs the actual send, so this
+ * returns 202 Accepted — results arrive asynchronously via status webhooks.
+ */
 async function dispatchCampaign(
   tenantId: string,
   campaign: CampaignWithTemplate,
@@ -183,39 +196,64 @@ async function dispatchCampaign(
     return { status: 409, body: { error: "No active WhatsApp channel configured for tenant" } };
   }
 
-  const workerResponse = await fetch(`${config.notificationWorkerUrl}/internal/v1/dispatch/campaign`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-request-id": randomUUID()
-    },
-    body: JSON.stringify({
-      campaignId: campaign.id,
-      tenantId,
-      channelId: channel.id,
-      templateName: campaign.templateName,
-      templateLanguage: campaign.templateLanguage,
-      templateCategory: campaign.templateCategory,
-      contactPhoneE164: payload.contactPhoneE164,
-      parameters: payload.parameters ?? []
-    })
+  await withTenant(tenantId, async (client) => {
+    await client.query("UPDATE campaigns SET status = 'running' WHERE id = $1", [campaign.id]);
+    await outboxRepository.enqueue(client, tenantId, {
+      topic: EventTopics.CampaignDispatchRequested,
+      payload: {
+        campaignId: campaign.id,
+        tenantId,
+        channelId: channel.id,
+        templateName: campaign.templateName,
+        templateLanguage: campaign.templateLanguage,
+        templateCategory: campaign.templateCategory,
+        contactPhoneE164: payload.contactPhoneE164,
+        parameters: payload.parameters ?? []
+      }
+    });
   });
 
-  const workerBody = (await workerResponse.json()) as Record<string, unknown>;
-  if (workerResponse.ok) {
-    await campaignRepository.setStatus(tenantId, campaign.id, "running");
-  }
+  return { status: 202, body: { status: "dispatch_enqueued", campaignId: campaign.id } };
+}
 
-  return {
-    status: workerResponse.status,
-    body: { status: "dispatch_triggered", notification: workerBody }
-  };
+/**
+ * Transactional-outbox relay: claims pending events and publishes them to the
+ * event bus, then marks them processed. At-least-once; consumers are idempotent.
+ */
+function startOutboxRelay(): NodeJS.Timeout {
+  let running = false;
+  return setInterval(() => {
+    if (running) {
+      return;
+    }
+    running = true;
+    void (async () => {
+      try {
+        const batch = await outboxRepository.claim(50);
+        for (const row of batch) {
+          await eventBus.publish(row.topic as typeof EventTopics[keyof typeof EventTopics], row.payload, row.tenant_id ?? undefined);
+          await outboxRepository.markProcessed(row.id);
+          incCounter("events_published_total", "Events published to the bus.", { topic: row.topic });
+        }
+      } catch (error) {
+        logger.error("outbox_relay_error", { error: error instanceof Error ? error.message : String(error) });
+      } finally {
+        running = false;
+      }
+    })();
+  }, 1_000);
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const method = req.method ?? "GET";
   const path = parseUrlPath(req.url);
   const ctx = requestContext(req);
+  incCounter("http_requests_total", "Total HTTP requests received.", { service: "api-gateway" });
+
+  if (path === "/metrics") {
+    sendMetrics(res);
+    return;
+  }
 
   if (path === "/health") {
     let db = false;
@@ -597,6 +635,8 @@ const server = createServer((req, res) => {
   });
 });
 
+const relayTimer = startOutboxRelay();
+
 server.listen(config.apiGatewayPort, () => {
   logger.info("service_started", { port: config.apiGatewayPort, nodeEnv: config.nodeEnv, authEnabled: config.authEnabled });
 });
@@ -607,7 +647,9 @@ server.on("error", (error) => {
 
 async function shutdown(signal: string): Promise<void> {
   logger.info("shutdown_started", { signal });
+  clearInterval(relayTimer);
   server.close(async () => {
+    await eventBus.close().catch(() => undefined);
     await closePool().catch(() => undefined);
     logger.info("shutdown_complete", { signal });
     process.exit(0);

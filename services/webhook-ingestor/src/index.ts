@@ -1,5 +1,5 @@
 import { createServer } from "node:http";
-import { RabbitMqEventBus } from "@hyfib/event-bus";
+import { createEventBus } from "@hyfib/event-bus";
 import { loadConfig } from "@hyfib/config";
 import {
   EventTopics,
@@ -11,6 +11,8 @@ import {
   readRawBody,
   requestContext,
   sendJson,
+  sendMetrics,
+  incCounter,
   verifyMetaSignature
 } from "@hyfib/shared-core";
 
@@ -52,7 +54,7 @@ interface ForwardedWebhookRequest {
 
 const config = loadConfig();
 const logger = new Logger("webhook-ingestor", config.logLevel as "debug" | "info" | "warn" | "error");
-const eventBus = new RabbitMqEventBus();
+const eventBus = createEventBus(config);
 const idempotency = new IdempotencyStore(24 * 60 * 60 * 1000);
 
 function safeJsonParse(value: string): WebhookPayload {
@@ -87,6 +89,7 @@ async function ingest(payload: WebhookPayload, tenantId?: string): Promise<{ inb
         }
 
         inbound += 1;
+        incCounter("events_published_total", "Events published to the bus.", { topic: EventTopics.WhatsAppInboundReceived });
         await eventBus.publish(
           EventTopics.WhatsAppInboundReceived,
           {
@@ -110,6 +113,7 @@ async function ingest(payload: WebhookPayload, tenantId?: string): Promise<{ inb
         }
 
         statuses += 1;
+        incCounter("events_published_total", "Events published to the bus.", { topic: EventTopics.WhatsAppStatusUpdated });
         await eventBus.publish(
           EventTopics.WhatsAppStatusUpdated,
           {
@@ -134,6 +138,11 @@ const server = createServer(async (req, res) => {
   const path = parseUrlPath(req.url);
   const method = req.method ?? "GET";
   const ctx = requestContext(req);
+
+  if (path === "/metrics") {
+    sendMetrics(res);
+    return;
+  }
 
   if (path === "/health") {
     sendJson(res, 200, {

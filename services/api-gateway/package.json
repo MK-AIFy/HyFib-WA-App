@@ -15,6 +15,7 @@
   "dependencies": {
     "@hyfib/auth": "workspace:*",
     "@hyfib/config": "workspace:*",
+    "@hyfib/event-bus": "workspace:*",
     "@hyfib/persistence": "workspace:*",
     "@hyfib/policy-engine": "workspace:*",
     "@hyfib/shared-core": "workspace:*"

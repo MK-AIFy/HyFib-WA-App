@@ -11,6 +11,11 @@
     "lint": "echo 'No lint configured for @hyfib/event-bus'"
   },
   "dependencies": {
-    "@hyfib/shared-core": "workspace:*"
+    "@hyfib/config": "workspace:*",
+    "@hyfib/shared-core": "workspace:*",
+    "amqplib": "0.10.4"
+  },
+  "devDependencies": {
+    "@types/amqplib": "0.10.5"
   }
 }

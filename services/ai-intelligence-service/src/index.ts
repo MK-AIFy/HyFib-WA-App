@@ -8,7 +8,8 @@ import {
   readJsonBody,
   redactPII,
   requestContext,
-  sendJson
+  sendJson,
+  sendMetrics
 } from "@hyfib/shared-core";
 
 interface DraftCampaignRequest {
@@ -125,6 +126,11 @@ const server = createServer(async (req, res) => {
   const path = parseUrlPath(req.url);
   const method = req.method ?? "GET";
   const ctx = requestContext(req);
+
+  if (path === "/metrics") {
+    sendMetrics(res);
+    return;
+  }
 
   if (path === "/health") {
     sendJson(res, 200, {

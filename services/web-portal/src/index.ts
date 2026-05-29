@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { loadConfig } from "@hyfib/config";
-import { Logger, parseUrlPath } from "@hyfib/shared-core";
+import { Logger, parseUrlPath, sendMetrics } from "@hyfib/shared-core";
 
 const config = loadConfig();
 const logger = new Logger("web-portal", config.logLevel as "debug" | "info" | "warn" | "error");
@@ -256,6 +256,11 @@ const html = `<!doctype html>
 
 const server = createServer((req, res) => {
   const path = parseUrlPath(req.url);
+
+  if (path === "/metrics") {
+    sendMetrics(res);
+    return;
+  }
 
   if (path === "/health") {
     const payload = JSON.stringify({

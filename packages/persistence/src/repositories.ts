@@ -4,6 +4,7 @@ import type {
   Campaign,
   Contact,
   Conversation,
+  Message,
   MessageCategory,
   Order,
   Role,
@@ -337,6 +338,19 @@ export const contactRepository = {
       );
       return result.rows[0] ? mapContact(result.rows[0]) : undefined;
     });
+  },
+  /** Used by the inbound-message consumer to ensure a contact exists. */
+  async findOrCreateByPhone(tenantId: string, phoneE164: string): Promise<Contact> {
+    return withTenant(tenantId, async (client) => {
+      const inserted = await client.query<ContactRow>(
+        `INSERT INTO contacts (tenant_id, phone_e164, metadata)
+         VALUES ($1, $2, '{"optedOut":false,"tags":[]}'::jsonb)
+         ON CONFLICT (tenant_id, phone_e164) DO UPDATE SET phone_e164 = EXCLUDED.phone_e164
+         RETURNING id, tenant_id, phone_e164, first_name, last_name, metadata`,
+        [tenantId, phoneE164]
+      );
+      return mapContact(inserted.rows[0]!);
+    });
   }
 };
 
@@ -472,8 +486,165 @@ export const conversationRepository = {
       );
       return result.rows.map(mapConversation);
     });
+  },
+  async findOrCreate(tenantId: string, contactId: string, channelId: string): Promise<Conversation> {
+    return withTenant(tenantId, async (client) => {
+      const existing = await client.query<ConversationRow>(
+        `SELECT id, tenant_id, contact_id, channel_id, last_message_at
+         FROM conversations WHERE contact_id = $1 AND channel_id = $2 LIMIT 1`,
+        [contactId, channelId]
+      );
+      if (existing.rows[0]) {
+        return mapConversation(existing.rows[0]);
+      }
+      const inserted = await client.query<ConversationRow>(
+        `INSERT INTO conversations (tenant_id, contact_id, channel_id)
+         VALUES ($1, $2, $3)
+         RETURNING id, tenant_id, contact_id, channel_id, last_message_at`,
+        [tenantId, contactId, channelId]
+      );
+      return mapConversation(inserted.rows[0]!);
+    });
   }
 };
+
+interface MessageRow {
+  id: string;
+  tenant_id: string;
+  conversation_id: string;
+  direction: string;
+  category: string | null;
+  external_message_id: string | null;
+  status: string;
+  payload: Record<string, unknown>;
+  created_at: Date;
+}
+
+function mapMessage(row: MessageRow): Message {
+  return {
+    id: row.id,
+    tenantId: row.tenant_id,
+    conversationId: row.conversation_id,
+    direction: row.direction as Message["direction"],
+    category: (row.category as MessageCategory) ?? undefined,
+    externalMessageId: row.external_message_id ?? undefined,
+    status: row.status as Message["status"],
+    payload: row.payload,
+    createdAt: row.created_at.toISOString()
+  };
+}
+
+export const messageRepository = {
+  async create(
+    tenantId: string,
+    input: {
+      conversationId: string;
+      direction: Message["direction"];
+      status: Message["status"];
+      payload: Record<string, unknown>;
+      category?: MessageCategory;
+      externalMessageId?: string;
+    }
+  ): Promise<Message> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<MessageRow>(
+        `INSERT INTO messages (tenant_id, conversation_id, direction, category, external_message_id, payload, status)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
+         RETURNING id, tenant_id, conversation_id, direction, category, external_message_id, payload, status, created_at`,
+        [
+          tenantId,
+          input.conversationId,
+          input.direction,
+          input.category ?? null,
+          input.externalMessageId ?? null,
+          JSON.stringify(input.payload),
+          input.status
+        ]
+      );
+      await client.query("UPDATE conversations SET last_message_at = now() WHERE id = $1", [input.conversationId]);
+      return mapMessage(result.rows[0]!);
+    });
+  },
+  async updateStatusByExternalId(tenantId: string, externalMessageId: string, status: Message["status"]): Promise<boolean> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query(
+        "UPDATE messages SET status = $2 WHERE external_message_id = $1",
+        [externalMessageId, status]
+      );
+      return (result.rowCount ?? 0) > 0;
+    });
+  }
+};
+
+export interface OutboxEnqueueInput {
+  topic: string;
+  payload: Record<string, unknown>;
+}
+
+export interface OutboxRow {
+  id: string;
+  tenant_id: string | null;
+  topic: string;
+  payload: Record<string, unknown>;
+  status: string;
+  created_at: Date;
+}
+
+export const outboxRepository = {
+  /** Enqueue an event in the SAME transaction as the domain change (atomic). */
+  async enqueue(client: QueryClient, tenantId: string, input: OutboxEnqueueInput): Promise<void> {
+    await client.query(
+      "INSERT INTO outbox_events (tenant_id, topic, payload, status) VALUES ($1, $2, $3::jsonb, 'pending')",
+      [tenantId, input.topic, JSON.stringify(input.payload)]
+    );
+  },
+  /** Claim a batch of pending/stuck rows for publishing (bypasses RLS via SECURITY DEFINER fn). */
+  async claim(limit: number): Promise<OutboxRow[]> {
+    const result = await query<OutboxRow>("SELECT * FROM outbox_claim($1)", [limit]);
+    return result.rows;
+  },
+  async markProcessed(id: string): Promise<void> {
+    await query("SELECT outbox_mark_processed($1)", [id]);
+  }
+};
+
+export const campaignSendLog = {
+  /** Returns true if this (campaign, phone) was newly claimed; false if already sent. */
+  async tryClaim(tenantId: string, campaignId: string, phoneE164: string): Promise<boolean> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query(
+        `INSERT INTO campaign_send_log (tenant_id, campaign_id, phone_e164)
+         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+        [tenantId, campaignId, phoneE164]
+      );
+      return (result.rowCount ?? 0) > 0;
+    });
+  },
+  /** Releases a claim so a failed send can be retried on redelivery. */
+  async release(tenantId: string, campaignId: string, phoneE164: string): Promise<void> {
+    await withTenant(tenantId, async (client) => {
+      await client.query(
+        "DELETE FROM campaign_send_log WHERE campaign_id = $1 AND phone_e164 = $2",
+        [campaignId, phoneE164]
+      );
+    });
+  }
+};
+
+export interface ResolvedChannel {
+  tenantId: string;
+  channelId: string;
+}
+
+/** System-level lookup (no tenant context) used by the inbound webhook consumer. */
+export async function resolveChannelByPhoneNumberId(phoneNumberId: string): Promise<ResolvedChannel | undefined> {
+  const result = await query<{ tenant_id: string; channel_id: string }>(
+    "SELECT tenant_id, channel_id FROM resolve_channel_by_phone_number_id($1)",
+    [phoneNumberId]
+  );
+  const row = result.rows[0];
+  return row ? { tenantId: row.tenant_id, channelId: row.channel_id } : undefined;
+}
 
 export interface TenantAnalytics {
   templates: number;
