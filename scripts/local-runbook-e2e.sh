@@ -155,6 +155,26 @@ if [[ -z "${CAMPAIGN_ID}" ]]; then
 fi
 echo "CAMPAIGN_ID=${CAMPAIGN_ID}"
 
+# Marketing requires a known, consented contact. Create one and record consent.
+CONTACT_ID="$(
+  curl -fsS -X POST "${BASE_URL}/api/v1/contacts" \
+    -H 'content-type: application/json' \
+    -H 'x-role: marketing_manager' \
+    -H "x-tenant-id: ${TENANT_ID}" \
+    -d "{\"phoneE164\":\"${CONTACT_PHONE}\",\"firstName\":\"Sam\"}" | jq -r '.id // empty'
+)"
+if [[ -z "${CONTACT_ID}" ]]; then
+  echo "Failed to create contact"
+  exit 1
+fi
+echo "CONTACT_ID=${CONTACT_ID}"
+
+curl -fsS -X POST "${BASE_URL}/api/v1/contacts/${CONTACT_ID}/consent" \
+  -H 'content-type: application/json' \
+  -H 'x-role: marketing_manager' \
+  -H "x-tenant-id: ${TENANT_ID}" \
+  -d '{"source":"e2e_runbook","policyVersion":"v1"}' | jq .
+
 # Dispatch is asynchronous now: expect HTTP 202 + {status:"dispatch_enqueued"}.
 curl -fsS -X POST "${BASE_URL}/api/v1/campaigns/${CAMPAIGN_ID}/dispatch" \
   -H 'content-type: application/json' \

@@ -23,11 +23,17 @@ Implemented at `api-gateway`:
 - `/api/v1/templates`
 - `/api/v1/campaigns`
 - `/api/v1/contacts`
+- `POST /api/v1/contacts/:id/consent` — record opt-in consent (required before marketing)
+- `POST /api/v1/contacts/:id/opt-out` — revoke consent + suppress future sends
 - `/api/v1/conversations`
 - `/api/v1/orders`
 - `/api/v1/analytics`
 - `/api/v1/audit`
 - `GET/POST /api/v1/webhooks/meta/whatsapp`
+
+Campaign dispatch is consent-gated: a contact must exist and have active,
+un-revoked consent (and not be opted out). Inbound **STOP** messages opt the
+contact out automatically; **START** re-subscribes.
 
 Web entrypoint:
 

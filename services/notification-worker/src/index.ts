@@ -5,6 +5,7 @@ import { loadConfig } from "@hyfib/config";
 import {
   campaignSendLog,
   closePool,
+  consentRepository,
   contactRepository,
   conversationRepository,
   healthCheck,
@@ -18,6 +19,8 @@ import {
   sendJson,
   sendMetrics,
   incCounter,
+  isOptInKeyword,
+  isOptOutKeyword,
   type CampaignDispatchRequest,
   type EventEnvelope,
   type Message,
@@ -152,6 +155,24 @@ async function handleInbound(event: EventEnvelope): Promise<void> {
     payload: { text: inbound.text, type: inbound.type, timestamp: inbound.timestamp }
   });
   logger.info("inbound_recorded", { tenantId: channel.tenantId, messageId: inbound.messageId });
+
+  // Honour inbound STOP/START so opt-outs are respected automatically.
+  if (isOptOutKeyword(inbound.text)) {
+    await consentRepository.revoke(channel.tenantId, contact.id, "inbound_stop");
+    await contactRepository.setOptedOut(channel.tenantId, contact.id, true);
+    await eventBus.publish(
+      EventTopics.ComplianceOptOutEvent,
+      { tenantId: channel.tenantId, contactId: contact.id, phoneE164: contact.phoneE164, reason: "inbound_stop" },
+      channel.tenantId
+    );
+    incCounter("contact_opt_outs_total", "Contacts opted out.", { source: "inbound_stop" });
+    logger.info("inbound_opt_out", { tenantId: channel.tenantId, contactId: contact.id });
+  } else if (isOptInKeyword(inbound.text)) {
+    await consentRepository.grant(channel.tenantId, contact.id, { source: "inbound_start", policyVersion: "v1" });
+    await contactRepository.setOptedOut(channel.tenantId, contact.id, false);
+    incCounter("contact_opt_ins_total", "Contacts opted in.", { source: "inbound_start" });
+    logger.info("inbound_opt_in", { tenantId: channel.tenantId, contactId: contact.id });
+  }
 }
 
 async function handleStatus(event: EventEnvelope): Promise<void> {

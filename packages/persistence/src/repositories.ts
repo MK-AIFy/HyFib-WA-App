@@ -348,6 +348,54 @@ export const contactRepository = {
       );
       return mapContact(inserted.rows[0]!);
     });
+  },
+  async getById(tenantId: string, id: string): Promise<Contact | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<ContactRow>(
+        "SELECT id, tenant_id, phone_e164, first_name, last_name, metadata FROM contacts WHERE id = $1",
+        [id]
+      );
+      return result.rows[0] ? mapContact(result.rows[0]) : undefined;
+    });
+  },
+  async setOptedOut(tenantId: string, contactId: string, optedOut: boolean): Promise<void> {
+    await withTenant(tenantId, async (client) => {
+      await client.query(
+        "UPDATE contacts SET metadata = jsonb_set(metadata, '{optedOut}', to_jsonb($2::boolean)) WHERE id = $1",
+        [contactId, optedOut]
+      );
+    });
+  }
+};
+
+export const consentRepository = {
+  async grant(tenantId: string, contactId: string, input: { source: string; policyVersion: string }): Promise<void> {
+    await withTenant(tenantId, async (client) => {
+      await client.query(
+        `INSERT INTO consent_records (tenant_id, contact_id, channel, source, policy_version, granted_at)
+         VALUES ($1, $2, 'whatsapp', $3, $4, now())`,
+        [tenantId, contactId, input.source, input.policyVersion]
+      );
+    });
+  },
+  async revoke(tenantId: string, contactId: string, reason: string): Promise<void> {
+    await withTenant(tenantId, async (client) => {
+      await client.query(
+        `UPDATE consent_records SET revoked_at = now(), revoked_reason = $2
+         WHERE contact_id = $1 AND revoked_at IS NULL`,
+        [contactId, reason]
+      );
+    });
+  },
+  /** A contact has active consent if it has at least one un-revoked consent record. */
+  async hasActiveConsent(tenantId: string, contactId: string): Promise<boolean> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query(
+        "SELECT 1 FROM consent_records WHERE contact_id = $1 AND revoked_at IS NULL LIMIT 1",
+        [contactId]
+      );
+      return (result.rowCount ?? 0) > 0;
+    });
   }
 };
 

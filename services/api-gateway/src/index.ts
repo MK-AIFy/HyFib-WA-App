@@ -9,6 +9,7 @@ import {
   campaignRepository,
   channelRepository,
   closePool,
+  consentRepository,
   contactRepository,
   conversationRepository,
   healthCheck,
@@ -172,12 +173,20 @@ async function dispatchCampaign(
   template: Template,
   payload: DispatchCampaignRequest
 ): Promise<{ status: number; body: Record<string, unknown> }> {
-  // Defence in depth: honour the opt-out we have on record regardless of the caller's flag.
+  // Consent and opt-out are authoritative from our own records, never trusted
+  // from the caller. Marketing requires a known, consented, non-opted-out contact.
   const knownContact = await contactRepository.findByPhone(tenantId, payload.contactPhoneE164);
-  const isOptedOut = payload.isOptedOut || (knownContact?.optedOut ?? false);
+  if (!knownContact) {
+    return {
+      status: 422,
+      body: { error: "campaign_blocked_by_policy", reason: "Unknown contact (no consent on record)" }
+    };
+  }
+  const isOptedOut = knownContact.optedOut;
+  const hasActiveConsent = await consentRepository.hasActiveConsent(tenantId, knownContact.id);
 
   const policy = evaluateOutboundPolicy({
-    hasActiveConsent: payload.hasActiveConsent,
+    hasActiveConsent,
     isInside24hWindow: payload.isInside24hWindow,
     template,
     requestedCategory: campaign.templateCategory,
@@ -575,6 +584,76 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return;
     }
     sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+
+  // Record opt-in consent for a contact (required before marketing sends).
+  if (path.startsWith("/api/v1/contacts/") && path.endsWith("/consent") && method === "POST") {
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager"])) {
+      sendJson(res, 403, { error: "Insufficient role to record consent" });
+      return;
+    }
+    const contactId = path.replace("/api/v1/contacts/", "").replace("/consent", "").trim();
+    if (!UUID.test(contactId)) {
+      sendJson(res, 400, { error: "Invalid contact id" });
+      return;
+    }
+    const contact = await contactRepository.getById(tenantId, contactId);
+    if (!contact) {
+      sendJson(res, 404, { error: "Contact not found" });
+      return;
+    }
+    const body = await readJsonBody<{ source?: string; policyVersion?: string }>(req);
+    await consentRepository.grant(tenantId, contactId, {
+      source: body.source ?? "manual",
+      policyVersion: body.policyVersion ?? "v1"
+    });
+    await contactRepository.setOptedOut(tenantId, contactId, false);
+    await audit(tenantId, auth, {
+      action: "consent.granted",
+      resourceType: "Contact",
+      resourceId: contactId,
+      payload: { source: body.source ?? "manual" }
+    });
+    sendJson(res, 201, { status: "consent_recorded", contactId });
+    return;
+  }
+
+  // Opt a contact out: revoke consent, suppress future sends, emit compliance event.
+  if (path.startsWith("/api/v1/contacts/") && path.endsWith("/opt-out") && method === "POST") {
+    if (
+      !hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager", "support_agent", "compliance_auditor"])
+    ) {
+      sendJson(res, 403, { error: "Insufficient role to opt out a contact" });
+      return;
+    }
+    const contactId = path.replace("/api/v1/contacts/", "").replace("/opt-out", "").trim();
+    if (!UUID.test(contactId)) {
+      sendJson(res, 400, { error: "Invalid contact id" });
+      return;
+    }
+    const contact = await contactRepository.getById(tenantId, contactId);
+    if (!contact) {
+      sendJson(res, 404, { error: "Contact not found" });
+      return;
+    }
+    const body = await readJsonBody<{ reason?: string }>(req);
+    const reason = body.reason ?? "manual_opt_out";
+    await consentRepository.revoke(tenantId, contactId, reason);
+    await contactRepository.setOptedOut(tenantId, contactId, true);
+    await withTenant(tenantId, async (client) => {
+      await outboxRepository.enqueue(client, tenantId, {
+        topic: EventTopics.ComplianceOptOutEvent,
+        payload: { tenantId, contactId, phoneE164: contact.phoneE164, reason }
+      });
+    });
+    await audit(tenantId, auth, {
+      action: "contact.opted_out",
+      resourceType: "Contact",
+      resourceId: contactId,
+      payload: { reason }
+    });
+    sendJson(res, 200, { status: "opted_out", contactId });
     return;
   }
 
