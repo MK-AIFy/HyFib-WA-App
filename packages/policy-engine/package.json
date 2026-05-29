@@ -8,7 +8,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "node --test",
-    "lint": "echo 'No lint configured for @hyfib/policy-engine'"
+    "lint": "eslint src"
   },
   "dependencies": {
     "@hyfib/shared-core": "workspace:*"

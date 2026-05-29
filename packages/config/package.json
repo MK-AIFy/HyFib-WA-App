@@ -8,6 +8,6 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "node --test",
-    "lint": "echo 'No lint configured for @hyfib/config'"
+    "lint": "eslint src"
   }
 }
