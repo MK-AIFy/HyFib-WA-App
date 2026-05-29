@@ -14,7 +14,12 @@ import type {
   WhatsAppChannel
 } from "@hyfib/shared-core";
 
-export type CampaignWithTemplate = Campaign & { templateName: string; templateLanguage: string };
+export type CampaignWithTemplate = Campaign & {
+  templateName: string;
+  templateLanguage: string;
+  sentCount: number;
+  failedCount: number;
+};
 
 interface TenantRow {
   id: string;
@@ -228,6 +233,8 @@ interface CampaignRow {
   template_name: string;
   template_language: string;
   template_category: string;
+  sent_count: string | null;
+  failed_count: string | null;
 }
 
 function mapCampaign(row: CampaignRow): CampaignWithTemplate {
@@ -240,15 +247,19 @@ function mapCampaign(row: CampaignRow): CampaignWithTemplate {
     status: row.status as Campaign["status"],
     createdAt: row.created_at.toISOString(),
     templateName: row.template_name,
-    templateLanguage: row.template_language
+    templateLanguage: row.template_language,
+    sentCount: Number(row.sent_count ?? "0"),
+    failedCount: Number(row.failed_count ?? "0")
   };
 }
 
 const CAMPAIGN_SELECT = `
   SELECT c.id, c.tenant_id, c.name, c.template_id, c.status, c.created_at,
-         t.name AS template_name, t.language AS template_language, t.category AS template_category
+         t.name AS template_name, t.language AS template_language, t.category AS template_category,
+         s.sent_count, s.failed_count
   FROM campaigns c
   JOIN templates t ON t.id = c.template_id
+  LEFT JOIN campaign_stats s ON s.campaign_id = c.id
 `;
 
 export const campaignRepository = {
@@ -277,6 +288,23 @@ export const campaignRepository = {
   async setStatus(tenantId: string, id: string, status: Campaign["status"]): Promise<void> {
     await withTenant(tenantId, async (client) => {
       await client.query("UPDATE campaigns SET status = $2 WHERE id = $1", [id, status]);
+    });
+  }
+};
+
+export const campaignStatsRepository = {
+  /** Idempotently records a per-contact dispatch outcome onto the campaign tally. */
+  async recordResult(tenantId: string, campaignId: string, outcome: "sent" | "failed"): Promise<void> {
+    await withTenant(tenantId, async (client) => {
+      await client.query(
+        `INSERT INTO campaign_stats (tenant_id, campaign_id, sent_count, failed_count, last_result_at)
+         VALUES ($1, $2, $3, $4, now())
+         ON CONFLICT (tenant_id, campaign_id) DO UPDATE
+           SET sent_count = campaign_stats.sent_count + EXCLUDED.sent_count,
+               failed_count = campaign_stats.failed_count + EXCLUDED.failed_count,
+               last_result_at = now()`,
+        [tenantId, campaignId, outcome === "sent" ? 1 : 0, outcome === "failed" ? 1 : 0]
+      );
     });
   }
 };

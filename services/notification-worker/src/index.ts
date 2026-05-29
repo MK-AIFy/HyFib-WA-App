@@ -4,6 +4,7 @@ import { createEventBus } from "@hyfib/event-bus";
 import { loadConfig } from "@hyfib/config";
 import {
   campaignSendLog,
+  campaignStatsRepository,
   closePool,
   consentRepository,
   contactRepository,
@@ -192,7 +193,24 @@ async function handleStatus(event: EventEnvelope): Promise<void> {
   await messageRepository.updateStatusByExternalId(channel.tenantId, status.messageId, mapped);
 }
 
+interface DispatchResultEvent {
+  campaignId?: string;
+  tenantId?: string;
+  status?: string;
+}
+
+async function handleDispatchResult(event: EventEnvelope): Promise<void> {
+  incCounter("events_consumed_total", "Events consumed from the bus.", { topic: EventTopics.CampaignDispatchResult });
+  const result = event.payload as DispatchResultEvent;
+  if (!result.tenantId || !result.campaignId) {
+    return;
+  }
+  const outcome = result.status === "failed" ? "failed" : "sent";
+  await campaignStatsRepository.recordResult(result.tenantId, result.campaignId, outcome);
+}
+
 eventBus.subscribe(EventTopics.CampaignDispatchRequested, "campaign-dispatch", handleDispatch);
+eventBus.subscribe(EventTopics.CampaignDispatchResult, "campaign-results", handleDispatchResult);
 eventBus.subscribe(EventTopics.WhatsAppInboundReceived, "inbound-messages", handleInbound);
 eventBus.subscribe(EventTopics.WhatsAppStatusUpdated, "status-updates", handleStatus);
 
