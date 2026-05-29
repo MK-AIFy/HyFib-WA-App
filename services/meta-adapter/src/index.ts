@@ -33,14 +33,36 @@ interface GraphError {
   code?: number;
 }
 
-async function graphRequest(path: string, method: "GET" | "POST", body?: Record<string, unknown>): Promise<Response> {
-  if (!config.whatsappAccessToken) {
-    throw new Error("WHATSAPP_ACCESS_TOKEN is not configured");
-  }
+// Simple circuit breaker shared across all Graph calls: after a run of
+// failures we stop hammering the API for a cooldown window.
+const BREAKER_THRESHOLD = 5;
+const BREAKER_OPEN_MS = 30_000;
+const MAX_ATTEMPTS = 4;
+const BASE_BACKOFF_MS = 500;
+let consecutiveFailures = 0;
+let breakerOpenUntil = 0;
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function backoffDelay(attempt: number, retryAfterHeader: string | null): number {
+  const retryAfter = retryAfterHeader ? Number(retryAfterHeader) : NaN;
+  if (Number.isFinite(retryAfter) && retryAfter > 0) {
+    return Math.min(retryAfter * 1000, 30_000);
+  }
+  const expo = BASE_BACKOFF_MS * 2 ** (attempt - 1);
+  const jitter = Math.floor(Math.random() * BASE_BACKOFF_MS);
+  return Math.min(expo + jitter, 30_000);
+}
+
+async function rawGraphRequest(
+  path: string,
+  method: "GET" | "POST",
+  body?: Record<string, unknown>
+): Promise<Response> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10_000);
-
   try {
     return await fetch(`https://graph.facebook.com/${config.whatsappGraphVersion}${path}`, {
       method,
@@ -53,6 +75,56 @@ async function graphRequest(path: string, method: "GET" | "POST", body?: Record<
     });
   } finally {
     clearTimeout(timeout);
+  }
+}
+
+/**
+ * Resilient Graph API call: opens a circuit breaker after repeated failures and
+ * retries transient errors (429/5xx, network/timeouts) with exponential backoff
+ * + jitter, honouring Retry-After. 4xx responses (other than 429) are returned
+ * immediately since retrying them is pointless.
+ */
+async function graphRequest(path: string, method: "GET" | "POST", body?: Record<string, unknown>): Promise<Response> {
+  if (!config.whatsappAccessToken) {
+    throw new Error("WHATSAPP_ACCESS_TOKEN is not configured");
+  }
+  if (Date.now() < breakerOpenUntil) {
+    throw new Error("graph_circuit_open");
+  }
+
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    try {
+      const response = await rawGraphRequest(path, method, body);
+      if (response.status !== 429 && response.status < 500) {
+        consecutiveFailures = 0;
+        return response;
+      }
+      // Transient server-side error: back off and retry unless out of attempts.
+      if (attempt < MAX_ATTEMPTS) {
+        await sleep(backoffDelay(attempt, response.headers.get("retry-after")));
+        continue;
+      }
+      registerFailure();
+      return response;
+    } catch (error) {
+      lastError = error;
+      if (attempt < MAX_ATTEMPTS) {
+        await sleep(backoffDelay(attempt, null));
+        continue;
+      }
+    }
+  }
+  registerFailure();
+  throw lastError instanceof Error ? lastError : new Error("graph_request_failed");
+}
+
+function registerFailure(): void {
+  consecutiveFailures += 1;
+  if (consecutiveFailures >= BREAKER_THRESHOLD) {
+    breakerOpenUntil = Date.now() + BREAKER_OPEN_MS;
+    consecutiveFailures = 0;
+    logger.warn("graph_circuit_opened", { cooldownMs: BREAKER_OPEN_MS });
   }
 }
 

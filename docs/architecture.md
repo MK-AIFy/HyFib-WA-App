@@ -16,23 +16,21 @@
 - TLS 1.3 termination and strict inbound controls.
 - Meta webhook source filtering and rate limiting.
 
-2. Application plane:
-- `web-portal`
-- `api-gateway`
-- `auth-service`
-- `tenant-service`
-- `contact-service`
-- `conversation-service`
-- `campaign-service`
-- `template-service`
-- `commerce-service`
-- `billing-usage-service`
-- `reporting-service`
-- `audit-service`
-- `meta-adapter`
-- `webhook-ingestor`
-- `notification-worker`
-- `ai-intelligence-service`
+2. Application plane (consolidated to six runtime services):
+- `api-gateway` — authenticated, PostgreSQL-backed core API (tenants, users,
+  channels, templates, campaigns, contacts, orders, analytics, audit, webhooks)
+  and the transactional-outbox relay.
+- `web-portal` — operator UI.
+- `meta-adapter` — WhatsApp Cloud API integration (resilient: retry/backoff +
+  circuit breaker).
+- `webhook-ingestor` — inbound webhook HMAC verification + event publication.
+- `notification-worker` (message-worker) — consumes campaign/inbound/status
+  events; sends templates and persists conversations + messages + statuses.
+- `ai-intelligence-service` — internal backoffice intelligence.
+
+The earlier per-domain microservices (`auth/tenant/contact/conversation/campaign/
+template/commerce/billing/reporting/audit-service`) were empty stubs and have
+been consolidated into `api-gateway`. Identity is delegated to Keycloak.
 
 3. Data plane:
 - PostgreSQL 16 with replication topology.
@@ -55,14 +53,28 @@
 
 ## Messaging Flow
 
-1. Outbound campaign request enters `api-gateway`.
-2. Policy checks validate consent, template category, rate/frequency constraints.
-3. Command published to `campaign.dispatch.requested`.
-4. `notification-worker` consumes command and calls `meta-adapter`.
-5. `meta-adapter` sends Graph API request to WhatsApp Cloud API.
-6. Delivery states arrive through webhook endpoint.
-7. `webhook-ingestor` validates signature, deduplicates, publishes status event.
-8. `conversation-service` and `reporting-service` update projections.
+Outbound (campaign dispatch):
+1. Authenticated dispatch request enters `api-gateway`.
+2. Policy checks validate consent, opt-out (from stored contacts), template
+   category, quiet hours, and frequency constraints.
+3. In one DB transaction the gateway sets the campaign `running` and writes a
+   `campaign.dispatch.requested` row to the **outbox**; it returns `202 Accepted`.
+4. The gateway's **outbox relay** publishes pending rows to RabbitMQ (durable
+   topic exchange, publisher confirms) and marks them processed.
+5. `notification-worker` consumes the event (idempotent via `campaign_send_log`),
+   calls `meta-adapter`, and persists an outbound `message` with the
+   `external_message_id`, then publishes `campaign.dispatch.result`.
+
+Inbound + status:
+6. Meta calls the webhook; `api-gateway` verifies HMAC and forwards to
+   `webhook-ingestor`, which re-verifies, deduplicates, and publishes
+   `whatsapp.inbound.received` / `whatsapp.status.updated`.
+7. `notification-worker` consumes these, resolves the tenant/channel from the
+   `phone_number_id` (RLS-safe `SECURITY DEFINER` function), upserts the contact +
+   conversation, records the inbound message, and updates delivery status by
+   `external_message_id`.
+
+See [`event-architecture.md`](event-architecture.md) for the full eventing design.
 
 ## Web Access Flow
 

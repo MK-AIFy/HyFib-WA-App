@@ -98,19 +98,19 @@ curl http://localhost:18080/health      # api-gateway direct (DB-backed)
 
 ## Important limitations
 
-- The core platform (auth + persistence + WhatsApp marketing dispatch) is
-  implemented and tested at the unit level. End-to-end validation requires a
-  running stack (PostgreSQL, Keycloak, Meta credentials).
-- Inter-service eventing still uses an in-memory bus; `RabbitMqEventBus` is a
-  placeholder pending durable-transport wiring (see operational gaps doc).
-- Database HA topology in Compose is reference-oriented for lab/staging and must
-  be hardened for your real on-prem environment.
-- Vault runs in dev mode and Keycloak in `start-dev`; both must be moved to
-  production modes (integrated storage / `start`) before go-live.
-- Integrations (Meta, Keycloak, Vault, SIEM, SMTP, payment providers) require
-  environment-specific credentials and network controls.
-- The helper scripts under `scripts/` predate JWT auth and assume
-  `AUTH_ENABLED=false`; update them to obtain a Keycloak token before use.
+- The core platform (auth + persistence + durable RabbitMQ eventing + WhatsApp
+  marketing dispatch + inbound/status persistence) is implemented with unit and
+  DB integration tests. A full live round-trip still requires a running stack
+  (PostgreSQL, Keycloak, RabbitMQ) and real Meta WABA credentials.
+- Campaign dispatch is **asynchronous**: `POST /campaigns/:id/dispatch` returns
+  `202 Accepted`; the send happens via the outbox relay → RabbitMQ →
+  message-worker, and outcomes arrive via status webhooks.
+- For production infra (Vault server mode, Keycloak `start`, OpenSearch security,
+  Postgres HA, WAF) use `docker-compose.prod.yml` + the runbooks under
+  `docs/runbooks/`. True multi-node HA is environment-specific.
+- The `scripts/local-runbook-e2e.sh` helper runs with `AUTH_ENABLED=false`
+  (header identity); for production use a Keycloak bearer token
+  (see `docs/runbooks/keycloak-production.md`).
 
 ## Documentation
 

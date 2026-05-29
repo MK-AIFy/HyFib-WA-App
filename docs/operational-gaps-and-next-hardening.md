@@ -24,6 +24,26 @@ This implementation provides a production-grade foundation, but these items must
 - **Graceful shutdown**: gateway drains connections and closes the pool on
   SIGTERM/SIGINT.
 
+## 0b) Resolved in the production-completion iteration
+
+- **Durable eventing**: real RabbitMQ transport (durable topic exchange, confirm
+  channel, DLX/DLQ, auto-reconnect) replaces the in-memory placeholder, with a
+  transactional outbox + relay for atomic, at-least-once delivery.
+- **Message lifecycle**: inbound messages and delivery statuses are now consumed
+  and persisted (conversations + messages); campaign dispatch is asynchronous
+  (202) and idempotent.
+- **Observability**: Prometheus `/metrics` on every service.
+- **Quality gates**: ESLint + Prettier, expanded unit/integration tests, and a
+  hardened CI (frozen lockfile, lint/format, Postgres+RabbitMQ integration job,
+  Trivy image scan).
+- **Production overlay**: `docker-compose.prod.yml` (Keycloak `start`, Vault
+  server mode, OpenSearch security on) plus runbooks under `docs/runbooks/`.
+- **Meta resilience**: retry/backoff + circuit breaker around Graph API calls.
+
+The items below remain environment-specific and are delivered as configuration
+plus runbooks (not turnkey automation), to be completed against the client's
+hardware/network.
+
 ## 1) Replace Lab Defaults
 
 - Replace Vault dev mode with HA integrated storage and auto-unseal.

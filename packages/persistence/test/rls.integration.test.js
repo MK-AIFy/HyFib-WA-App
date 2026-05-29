@@ -1,12 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {
-  tenantRepository,
-  contactRepository,
-  outboxRepository,
-  withTenant,
-  closePool
-} from "../dist/index.js";
+import { tenantRepository, contactRepository, outboxRepository, withTenant, closePool } from "../dist/index.js";
 
 // These tests require a live PostgreSQL with the schema + app role applied.
 // CI provides it via service containers; locally run with RUN_DB_TESTS=1.

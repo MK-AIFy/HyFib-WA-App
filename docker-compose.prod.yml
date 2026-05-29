@@ -1,0 +1,76 @@
+# Production overlay for the HyFib WhatsApp platform.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# This overlay switches the supporting infrastructure out of dev/lab mode:
+#   - Keycloak runs in production mode behind the edge proxy.
+#   - Vault runs as a real server with persistent (raft) storage (init + unseal
+#     per docs/runbooks/vault-init-unseal.md).
+#   - OpenSearch enables its security plugin.
+#   - Application services run with NODE_ENV=production (fail-fast on placeholder
+#     secrets) against RabbitMQ (durable eventing).
+#
+# Multi-node HA (Postgres streaming replication, Vault raft cluster, OpenSearch
+# cluster) and a perimeter WAF are environment-specific; see the runbooks under
+# docs/runbooks/.
+
+services:
+  keycloak:
+    command: start --optimized --import-realm
+    environment:
+      KC_DB: postgres
+      KC_DB_URL_HOST: postgres-primary
+      KC_DB_URL_DATABASE: ${POSTGRES_DB}
+      KC_DB_USERNAME: ${POSTGRES_USER}
+      KC_DB_PASSWORD: ${POSTGRES_PASSWORD}
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+      KC_HOSTNAME: ${KEYCLOAK_PUBLIC_HOSTNAME}
+      KC_PROXY_HEADERS: xforwarded
+      KC_HTTP_ENABLED: "true"
+      KC_HEALTH_ENABLED: "true"
+
+  vault:
+    command: ["vault", "server", "-config=/vault/config/config.hcl"]
+    environment:
+      VAULT_ADDR: http://127.0.0.1:8200
+    volumes:
+      - ./infra/vault/config.hcl:/vault/config/config.hcl:ro
+      - vault_data:/vault/data
+    # Dev root token is intentionally NOT set; initialise and unseal per runbook.
+
+  opensearch:
+    environment:
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - "OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g"
+      - DISABLE_SECURITY_PLUGIN=false
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=${OPENSEARCH_ADMIN_PASSWORD}
+
+  api-gateway:
+    environment:
+      NODE_ENV: production
+
+  meta-adapter:
+    environment:
+      NODE_ENV: production
+
+  webhook-ingestor:
+    environment:
+      NODE_ENV: production
+
+  notification-worker:
+    environment:
+      NODE_ENV: production
+
+  ai-intelligence-service:
+    environment:
+      NODE_ENV: production
+
+  web-portal:
+    environment:
+      NODE_ENV: production
+
+volumes:
+  vault_data:
