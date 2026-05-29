@@ -69,7 +69,10 @@ function deriveTenantId(payload: WebhookPayload, fallbackTenantId?: string): str
   return payload.entry?.[0]?.id ?? fallbackTenantId;
 }
 
-async function ingest(payload: WebhookPayload, tenantId?: string): Promise<{ inbound: number; statuses: number; duplicates: number }> {
+async function ingest(
+  payload: WebhookPayload,
+  tenantId?: string
+): Promise<{ inbound: number; statuses: number; duplicates: number }> {
   let inbound = 0;
   let statuses = 0;
   let duplicates = 0;
@@ -89,7 +92,9 @@ async function ingest(payload: WebhookPayload, tenantId?: string): Promise<{ inb
         }
 
         inbound += 1;
-        incCounter("events_published_total", "Events published to the bus.", { topic: EventTopics.WhatsAppInboundReceived });
+        incCounter("events_published_total", "Events published to the bus.", {
+          topic: EventTopics.WhatsAppInboundReceived
+        });
         await eventBus.publish(
           EventTopics.WhatsAppInboundReceived,
           {
@@ -113,7 +118,9 @@ async function ingest(payload: WebhookPayload, tenantId?: string): Promise<{ inb
         }
 
         statuses += 1;
-        incCounter("events_published_total", "Events published to the bus.", { topic: EventTopics.WhatsAppStatusUpdated });
+        incCounter("events_published_total", "Events published to the bus.", {
+          topic: EventTopics.WhatsAppStatusUpdated
+        });
         await eventBus.publish(
           EventTopics.WhatsAppStatusUpdated,
           {

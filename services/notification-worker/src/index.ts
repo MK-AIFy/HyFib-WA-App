@@ -70,7 +70,11 @@ async function sendTemplate(command: CampaignDispatchRequest): Promise<{ message
   return { messageId: body.result?.messageId, accepted: body.result?.status === "accepted" };
 }
 
-async function recordOutbound(command: CampaignDispatchRequest, messageId: string | undefined, accepted: boolean): Promise<void> {
+async function recordOutbound(
+  command: CampaignDispatchRequest,
+  messageId: string | undefined,
+  accepted: boolean
+): Promise<void> {
   const contact = await contactRepository.findOrCreateByPhone(command.tenantId, command.contactPhoneE164);
   const conversation = await conversationRepository.findOrCreate(command.tenantId, contact.id, command.channelId);
   await messageRepository.create(command.tenantId, {
@@ -84,7 +88,9 @@ async function recordOutbound(command: CampaignDispatchRequest, messageId: strin
 }
 
 async function handleDispatch(event: EventEnvelope): Promise<void> {
-  incCounter("events_consumed_total", "Events consumed from the bus.", { topic: EventTopics.CampaignDispatchRequested });
+  incCounter("events_consumed_total", "Events consumed from the bus.", {
+    topic: EventTopics.CampaignDispatchRequested
+  });
   const command = event.payload as CampaignDispatchRequest;
   if (!command.campaignId || !command.tenantId || !command.contactPhoneE164) {
     logger.warn("dispatch_invalid_command", { eventId: event.id });
@@ -99,16 +105,28 @@ async function handleDispatch(event: EventEnvelope): Promise<void> {
   try {
     const result = await sendTemplate(command);
     await recordOutbound(command, result.messageId, result.accepted);
-    incCounter("whatsapp_messages_sent_total", "Outbound WhatsApp template sends.", { result: result.accepted ? "accepted" : "queued" });
+    incCounter("whatsapp_messages_sent_total", "Outbound WhatsApp template sends.", {
+      result: result.accepted ? "accepted" : "queued"
+    });
     await eventBus.publish(
       EventTopics.CampaignDispatchResult,
-      { campaignId: command.campaignId, tenantId: command.tenantId, externalMessageId: result.messageId, status: result.accepted ? "sent" : "queued" },
+      {
+        campaignId: command.campaignId,
+        tenantId: command.tenantId,
+        externalMessageId: result.messageId,
+        status: result.accepted ? "sent" : "queued"
+      },
       command.tenantId
     );
     logger.info("dispatch_sent", { campaignId: command.campaignId, externalMessageId: result.messageId });
   } catch (error) {
-    await campaignSendLog.release(command.tenantId, command.campaignId, command.contactPhoneE164).catch(() => undefined);
-    logger.error("dispatch_failed", { campaignId: command.campaignId, error: error instanceof Error ? error.message : String(error) });
+    await campaignSendLog
+      .release(command.tenantId, command.campaignId, command.contactPhoneE164)
+      .catch(() => undefined);
+    logger.error("dispatch_failed", {
+      campaignId: command.campaignId,
+      error: error instanceof Error ? error.message : String(error)
+    });
     throw error; // Trigger broker retry / DLQ.
   }
 }
@@ -170,14 +188,23 @@ const server = createServer(async (req, res) => {
     } catch {
       db = false;
     }
-    sendJson(res, db ? 200 : 503, { service: "message-worker", status: db ? "ok" : "degraded", database: db, timestamp: new Date().toISOString() });
+    sendJson(res, db ? 200 : 503, {
+      service: "message-worker",
+      status: db ? "ok" : "degraded",
+      database: db,
+      timestamp: new Date().toISOString()
+    });
     return;
   }
   sendJson(res, 404, { error: "route_not_found" });
 });
 
 server.listen(config.notificationWorkerPort, () => {
-  logger.info("service_started", { port: config.notificationWorkerPort, nodeEnv: config.nodeEnv, eventBus: config.eventBus });
+  logger.info("service_started", {
+    port: config.notificationWorkerPort,
+    nodeEnv: config.nodeEnv,
+    eventBus: config.eventBus
+  });
 });
 
 server.on("error", (error) => {

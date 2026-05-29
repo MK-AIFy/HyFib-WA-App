@@ -45,10 +45,7 @@ export const tenantRepository = {
     return result.rows.map(mapTenant);
   },
   async getById(id: string): Promise<Tenant | undefined> {
-    const result = await query<TenantRow>(
-      "SELECT id, name, status, created_at FROM tenants WHERE id = $1",
-      [id]
-    );
+    const result = await query<TenantRow>("SELECT id, name, status, created_at FROM tenants WHERE id = $1", [id]);
     return result.rows[0] ? mapTenant(result.rows[0]) : undefined;
   }
 };
@@ -431,7 +428,13 @@ function mapAudit(row: AuditRow): AuditEvent {
 export const auditRepository = {
   async add(
     tenantId: string,
-    event: { actorId?: string; action: string; resourceType: string; resourceId?: string; payload: Record<string, unknown> }
+    event: {
+      actorId?: string;
+      action: string;
+      resourceType: string;
+      resourceId?: string;
+      payload: Record<string, unknown>;
+    }
   ): Promise<void> {
     await withTenant(tenantId, async (client) => {
       await client.query(
@@ -565,12 +568,16 @@ export const messageRepository = {
       return mapMessage(result.rows[0]!);
     });
   },
-  async updateStatusByExternalId(tenantId: string, externalMessageId: string, status: Message["status"]): Promise<boolean> {
+  async updateStatusByExternalId(
+    tenantId: string,
+    externalMessageId: string,
+    status: Message["status"]
+  ): Promise<boolean> {
     return withTenant(tenantId, async (client) => {
-      const result = await client.query(
-        "UPDATE messages SET status = $2 WHERE external_message_id = $1",
-        [externalMessageId, status]
-      );
+      const result = await client.query("UPDATE messages SET status = $2 WHERE external_message_id = $1", [
+        externalMessageId,
+        status
+      ]);
       return (result.rowCount ?? 0) > 0;
     });
   }
@@ -623,10 +630,10 @@ export const campaignSendLog = {
   /** Releases a claim so a failed send can be retried on redelivery. */
   async release(tenantId: string, campaignId: string, phoneE164: string): Promise<void> {
     await withTenant(tenantId, async (client) => {
-      await client.query(
-        "DELETE FROM campaign_send_log WHERE campaign_id = $1 AND phone_e164 = $2",
-        [campaignId, phoneE164]
-      );
+      await client.query("DELETE FROM campaign_send_log WHERE campaign_id = $1 AND phone_e164 = $2", [
+        campaignId,
+        phoneE164
+      ]);
     });
   }
 };

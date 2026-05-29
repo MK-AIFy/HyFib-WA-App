@@ -41,9 +41,7 @@ test("blocks when there is no active consent", () => {
 });
 
 test("blocks an unapproved template outside the 24h window", () => {
-  const result = evaluateOutboundPolicy(
-    baseContext({ template: { ...approvedMarketing, status: "pending" } })
-  );
+  const result = evaluateOutboundPolicy(baseContext({ template: { ...approvedMarketing, status: "pending" } }));
   assert.equal(result.allowed, false);
   assert.match(result.reason, /not approved/i);
 });

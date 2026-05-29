@@ -93,7 +93,17 @@ services:
   redis-replica:
     image: redis:7.4-alpine
     container_name: redis-replica
-    command: ["redis-server", "--replicaof", "redis-master", "6379", "--masterauth", "${REDIS_PASSWORD}", "--requirepass", "${REDIS_PASSWORD}"]
+    command:
+      [
+        "redis-server",
+        "--replicaof",
+        "redis-master",
+        "6379",
+        "--masterauth",
+        "${REDIS_PASSWORD}",
+        "--requirepass",
+        "${REDIS_PASSWORD}"
+      ]
     depends_on:
       - redis-master
     volumes:
@@ -271,7 +281,13 @@ services:
     ports:
       - "18080:8080"
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        ]
       interval: 30s
       timeout: 5s
       retries: 5

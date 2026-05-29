@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { evaluateOutboundPolicy } from "@hyfib/policy-engine";
 import { loadConfig } from "@hyfib/config";
 import { createAuthenticator, hasAnyRole, AuthError, type AuthContext } from "@hyfib/auth";
-import { createEventBus, type EventBus } from "@hyfib/event-bus";
+import { createEventBus } from "@hyfib/event-bus";
 import {
   auditRepository,
   campaignRepository,
@@ -231,7 +231,11 @@ function startOutboxRelay(): NodeJS.Timeout {
       try {
         const batch = await outboxRepository.claim(50);
         for (const row of batch) {
-          await eventBus.publish(row.topic as typeof EventTopics[keyof typeof EventTopics], row.payload, row.tenant_id ?? undefined);
+          await eventBus.publish(
+            row.topic as (typeof EventTopics)[keyof typeof EventTopics],
+            row.payload,
+            row.tenant_id ?? undefined
+          );
           await outboxRepository.markProcessed(row.id);
           incCounter("events_published_total", "Events published to the bus.", { topic: row.topic });
         }
@@ -496,7 +500,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         sendJson(res, 422, { error: "Only marketing templates are allowed for campaigns" });
         return;
       }
-      const campaign = await campaignRepository.create(tenantId, { name: payload.name.trim(), templateId: payload.templateId });
+      const campaign = await campaignRepository.create(tenantId, {
+        name: payload.name.trim(),
+        templateId: payload.templateId
+      });
       await audit(tenantId, auth, {
         action: "campaign.created",
         resourceType: "Campaign",
@@ -638,7 +645,11 @@ const server = createServer((req, res) => {
 const relayTimer = startOutboxRelay();
 
 server.listen(config.apiGatewayPort, () => {
-  logger.info("service_started", { port: config.apiGatewayPort, nodeEnv: config.nodeEnv, authEnabled: config.authEnabled });
+  logger.info("service_started", {
+    port: config.apiGatewayPort,
+    nodeEnv: config.nodeEnv,
+    authEnabled: config.authEnabled
+  });
 });
 
 server.on("error", (error) => {

@@ -13,12 +13,20 @@
     "typecheck": "pnpm -r build",
     "dev": "pnpm -r --parallel dev",
     "test": "pnpm -r test",
-    "lint": "pnpm -r lint",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
     "compose:up": "docker compose up --build",
     "compose:down": "docker compose down --remove-orphans"
   },
   "devDependencies": {
+    "@eslint/js": "^9.17.0",
     "@types/node": "^24.10.0",
-    "typescript": "^5.9.2"
+    "eslint": "^9.17.0",
+    "eslint-config-prettier": "^9.1.0",
+    "prettier": "^3.4.2",
+    "typescript": "^5.9.2",
+    "typescript-eslint": "^8.18.0"
   }
 }

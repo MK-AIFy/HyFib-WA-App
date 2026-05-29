@@ -1,0 +1,7 @@
+**/dist/**
+**/node_modules/**
+pnpm-lock.yaml
+*.md
+infra/grafana/**
+infra/keycloak/**
+infra/nginx/certs/**

@@ -28,7 +28,9 @@ export function getPool(): pg.Pool {
     });
     pool.on("error", (err) => {
       // A pooled client errored while idle; log to stderr so the pool can recover.
-      process.stderr.write(`${JSON.stringify({ level: "error", component: "persistence", message: "pool_client_error", error: err.message })}\n`);
+      process.stderr.write(
+        `${JSON.stringify({ level: "error", component: "persistence", message: "pool_client_error", error: err.message })}\n`
+      );
     });
   }
   return pool;
@@ -42,7 +44,10 @@ export async function closePool(): Promise<void> {
 }
 
 export interface QueryClient {
-  query<T extends pg.QueryResultRow = pg.QueryResultRow>(text: string, params?: readonly unknown[]): Promise<pg.QueryResult<T>>;
+  query<T extends pg.QueryResultRow = pg.QueryResultRow>(
+    text: string,
+    params?: readonly unknown[]
+  ): Promise<pg.QueryResult<T>>;
 }
 
 /**

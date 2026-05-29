@@ -5,7 +5,10 @@ interface LogMetadata {
 }
 
 export class Logger {
-  constructor(private readonly component: string, private readonly minimum: LogLevel = "info") {}
+  constructor(
+    private readonly component: string,
+    private readonly minimum: LogLevel = "info"
+  ) {}
 
   debug(message: string, metadata: LogMetadata = {}): void {
     this.write("debug", message, metadata);

@@ -105,7 +105,11 @@ function fallbackLeadScore(input: LeadScoreRequest): number {
   return Math.max(0, Math.min(100, Math.round(raw)));
 }
 
-async function runWithFallback(system: string, user: string, fallback: string): Promise<{ text: string; mode: "claude" | "fallback" }> {
+async function runWithFallback(
+  system: string,
+  user: string,
+  fallback: string
+): Promise<{ text: string; mode: "claude" | "fallback" }> {
   try {
     const text = await callClaude(system, redactPII(user));
     return { text, mode: "claude" };
@@ -155,7 +159,8 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    const system = "You are a B2B WhatsApp marketing assistant. Output policy-safe campaign drafts only. Never bypass consent or template policy.";
+    const system =
+      "You are a B2B WhatsApp marketing assistant. Output policy-safe campaign drafts only. Never bypass consent or template policy.";
     const user = `Create a concise campaign draft. Objective: ${payload.objective}. Audience: ${payload.audienceDescription}. Offer: ${payload.offer}. Tone: ${payload.tone}. Language: ${payload.language}. Include a clear opt-out reminder.`;
     const fallback = fallbackCampaignDraft(payload);
 

@@ -2,42 +2,97 @@ name: CI
 
 on:
   push:
-    branches: ["main", "master", "develop", "feature/**"]
+    branches: ["main", "master", "develop", "feature/**", "claude/**"]
   pull_request:
 
 jobs:
   build-test:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 24
-
-      - name: Enable Corepack
-        run: corepack enable
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+      - run: corepack enable
+      - uses: pnpm/action-setup@v4
         with:
           version: 10.12.1
-
-      - name: Install Dependencies
-        run: pnpm install --no-frozen-lockfile
-
-      - name: Build
-        run: pnpm build
-
-      - name: Test
-        run: pnpm test
-
+      - name: Install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
       - name: Lint
         run: pnpm lint
-
-      - name: Compose Validation
+      - name: Format check
+        run: pnpm format:check
+      - name: Build
+        run: pnpm build
+      - name: Unit tests
+        run: pnpm test
+      - name: Compose validation
         run: |
           cp .env.example .env
-          docker compose config >/tmp/compose.yml
+          docker compose config -q
+
+  integration-test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: platform
+          POSTGRES_PASSWORD: bootpw
+          POSTGRES_DB: hyfib_wa
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U platform -d hyfib_wa"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+      rabbitmq:
+        image: rabbitmq:3.13-alpine
+        env:
+          RABBITMQ_DEFAULT_USER: platform
+          RABBITMQ_DEFAULT_PASS: apppw
+        ports: ["5672:5672"]
+    env:
+      NODE_ENV: test
+      POSTGRES_HOST: localhost
+      POSTGRES_DB: hyfib_wa
+      POSTGRES_APP_USER: hyfib_app
+      POSTGRES_APP_PASSWORD: apppw
+      RUN_DB_TESTS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: corepack enable
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.12.1
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - name: Install psql client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: Apply schema and app role
+        env:
+          PGHOST: localhost
+          PGPASSWORD: bootpw
+        run: |
+          psql -U platform -d hyfib_wa -f infra/postgres/init/001_schema.sql
+          APP_DB_USER=hyfib_app APP_DB_PASSWORD=apppw POSTGRES_USER=platform POSTGRES_DB=hyfib_wa \
+            sh infra/postgres/init/002_app_role.sh
+          psql -U platform -d hyfib_wa -f infra/postgres/init/003_functions.sql
+      - name: Persistence integration tests
+        run: pnpm --filter @hyfib/persistence test
+
+  image-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build api-gateway image
+        run: docker build -f services/api-gateway/Dockerfile -t hyfib/api-gateway:ci .
+      - name: Trivy scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: hyfib/api-gateway:ci
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
