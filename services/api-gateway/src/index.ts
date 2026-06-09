@@ -16,6 +16,7 @@ import {
   messageRepository,
   orderRepository,
   outboxRepository,
+  resolveChannelByPhoneNumberId,
   templateRepository,
   tenantAnalytics,
   tenantRepository,
@@ -28,6 +29,7 @@ import {
   Logger,
   parseQuery,
   parseUrlPath,
+  readBinaryBody,
   readJsonBody,
   readRawBody,
   requestContext,
@@ -36,11 +38,15 @@ import {
   incCounter,
   verifyMetaSignature,
   EventTopics,
+  type EventEnvelope,
   type MessageCategory,
   type Role,
   type Template,
+  type WhatsAppInteractivePayload,
   type WhatsAppMediaKind
 } from "@hyfib/shared-core";
+import { validateInteractivePayload } from "./validation.js";
+import { SseHub } from "./sse-hub.js";
 
 interface CreateTenantRequest {
   name: string;
@@ -61,10 +67,11 @@ interface CreateChannelRequest {
 }
 
 interface SendMessageRequest {
-  kind?: "text" | "media";
+  kind?: "text" | "media" | "interactive";
   text?: string;
   previewUrl?: boolean;
   media?: { mediaType: WhatsAppMediaKind; link?: string; mediaId?: string; caption?: string; filename?: string };
+  interactive?: WhatsAppInteractivePayload;
 }
 
 interface CreateTemplateRequest {
@@ -120,6 +127,8 @@ const webhookIdempotency = new IdempotencyStore(24 * 60 * 60 * 1000);
 
 const E164 = /^\+[1-9]\d{7,14}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Keep in sync with the meta-adapter's upload cap and nginx client_max_body_size.
+const MEDIA_UPLOAD_MAX_BYTES = 16 * 1024 * 1024;
 
 if (!config.authEnabled) {
   logger.warn("auth_disabled_dev_mode", {
@@ -273,17 +282,20 @@ async function syncTemplates(
     }
     items = body.items ?? [];
   } catch (error) {
-    return { status: 503, body: { error: "meta_adapter_unavailable", detail: error instanceof Error ? error.message : "failed" } };
+    return {
+      status: 503,
+      body: { error: "meta_adapter_unavailable", detail: error instanceof Error ? error.message : "failed" }
+    };
   }
 
   let synced = 0;
   for (const item of items) {
-    const category = (item.category && META_CATEGORIES.has(item.category as MessageCategory)
-      ? item.category
-      : "utility") as MessageCategory;
-    const status = (["approved", "rejected", "pending", "paused"].includes(item.status)
-      ? item.status
-      : "pending") as Template["status"];
+    const category = (
+      item.category && META_CATEGORIES.has(item.category as MessageCategory) ? item.category : "utility"
+    ) as MessageCategory;
+    const status = (
+      ["approved", "rejected", "pending", "paused"].includes(item.status) ? item.status : "pending"
+    ) as Template["status"];
     const template = await templateRepository.upsertFromMeta(tenantId, {
       name: item.name,
       language: item.language,
@@ -324,12 +336,20 @@ async function sendConversationMessage(
     return { status: 422, body: { error: "contact_opted_out" } };
   }
 
-  const kind = body.kind === "media" ? "media" : "text";
+  const kind = body.kind === "media" ? "media" : body.kind === "interactive" ? "interactive" : "text";
   if (kind === "text" && !body.text?.trim()) {
     return { status: 400, body: { error: "text is required" } };
   }
   if (kind === "media" && !body.media?.mediaType) {
     return { status: 400, body: { error: "media.mediaType is required" } };
+  }
+  let interactive: WhatsAppInteractivePayload | undefined;
+  if (kind === "interactive") {
+    const validated = validateInteractivePayload(body.interactive);
+    if (!validated.ok) {
+      return { status: 400, body: { error: validated.error } };
+    }
+    interactive = validated.value;
   }
 
   await withTenant(tenantId, async (client) => {
@@ -344,6 +364,7 @@ async function sendConversationMessage(
         text: body.text,
         previewUrl: body.previewUrl,
         media: body.media,
+        interactive,
         actorId: asActorUuid(auth.subject)
       }
     });
@@ -382,6 +403,59 @@ function startOutboxRelay(): NodeJS.Timeout {
     })();
   }, 1_000);
 }
+
+/**
+ * Fan-out of inbound/status events to connected SSE clients. The event
+ * envelope's tenantId for these topics is Meta's WABA id (entry[0].id), so the
+ * real tenant is resolved from the payload's phoneNumberId — the same routing
+ * the worker uses — and memoized.
+ */
+const sseHub = new SseHub();
+const sseTenantByPhoneNumberId = new Map<string, string>();
+
+async function forwardEventToSse(event: EventEnvelope): Promise<void> {
+  if (!sseHub.hasClients()) {
+    return;
+  }
+  const payload = event.payload as { phoneNumberId?: string } | undefined;
+  const phoneNumberId = typeof payload?.phoneNumberId === "string" ? payload.phoneNumberId : undefined;
+  if (!phoneNumberId) {
+    return;
+  }
+  try {
+    let resolvedTenantId = sseTenantByPhoneNumberId.get(phoneNumberId);
+    if (!resolvedTenantId) {
+      const channel = await resolveChannelByPhoneNumberId(phoneNumberId);
+      if (!channel) {
+        return;
+      }
+      resolvedTenantId = channel.tenantId;
+      if (sseTenantByPhoneNumberId.size >= 1_000) {
+        sseTenantByPhoneNumberId.clear();
+      }
+      sseTenantByPhoneNumberId.set(phoneNumberId, resolvedTenantId);
+    }
+    sseHub.broadcast(resolvedTenantId, event.topic, event.id, {
+      occurredAt: event.occurredAt,
+      payload: event.payload
+    });
+  } catch (error) {
+    logger.warn("sse_forward_failed", {
+      topic: event.topic,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+}
+
+// Per-instance ephemeral queues so every gateway replica sees every event.
+const sseQueuePrefix = `api-gateway-sse.${randomUUID().slice(0, 8)}`;
+eventBus.subscribe(EventTopics.WhatsAppInboundReceived, `${sseQueuePrefix}.inbound`, forwardEventToSse, {
+  ephemeral: true
+});
+eventBus.subscribe(EventTopics.WhatsAppStatusUpdated, `${sseQueuePrefix}.status`, forwardEventToSse, {
+  ephemeral: true
+});
+sseHub.startKeepAlive();
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const method = req.method ?? "GET";
@@ -514,6 +588,27 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
 
+  // Tenant-scoped live stream of inbound messages and delivery-status updates.
+  // Browser EventSource cannot set Authorization headers, so web apps should
+  // consume this with a fetch-based SSE reader.
+  if (path === "/api/v1/events/stream") {
+    if (method !== "GET") {
+      sendJson(res, 405, { error: "Method not allowed" });
+      return;
+    }
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders();
+    res.write(": connected\n\n");
+    const clientId = sseHub.addClient(tenantId, res);
+    incCounter("sse_clients_connected_total", "SSE clients connected.", { service: "api-gateway" });
+    req.on("close", () => sseHub.removeClient(tenantId, clientId));
+    return;
+  }
+
   if (path === "/api/v1/users") {
     if (method === "GET") {
       sendJson(res, 200, { items: await userRepository.list(tenantId) });
@@ -572,7 +667,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         });
       } catch (error) {
         // Most likely a missing CHANNEL_ENCRYPTION_KEY when a token was supplied.
-        sendJson(res, 400, { error: "channel_create_failed", detail: error instanceof Error ? error.message : "failed" });
+        sendJson(res, 400, {
+          error: "channel_create_failed",
+          detail: error instanceof Error ? error.message : "failed"
+        });
         return;
       }
       await audit(tenantId, auth, {
@@ -609,6 +707,79 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       });
     }
     sendJson(res, result.status, result.body);
+    return;
+  }
+
+  // Upload media bytes to WhatsApp via the channel's credentials. The request
+  // body is the raw file with its real Content-Type; the returned mediaId is
+  // then usable in kind:"media" conversation sends.
+  if (path.startsWith("/api/v1/channels/whatsapp/") && path.endsWith("/media") && method === "POST") {
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager", "sales_agent", "support_agent"])) {
+      sendJson(res, 403, { error: "Insufficient role to upload media" });
+      return;
+    }
+    const channelId = path.replace("/api/v1/channels/whatsapp/", "").replace("/media", "").trim();
+    if (!UUID.test(channelId)) {
+      sendJson(res, 400, { error: "Invalid channel id" });
+      return;
+    }
+    const channel = await channelRepository.getCredentials(tenantId, channelId);
+    if (!channel) {
+      sendJson(res, 404, { error: "Channel not found" });
+      return;
+    }
+    const mimeType = typeof req.headers["content-type"] === "string" ? req.headers["content-type"] : "";
+    if (!mimeType || mimeType.startsWith("application/json")) {
+      sendJson(res, 400, { error: "Content-Type must be the media MIME type (e.g. image/jpeg)" });
+      return;
+    }
+    let buffer: Buffer;
+    try {
+      buffer = await readBinaryBody(req, MEDIA_UPLOAD_MAX_BYTES);
+    } catch {
+      sendJson(res, 413, { error: "media_too_large", maxBytes: MEDIA_UPLOAD_MAX_BYTES });
+      return;
+    }
+    if (buffer.length === 0) {
+      sendJson(res, 400, { error: "Request body (file bytes) is required" });
+      return;
+    }
+    const uploadUrl = new URL(`${config.metaAdapterUrl}/internal/v1/whatsapp/media`);
+    uploadUrl.searchParams.set("phoneNumberId", channel.phoneNumberId);
+    const filename = parseQuery(req.url).get("filename");
+    if (filename) {
+      uploadUrl.searchParams.set("filename", filename);
+    }
+    try {
+      const response = await fetch(uploadUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": mimeType,
+          "x-tenant-id": tenantId,
+          "x-request-id": randomUUID(),
+          ...(channel.accessToken ? { "x-access-token": channel.accessToken } : {})
+        },
+        // Plain Uint8Array: Buffer's ArrayBufferLike backing is not a valid BodyInit.
+        body: new Uint8Array(buffer)
+      });
+      const body = (await response.json()) as { mediaId?: string; error?: string };
+      if (!response.ok || !body.mediaId) {
+        sendJson(res, 502, { error: "media_upload_failed", detail: body.error ?? "meta error" });
+        return;
+      }
+      await audit(tenantId, auth, {
+        action: "channel.media.uploaded",
+        resourceType: "WhatsAppChannel",
+        resourceId: channelId,
+        payload: { mimeType, bytes: buffer.length, mediaId: body.mediaId }
+      });
+      sendJson(res, 201, { mediaId: body.mediaId });
+    } catch (error) {
+      sendJson(res, 503, {
+        error: "meta_adapter_unavailable",
+        detail: error instanceof Error ? error.message : "failed"
+      });
+    }
     return;
   }
 
@@ -848,7 +1019,12 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         sendJson(res, 403, { error: "Insufficient role to send a message" });
         return;
       }
-      const result = await sendConversationMessage(tenantId, conversationId, auth, await readJsonBody<SendMessageRequest>(req));
+      const result = await sendConversationMessage(
+        tenantId,
+        conversationId,
+        auth,
+        await readJsonBody<SendMessageRequest>(req)
+      );
       if (result.status === 202) {
         await audit(tenantId, auth, {
           action: "conversation.message.sent",
@@ -940,6 +1116,8 @@ server.on("error", (error) => {
 async function shutdown(signal: string): Promise<void> {
   logger.info("shutdown_started", { signal });
   clearInterval(relayTimer);
+  // Open SSE sockets would otherwise keep the server from closing.
+  sseHub.close();
   server.close(async () => {
     await eventBus.close().catch(() => undefined);
     await closePool().catch(() => undefined);

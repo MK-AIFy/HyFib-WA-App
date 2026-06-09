@@ -29,6 +29,17 @@ test("InMemoryEventBus does not deliver across different topics", async () => {
   assert.equal(count, 0);
 });
 
+test("InMemoryEventBus accepts ephemeral subscriptions", async () => {
+  const bus = new InMemoryEventBus();
+  const received = [];
+  bus.subscribe("whatsapp.status.updated", "sse-queue", (event) => received.push(event), { ephemeral: true });
+
+  await bus.publish("whatsapp.status.updated", { status: "delivered" }, "tenant-1");
+
+  assert.equal(received.length, 1);
+  assert.deepEqual(received[0].payload, { status: "delivered" });
+});
+
 test("createEventBus returns the in-memory transport when configured", () => {
   const bus = createEventBus({ eventBus: "memory", rabbitmqUrl: "amqp://unused" });
   assert.equal(bus instanceof InMemoryEventBus, true);

@@ -7,6 +7,7 @@ import {
   notFound,
   parseQuery,
   parseUrlPath,
+  readBinaryBody,
   readJsonBody,
   requestContext,
   sendJson,
@@ -23,6 +24,7 @@ import {
   buildInteractiveBody,
   buildMarkReadBody,
   buildMediaBody,
+  buildMediaUploadForm,
   buildTemplateBody,
   buildTextBody,
   extractTemplateBody,
@@ -53,6 +55,10 @@ const BREAKER_THRESHOLD = 5;
 const BREAKER_OPEN_MS = 30_000;
 const MAX_ATTEMPTS = 4;
 const BASE_BACKOFF_MS = 500;
+// Covers Meta's per-type caps (image/sticker 5MB, audio/video 16MB); documents
+// up to 100MB are not accepted through this endpoint. Keep in sync with the
+// gateway's upload limit and nginx client_max_body_size.
+const MEDIA_UPLOAD_MAX_BYTES = 16 * 1024 * 1024;
 let consecutiveFailures = 0;
 let breakerOpenUntil = 0;
 
@@ -73,19 +79,22 @@ function backoffDelay(attempt: number, retryAfterHeader: string | null): number 
 async function rawGraphRequest(
   path: string,
   method: "GET" | "POST",
-  body?: Record<string, unknown>,
+  body?: Record<string, unknown> | FormData,
   accessToken?: string
 ): Promise<Response> {
+  // For FormData, fetch must set Content-Type itself to include the boundary.
+  const isForm = body instanceof FormData;
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10_000);
+  // Media uploads move megabytes; give them longer than control-plane calls.
+  const timeout = setTimeout(() => controller.abort(), isForm ? 60_000 : 10_000);
   try {
     return await fetch(`https://graph.facebook.com/${config.whatsappGraphVersion}${path}`, {
       method,
       headers: {
         Authorization: `Bearer ${accessToken ?? config.whatsappAccessToken}`,
-        "Content-Type": "application/json"
+        ...(isForm ? {} : { "Content-Type": "application/json" })
       },
-      body: body ? JSON.stringify(body) : undefined,
+      body: isForm ? body : body ? JSON.stringify(body) : undefined,
       signal: controller.signal
     });
   } finally {
@@ -102,7 +111,7 @@ async function rawGraphRequest(
 async function graphRequest(
   path: string,
   method: "GET" | "POST",
-  body?: Record<string, unknown>,
+  body?: Record<string, unknown> | FormData,
   accessToken?: string
 ): Promise<Response> {
   if (!accessToken && !config.whatsappAccessToken) {
@@ -482,6 +491,58 @@ const server = createServer(async (req, res) => {
           body: extractTemplateBody(entry.components)
         }));
       sendJson(res, 200, { items: templates });
+    } catch (error) {
+      sendJson(res, 503, {
+        error: "meta_adapter_unavailable",
+        details: error instanceof Error ? error.message : String(error)
+      });
+    }
+    return;
+  }
+
+  // Upload media bytes to Meta to obtain a reusable media id. The raw file is
+  // the request body; metadata travels in query/headers so the bytes stay intact.
+  if (path === "/internal/v1/whatsapp/media") {
+    if (method !== "POST") {
+      methodNotAllowed(res);
+      return;
+    }
+    const query = parseQuery(req.url);
+    const phoneNumberId = query.get("phoneNumberId") ?? config.whatsappPhoneNumberId;
+    const filename = query.get("filename") ?? undefined;
+    const mimeType = typeof req.headers["content-type"] === "string" ? req.headers["content-type"] : "";
+    const tokenHeader = req.headers["x-access-token"];
+    const accessToken = typeof tokenHeader === "string" && tokenHeader.length > 0 ? tokenHeader : undefined;
+    if (!phoneNumberId) {
+      sendJson(res, 400, { error: "phoneNumberId is required" });
+      return;
+    }
+    if (!mimeType || mimeType.startsWith("application/json")) {
+      sendJson(res, 400, { error: "Content-Type must be the media MIME type (e.g. image/jpeg)" });
+      return;
+    }
+    let buffer: Buffer;
+    try {
+      buffer = await readBinaryBody(req, MEDIA_UPLOAD_MAX_BYTES);
+    } catch {
+      sendJson(res, 413, { error: "media_too_large", maxBytes: MEDIA_UPLOAD_MAX_BYTES });
+      return;
+    }
+    if (buffer.length === 0) {
+      sendJson(res, 400, { error: "Request body (file bytes) is required" });
+      return;
+    }
+    try {
+      const form = buildMediaUploadForm({ buffer, mimeType, filename });
+      const response = await graphRequest(`/${phoneNumberId}/media`, "POST", form, accessToken);
+      if (!response.ok) {
+        const graphError = await parseGraphError(response);
+        logger.warn("meta_media_upload_failed", { requestId: ctx.requestId, statusCode: response.status });
+        sendJson(res, 502, { error: "meta_media_upload_failed", details: graphError });
+        return;
+      }
+      const parsed = (await response.json()) as { id?: string };
+      sendJson(res, 201, { requestId: ctx.requestId, mediaId: parsed.id });
     } catch (error) {
       sendJson(res, 503, {
         error: "meta_adapter_unavailable",

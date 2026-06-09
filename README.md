@@ -26,6 +26,10 @@ Implemented at `api-gateway`:
 - `POST /api/v1/contacts/:id/consent` — record opt-in consent (required before marketing)
 - `POST /api/v1/contacts/:id/opt-out` — revoke consent + suppress future sends
 - `/api/v1/conversations`
+- `GET /api/v1/conversations/:id/messages` — paginated history
+- `POST /api/v1/conversations/:id/messages` — agent session reply (`kind`: `text` | `media` | `interactive`)
+- `POST /api/v1/channels/whatsapp/:id/media` — upload raw file bytes to WhatsApp, returns a reusable `mediaId`
+- `GET /api/v1/events/stream` — tenant-scoped Server-Sent Events stream of inbound messages and delivery statuses
 - `/api/v1/orders`
 - `/api/v1/analytics`
 - `/api/v1/audit`
@@ -95,6 +99,9 @@ curl http://localhost:18080/health      # api-gateway direct (DB-backed)
 > For local development only, set `AUTH_ENABLED=false` to fall back to
 > `x-role` / `x-tenant-id` headers — never do this in production.
 
+> Receiving live Meta webhooks on a locally hosted stack requires a public
+> tunnel — see [`docs/runbooks/local-webhook-tunnel.md`](docs/runbooks/local-webhook-tunnel.md).
+
 5. Follow full onboarding and validation runbook:
 
 - [`docs/runbooks/whatsapp-marketing-number-onboarding.md`](docs/runbooks/whatsapp-marketing-number-onboarding.md)
@@ -123,6 +130,7 @@ curl http://localhost:18080/health      # api-gateway direct (DB-backed)
 - [Architecture](docs/architecture.md)
 - [Security and Compliance Controls](docs/security/compliance-controls.md)
 - [WhatsApp Marketing Number Runbook](docs/runbooks/whatsapp-marketing-number-onboarding.md)
+- [Local Webhook Tunnel Runbook](docs/runbooks/local-webhook-tunnel.md)
 - [Implementation Roadmap](docs/implementation-roadmap.md)
 - [Test Plan and Go-Live Gates](docs/test-plan-and-gates.md)
 - [Operational Hardening Gaps](docs/operational-gaps-and-next-hardening.md)

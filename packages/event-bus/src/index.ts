@@ -6,10 +6,19 @@ import type { EventEnvelope, EventTopic } from "@hyfib/shared-core";
 
 export type EventHandler = (event: EventEnvelope) => Promise<void> | void;
 
+export interface SubscribeOptions {
+  /**
+   * Ephemeral subscriptions get an exclusive, auto-deleted, non-durable queue
+   * with no DLQ, and failures are acked (best-effort delivery). Used for
+   * fan-out consumers like SSE forwarding where replay is not wanted.
+   */
+  ephemeral?: boolean;
+}
+
 export interface EventBus {
   publish<TPayload>(topic: EventTopic, payload: TPayload, tenantId?: string): Promise<EventEnvelope<TPayload>>;
   /** Subscribe a durable, named queue (consumer group) to a topic. */
-  subscribe(topic: EventTopic, queue: string, handler: EventHandler): void;
+  subscribe(topic: EventTopic, queue: string, handler: EventHandler, options?: SubscribeOptions): void;
   close(): Promise<void>;
 }
 
@@ -37,7 +46,7 @@ export class InMemoryEventBus implements EventBus {
     return event;
   }
 
-  subscribe(topic: EventTopic, _queue: string, handler: EventHandler): void {
+  subscribe(topic: EventTopic, _queue: string, handler: EventHandler, _options?: SubscribeOptions): void {
     const current = this.handlers.get(topic) ?? [];
     current.push(handler);
     this.handlers.set(topic, current);
@@ -52,6 +61,7 @@ interface Subscription {
   topic: EventTopic;
   queue: string;
   handler: EventHandler;
+  ephemeral?: boolean;
 }
 
 const EXCHANGE = "hyfib.events";
@@ -123,11 +133,16 @@ export class RabbitMqEventBus implements EventBus {
   }
 
   private async setupConsumer(channel: ConfirmChannel, sub: Subscription): Promise<void> {
-    const dlq = `${sub.queue}.dlq`;
-    await channel.assertQueue(sub.queue, { durable: true, deadLetterExchange: DLX });
-    await channel.bindQueue(sub.queue, EXCHANGE, sub.topic);
-    await channel.assertQueue(dlq, { durable: true });
-    await channel.bindQueue(dlq, DLX, sub.topic);
+    if (sub.ephemeral) {
+      await channel.assertQueue(sub.queue, { exclusive: true, autoDelete: true, durable: false });
+      await channel.bindQueue(sub.queue, EXCHANGE, sub.topic);
+    } else {
+      const dlq = `${sub.queue}.dlq`;
+      await channel.assertQueue(sub.queue, { durable: true, deadLetterExchange: DLX });
+      await channel.bindQueue(sub.queue, EXCHANGE, sub.topic);
+      await channel.assertQueue(dlq, { durable: true });
+      await channel.bindQueue(dlq, DLX, sub.topic);
+    }
 
     await channel.consume(sub.queue, (msg: ConsumeMessage | null) => {
       if (!msg) {
@@ -143,6 +158,11 @@ export class RabbitMqEventBus implements EventBus {
       await sub.handler(event);
       channel.ack(msg);
     } catch {
+      if (sub.ephemeral) {
+        // Best-effort delivery: drop rather than requeue/dead-letter.
+        channel.ack(msg);
+        return;
+      }
       // Retry once (requeue); on a second failure, dead-letter the message.
       channel.nack(msg, false, !msg.fields.redelivered);
     }
@@ -164,8 +184,8 @@ export class RabbitMqEventBus implements EventBus {
     return event;
   }
 
-  subscribe(topic: EventTopic, queue: string, handler: EventHandler): void {
-    const sub: Subscription = { topic, queue, handler };
+  subscribe(topic: EventTopic, queue: string, handler: EventHandler, options?: SubscribeOptions): void {
+    const sub: Subscription = { topic, queue, handler, ephemeral: options?.ephemeral };
     this.subscriptions.push(sub);
     if (this.channel) {
       void this.setupConsumer(this.channel, sub);
