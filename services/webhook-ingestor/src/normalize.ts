@@ -124,11 +124,7 @@ function deriveText(message: RawMessage): string | undefined {
   }
 }
 
-export function normalizeInbound(
-  value: RawValue,
-  message: RawMessage,
-  entryId?: string
-): NormalizedInboundEvent {
+export function normalizeInbound(value: RawValue, message: RawMessage, entryId?: string): NormalizedInboundEvent {
   const profileName = value.contacts?.find((c) => c.wa_id === message.from)?.profile?.name;
   const event: NormalizedInboundEvent = {
     entryId,
@@ -141,8 +137,7 @@ export function normalizeInbound(
     text: deriveText(message)
   };
 
-  const mediaSource =
-    message.image ?? message.video ?? message.audio ?? message.document ?? message.sticker;
+  const mediaSource = message.image ?? message.video ?? message.audio ?? message.document ?? message.sticker;
   const media = mapMedia(mediaSource);
   if (media) {
     event.media = media;
