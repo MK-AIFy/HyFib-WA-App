@@ -30,6 +30,7 @@ import {
   type MessageCategory,
   type WhatsAppOutboundRequest
 } from "@hyfib/shared-core";
+import { buildOutboundAdapterCall } from "./outbound.js";
 
 const config = loadConfig();
 const logger = new Logger("message-worker", config.logLevel as "debug" | "info" | "warn" | "error");
@@ -191,30 +192,8 @@ async function handleOutbound(event: EventEnvelope): Promise<void> {
   }
   const channel = await resolveSendChannel(command.tenantId, command.channelId);
 
-  let result: { messageId?: string; accepted: boolean };
-  let payload: Record<string, unknown>;
-  if (command.kind === "media" && command.media) {
-    result = await callMetaAdapter("/internal/v1/whatsapp/send-media", command.tenantId, {
-      phoneNumberId: channel.phoneNumberId,
-      to: command.contactPhoneE164,
-      mediaType: command.media.mediaType,
-      link: command.media.link,
-      mediaId: command.media.mediaId,
-      caption: command.media.caption,
-      filename: command.media.filename,
-      accessToken: channel.accessToken
-    });
-    payload = { kind: "media", media: command.media, actorId: command.actorId };
-  } else {
-    result = await callMetaAdapter("/internal/v1/whatsapp/send-text", command.tenantId, {
-      phoneNumberId: channel.phoneNumberId,
-      to: command.contactPhoneE164,
-      text: command.text,
-      previewUrl: command.previewUrl,
-      accessToken: channel.accessToken
-    });
-    payload = { kind: "text", text: command.text, actorId: command.actorId };
-  }
+  const call = buildOutboundAdapterCall(command, channel);
+  const result = await callMetaAdapter(call.endpoint, command.tenantId, call.payload);
 
   await messageRepository.create(command.tenantId, {
     conversationId: command.conversationId,
@@ -222,7 +201,7 @@ async function handleOutbound(event: EventEnvelope): Promise<void> {
     status: result.accepted ? "sent" : "queued",
     category: "service" as MessageCategory,
     externalMessageId: result.messageId,
-    payload
+    payload: call.persistedPayload
   });
   incCounter("whatsapp_messages_sent_total", "Outbound WhatsApp template sends.", {
     result: result.accepted ? "accepted" : "queued"
@@ -261,7 +240,18 @@ async function handleInbound(event: EventEnvelope): Promise<void> {
   const conversation = await conversationRepository.findOrCreate(channel.tenantId, contact.id, channel.channelId);
   // Persist the full normalized message (text + any media/interactive/location/etc.).
   const payload: Record<string, unknown> = { type: inbound.type, timestamp: inbound.timestamp };
-  for (const field of ["text", "profileName", "media", "interactive", "button", "location", "reaction", "contacts", "referral", "context"] as const) {
+  for (const field of [
+    "text",
+    "profileName",
+    "media",
+    "interactive",
+    "button",
+    "location",
+    "reaction",
+    "contacts",
+    "referral",
+    "context"
+  ] as const) {
     if (inbound[field] !== undefined) {
       payload[field] = inbound[field];
     }

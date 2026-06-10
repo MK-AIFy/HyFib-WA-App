@@ -27,7 +27,13 @@ test("normalizes an image message with media and caption", () => {
     type: "image",
     image: { id: "MID", mime_type: "image/jpeg", sha256: "abc", caption: "a pic" }
   });
-  assert.deepEqual(event.media, { id: "MID", mimeType: "image/jpeg", sha256: "abc", caption: "a pic", filename: undefined });
+  assert.deepEqual(event.media, {
+    id: "MID",
+    mimeType: "image/jpeg",
+    sha256: "abc",
+    caption: "a pic",
+    filename: undefined
+  });
   assert.equal(event.text, "a pic");
 });
 
@@ -62,14 +68,23 @@ test("normalizes location, reaction, button and referral", () => {
   assert.deepEqual(loc.location, { latitude: 1.5, longitude: -2.5, name: "HQ", address: "1 St" });
   assert.equal(loc.text, "HQ");
 
-  const react = normalizeInbound(value(), { id: "2", type: "reaction", reaction: { emoji: "👍", message_id: "wamid.x" } });
+  const react = normalizeInbound(value(), {
+    id: "2",
+    type: "reaction",
+    reaction: { emoji: "👍", message_id: "wamid.x" }
+  });
   assert.deepEqual(react.reaction, { emoji: "👍", messageId: "wamid.x" });
 
   const btn = normalizeInbound(value(), { id: "3", type: "button", button: { payload: "STOP", text: "Unsubscribe" } });
   assert.deepEqual(btn.button, { payload: "STOP", text: "Unsubscribe" });
   assert.equal(btn.text, "Unsubscribe");
 
-  const ref = normalizeInbound(value(), { id: "4", type: "text", text: { body: "hi" }, referral: { source_url: "https://ad" } });
+  const ref = normalizeInbound(value(), {
+    id: "4",
+    type: "text",
+    text: { body: "hi" },
+    referral: { source_url: "https://ad" }
+  });
   assert.deepEqual(ref.referral, { source_url: "https://ad" });
 });
 

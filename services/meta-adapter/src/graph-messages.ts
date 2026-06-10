@@ -45,7 +45,9 @@ export function buildTemplateBody(input: TemplateBuildInput): Record<string, unk
   };
 }
 
-export function buildTextBody(input: Pick<WhatsAppTextSendRequest, "to" | "text" | "previewUrl">): Record<string, unknown> {
+export function buildTextBody(
+  input: Pick<WhatsAppTextSendRequest, "to" | "text" | "previewUrl">
+): Record<string, unknown> {
   return {
     messaging_product: "whatsapp",
     recipient_type: "individual",
@@ -126,6 +128,21 @@ export function buildInteractiveBody(
     type: "interactive",
     interactive
   };
+}
+
+export interface MediaUploadInput {
+  buffer: Buffer;
+  mimeType: string;
+  filename?: string;
+}
+
+/** Builds the multipart form for uploading media to `/{phoneNumberId}/media`. */
+export function buildMediaUploadForm(input: MediaUploadInput): FormData {
+  const form = new FormData();
+  form.append("messaging_product", "whatsapp");
+  // Copy into a plain Uint8Array: Buffer's ArrayBufferLike backing is not a valid BlobPart.
+  form.append("file", new Blob([new Uint8Array(input.buffer)], { type: input.mimeType }), input.filename ?? "upload");
+  return form;
 }
 
 export function buildMarkReadBody(messageId: string): Record<string, unknown> {

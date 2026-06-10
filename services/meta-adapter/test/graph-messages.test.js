@@ -6,6 +6,7 @@ import {
   buildMediaBody,
   buildInteractiveBody,
   buildMarkReadBody,
+  buildMediaUploadForm,
   mapMetaTemplateStatus,
   extractTemplateBody
 } from "../dist/graph-messages.js";
@@ -104,6 +105,24 @@ test("maps meta template statuses", () => {
   assert.equal(mapMetaTemplateStatus("PAUSED"), "paused");
   assert.equal(mapMetaTemplateStatus("IN_APPEAL"), "pending");
   assert.equal(mapMetaTemplateStatus(undefined), "pending");
+});
+
+test("media upload form carries the product, bytes, type and filename", async () => {
+  const bytes = Buffer.from([0xff, 0xd8, 0xff, 0x00, 0x80]);
+  const form = buildMediaUploadForm({ buffer: bytes, mimeType: "image/jpeg", filename: "photo.jpg" });
+
+  assert.equal(form.get("messaging_product"), "whatsapp");
+  const file = form.get("file");
+  assert.equal(file.name, "photo.jpg");
+  assert.equal(file.type, "image/jpeg");
+  assert.equal(file.size, bytes.length);
+  const roundTripped = Buffer.from(await file.arrayBuffer());
+  assert.equal(Buffer.compare(roundTripped, bytes), 0);
+});
+
+test("media upload form defaults the filename", () => {
+  const form = buildMediaUploadForm({ buffer: Buffer.from("abc"), mimeType: "application/pdf" });
+  assert.equal(form.get("file").name, "upload");
 });
 
 test("extracts body text from meta components", () => {

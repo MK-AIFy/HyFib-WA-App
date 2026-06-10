@@ -241,6 +241,13 @@ export interface WhatsAppInteractiveSendRequest {
   accessToken?: string;
 }
 
+/**
+ * The caller-supplied portion of an interactive send: everything except the
+ * routing fields (`phoneNumberId`/`to`) and credentials, which the worker
+ * resolves from the channel at send time.
+ */
+export type WhatsAppInteractivePayload = Omit<WhatsAppInteractiveSendRequest, "phoneNumberId" | "to" | "accessToken">;
+
 export interface WhatsAppMarkReadRequest {
   phoneNumberId: string;
   messageId: string;
@@ -275,6 +282,7 @@ export interface WhatsAppOutboundRequest {
   text?: string;
   previewUrl?: boolean;
   media?: { mediaType: WhatsAppMediaKind; link?: string; mediaId?: string; caption?: string; filename?: string };
+  interactive?: WhatsAppInteractivePayload;
   actorId?: string;
 }
 

@@ -43,6 +43,34 @@ export async function readRawBody(req: IncomingMessage): Promise<string> {
   });
 }
 
+/**
+ * Reads the raw request body as bytes. Unlike `readRawBody` (which decodes
+ * UTF-8 and would corrupt binary payloads), this preserves the exact bytes —
+ * required for media uploads.
+ */
+export async function readBinaryBody(req: IncomingMessage, maxBytes: number): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+
+    req.on("data", (chunk: Buffer) => {
+      total += chunk.length;
+      if (total > maxBytes) {
+        reject(new Error("Request body too large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+
+    req.on("end", () => {
+      resolve(Buffer.concat(chunks));
+    });
+
+    req.on("error", reject);
+  });
+}
+
 export async function readJsonBody<TPayload>(req: IncomingMessage): Promise<TPayload> {
   const payload = await readRawBody(req);
   if (payload.trim() === "") {

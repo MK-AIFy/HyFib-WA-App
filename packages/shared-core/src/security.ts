@@ -1,10 +1,4 @@
-import {
-  createCipheriv,
-  createDecipheriv,
-  createHmac,
-  randomBytes,
-  timingSafeEqual
-} from "node:crypto";
+import { createCipheriv, createDecipheriv, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 
 export function verifyMetaSignature(rawBody: string, signatureHeader: string | undefined, appSecret: string): boolean {
   if (!signatureHeader || !signatureHeader.startsWith("sha256=")) {
