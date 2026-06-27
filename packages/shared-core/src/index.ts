@@ -220,6 +220,7 @@ export interface CampaignRunRequest {
   templateName: string;
   templateLanguage: string;
   templateCategory: MessageCategory;
+  templateStatus: string;
   variableMapping?: VariableMapping;
   quietHours?: QuietHoursConfig;
   frequencyCap?: FrequencyCapConfig;

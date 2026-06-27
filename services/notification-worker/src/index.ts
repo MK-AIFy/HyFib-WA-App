@@ -269,8 +269,10 @@ async function handleCampaignRun(event: EventEnvelope): Promise<void> {
       const policy = evaluateOutboundPolicy({
         hasActiveConsent,
         isInside24hWindow,
-        // Only category is used by the policy check; cast to satisfy the type.
-        template: { category: run.templateCategory } as import("@hyfib/shared-core").Template,
+        template: {
+          category: run.templateCategory,
+          status: run.templateStatus ?? "approved"
+        } as import("@hyfib/shared-core").Template,
         requestedCategory: run.templateCategory,
         isOptedOut,
         currentHourLocal,

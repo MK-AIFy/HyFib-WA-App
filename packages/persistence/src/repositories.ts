@@ -25,6 +25,7 @@ import type {
 export type CampaignWithTemplate = Campaign & {
   templateName: string;
   templateLanguage: string;
+  templateStatus: string;
   sentCount: number;
   failedCount: number;
   deliveredCount: number;
@@ -304,6 +305,7 @@ interface CampaignRow {
   template_name: string;
   template_language: string;
   template_category: string;
+  template_status: string | null;
   sent_count: string | null;
   failed_count: string | null;
   delivered_count: string | null;
@@ -327,6 +329,7 @@ function mapCampaign(row: CampaignRow): CampaignWithTemplate {
     createdAt: row.created_at.toISOString(),
     templateName: row.template_name,
     templateLanguage: row.template_language,
+    templateStatus: row.template_status ?? "pending",
     sentCount: Number(row.sent_count ?? "0"),
     failedCount: Number(row.failed_count ?? "0"),
     deliveredCount: Number(row.delivered_count ?? "0"),
@@ -344,7 +347,7 @@ const CAMPAIGN_SELECT = `
   SELECT c.id, c.tenant_id, c.name, c.template_id, c.status, c.created_at,
          c.segment_id, c.scheduled_at, c.variable_mapping, c.rate_per_minute,
          c.quiet_hours, c.frequency_cap,
-         t.name AS template_name, t.language AS template_language, t.category AS template_category,
+         t.name AS template_name, t.language AS template_language, t.category AS template_category, t.status AS template_status,
          s.sent_count, s.failed_count, s.delivered_count, s.read_count
   FROM campaigns c
   JOIN templates t ON t.id = c.template_id

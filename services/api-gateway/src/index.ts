@@ -349,6 +349,7 @@ async function runCampaign(
         templateName: campaign.templateName,
         templateLanguage: campaign.templateLanguage,
         templateCategory: campaign.templateCategory,
+        templateStatus: campaign.templateStatus ?? "approved",
         variableMapping: campaign.variableMapping,
         quietHours: campaign.quietHours,
         frequencyCap: campaign.frequencyCap,
@@ -547,6 +548,7 @@ function startCampaignScheduler(): NodeJS.Timeout {
           template_name: string;
           template_language: string;
           template_category: string;
+          template_status: string | null;
           variable_mapping: Record<string, unknown> | null;
           quiet_hours: Record<string, unknown> | null;
           frequency_cap: Record<string, unknown> | null;
@@ -555,7 +557,7 @@ function startCampaignScheduler(): NodeJS.Timeout {
         }>(
           `SELECT c.id, c.tenant_id, c.variable_mapping, c.quiet_hours, c.frequency_cap,
                   c.rate_per_minute, c.segment_id,
-                  t.name AS template_name, t.language AS template_language, t.category AS template_category
+                  t.name AS template_name, t.language AS template_language, t.category AS template_category, t.status AS template_status
            FROM campaigns c
            JOIN templates t ON t.id = c.template_id
            WHERE c.status = 'scheduled' AND c.scheduled_at <= now()
@@ -586,6 +588,7 @@ function startCampaignScheduler(): NodeJS.Timeout {
                 templateName: row.template_name,
                 templateLanguage: row.template_language,
                 templateCategory: row.template_category,
+                templateStatus: row.template_status ?? "approved",
                 variableMapping: row.variable_mapping,
                 quietHours: row.quiet_hours,
                 frequencyCap: row.frequency_cap,
