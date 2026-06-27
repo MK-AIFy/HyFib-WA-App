@@ -23,10 +23,14 @@ services:
     container_name: web-portal
     env_file:
       - .env
+    environment:
+      - API_GATEWAY_HOST=api-gateway
     ports:
       - "3001:3000"
     networks:
       - app-net
+    depends_on:
+      - api-gateway
     restart: unless-stopped
 
   postgres-primary:
