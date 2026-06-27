@@ -2,7 +2,10 @@ import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
 import { createEventBus } from "@hyfib/event-bus";
 import { loadConfig } from "@hyfib/config";
+import { evaluateOutboundPolicy } from "@hyfib/policy-engine";
 import {
+  autoReplyRuleRepository,
+  campaignRecipientRepository,
   campaignSendLog,
   campaignStatsRepository,
   channelRepository,
@@ -12,9 +15,12 @@ import {
   conversationRepository,
   healthCheck,
   messageRepository,
+  outboxRepository,
   resolveChannelByPhoneNumberId,
+  withTenant,
   type ChannelCredentials
 } from "@hyfib/persistence";
+import { getRedisClient, acquireRateLimit } from "@hyfib/ratelimit";
 import {
   EventTopics,
   Logger,
@@ -25,16 +31,20 @@ import {
   isOptInKeyword,
   isOptOutKeyword,
   type CampaignDispatchRequest,
+  type CampaignRunRequest,
   type EventEnvelope,
   type Message,
   type MessageCategory,
   type WhatsAppOutboundRequest
 } from "@hyfib/shared-core";
 import { buildOutboundAdapterCall } from "./outbound.js";
+import { resolveVariables } from "./personalize.js";
+import { matchAutoReply } from "./autoreply.js";
 
 const config = loadConfig();
-const logger = new Logger("message-worker", config.logLevel as "debug" | "info" | "warn" | "error");
+const logger = new Logger("notification-worker", config.logLevel as "debug" | "info" | "warn" | "error");
 const eventBus = createEventBus(config);
+const redis = getRedisClient(config);
 
 interface InboundEvent {
   phoneNumberId?: string;
@@ -151,6 +161,15 @@ async function handleDispatch(event: EventEnvelope): Promise<void> {
     const channel = await resolveSendChannel(command.tenantId, command.channelId);
     const result = await sendTemplate(command, channel);
     await recordOutbound(command, result.messageId, result.accepted);
+
+    // Update the per-recipient funnel row when this is a fan-out send.
+    if (command.recipientId) {
+      await campaignRecipientRepository.updateStatus(command.tenantId, command.recipientId, {
+        status: result.accepted ? "sent" : "failed",
+        externalMessageId: result.messageId
+      });
+    }
+
     incCounter("whatsapp_messages_sent_total", "Outbound WhatsApp template sends.", {
       result: result.accepted ? "accepted" : "queued"
     });
@@ -169,12 +188,140 @@ async function handleDispatch(event: EventEnvelope): Promise<void> {
     await campaignSendLog
       .release(command.tenantId, command.campaignId, command.contactPhoneE164)
       .catch(() => undefined);
+
+    if (command.recipientId) {
+      await campaignRecipientRepository
+        .updateStatus(command.tenantId, command.recipientId, {
+          status: "failed",
+          error: error instanceof Error ? error.message : "send_failed"
+        })
+        .catch(() => undefined);
+    }
+
     logger.error("dispatch_failed", {
       campaignId: command.campaignId,
       error: error instanceof Error ? error.message : String(error)
     });
     throw error; // Trigger broker retry / DLQ.
   }
+}
+
+/**
+ * Fan-out consumer: picks up CampaignRunRequested, batches through
+ * campaign_recipients applying per-contact policy + personalisation + rate pacing,
+ * then enqueues individual CampaignDispatchRequested events.
+ *
+ * This runs as a single-consumer loop so the pacing token bucket is effective.
+ * On restart it continues from wherever pending rows remain (idempotent inserts).
+ */
+async function handleCampaignRun(event: EventEnvelope): Promise<void> {
+  incCounter("events_consumed_total", "Events consumed from the bus.", {
+    topic: EventTopics.CampaignRunRequested
+  });
+  const run = event.payload as CampaignRunRequest;
+  if (!run.campaignId || !run.tenantId || !run.channelId) {
+    logger.warn("campaign_run_invalid", { eventId: event.id });
+    return;
+  }
+
+  const channel = await resolveSendChannel(run.tenantId, run.channelId);
+  const rateScopeKey = `campaign:${run.campaignId}:${channel.phoneNumberId}`;
+  const ratePerMinute = run.ratePerMinute ?? 60;
+
+  logger.info("campaign_run_started", { campaignId: run.campaignId, tenantId: run.tenantId });
+
+  // Process in batches of 50; claimPendingBatch advisory-locks rows so a
+  // restarted worker won't re-dispatch the same contacts.
+  let processed = 0;
+  let batches = 0;
+  const MAX_BATCHES = 10_000; // Safety limit (~500K contacts per invocation)
+
+  while (batches < MAX_BATCHES) {
+    const batch = await campaignRecipientRepository.claimPendingBatch(run.tenantId, run.campaignId, 50);
+    if (batch.length === 0) break;
+    batches++;
+
+    for (const recipient of batch) {
+      // Load full contact for policy + personalization.
+      const contact = await contactRepository.getById(run.tenantId, recipient.contactId).catch(() => undefined);
+      if (!contact) {
+        await campaignRecipientRepository.updateStatus(run.tenantId, recipient.id, {
+          status: "failed",
+          error: "contact_not_found"
+        });
+        continue;
+      }
+
+      // Server-side policy evaluation.
+      const hasActiveConsent = await consentRepository.hasActiveConsent(run.tenantId, contact.id);
+      const isOptedOut = contact.optedOut;
+      const lastInboundAt = await conversationRepository.lastInboundAt(run.tenantId, contact.id);
+      const isInside24hWindow = lastInboundAt ? Date.now() - lastInboundAt.getTime() < 24 * 60 * 60 * 1000 : false;
+      const tz = contact.timezone ?? "UTC";
+      const currentHourLocal = getCurrentHourInTz(tz);
+
+      let sentInPeriod = 0;
+      if (run.frequencyCap) {
+        const since = new Date(Date.now() - run.frequencyCap.periodHours * 60 * 60 * 1000).toISOString();
+        sentInPeriod = await messageRepository.countOutboundSince(run.tenantId, contact.id, since);
+      }
+
+      const policy = evaluateOutboundPolicy({
+        hasActiveConsent,
+        isInside24hWindow,
+        // Only category is used by the policy check; cast to satisfy the type.
+        template: { category: run.templateCategory } as import("@hyfib/shared-core").Template,
+        requestedCategory: run.templateCategory,
+        isOptedOut,
+        currentHourLocal,
+        quietHours: run.quietHours,
+        frequencyCap: run.frequencyCap ? { ...run.frequencyCap, sentInPeriod } : undefined
+      });
+
+      if (!policy.allowed) {
+        await campaignRecipientRepository.updateStatus(run.tenantId, recipient.id, {
+          status: "policy_skipped",
+          error: policy.reason
+        });
+        continue;
+      }
+
+      // Personalise template parameters.
+      const parameters = resolveVariables(run.variableMapping, {
+        firstName: contact.firstName,
+        lastName: contact.lastName,
+        phoneE164: contact.phoneE164,
+        country: contact.country,
+        tags: contact.tags ?? [],
+        timezone: contact.timezone
+      });
+
+      // Rate pacing: acquire a slot from the token bucket; waits if needed.
+      await acquireRateLimit(redis, rateScopeKey, ratePerMinute).catch(() => undefined);
+
+      // Enqueue per-contact dispatch (worker's existing handleDispatch picks it up).
+      await withTenant(run.tenantId, async (client) => {
+        await outboxRepository.enqueue(client, run.tenantId, {
+          topic: EventTopics.CampaignDispatchRequested,
+          payload: {
+            campaignId: run.campaignId,
+            tenantId: run.tenantId,
+            channelId: run.channelId,
+            templateName: run.templateName,
+            templateLanguage: run.templateLanguage,
+            templateCategory: run.templateCategory,
+            contactPhoneE164: recipient.phoneE164,
+            parameters,
+            recipientId: recipient.id
+          } satisfies CampaignDispatchRequest
+        });
+      });
+
+      processed++;
+    }
+  }
+
+  logger.info("campaign_run_completed", { campaignId: run.campaignId, processed });
 }
 
 /**
@@ -238,6 +385,10 @@ async function handleInbound(event: EventEnvelope): Promise<void> {
   }
   const contact = await contactRepository.findOrCreateByPhone(channel.tenantId, inbound.from);
   const conversation = await conversationRepository.findOrCreate(channel.tenantId, contact.id, channel.channelId);
+
+  // Stamp last_inbound_at for 24h session window tracking.
+  await conversationRepository.touchInbound(channel.tenantId, conversation.id);
+
   // Persist the full normalized message (text + any media/interactive/location/etc.).
   const payload: Record<string, unknown> = { type: inbound.type, timestamp: inbound.timestamp };
   for (const field of [
@@ -280,11 +431,42 @@ async function handleInbound(event: EventEnvelope): Promise<void> {
     );
     incCounter("contact_opt_outs_total", "Contacts opted out.", { source: "inbound_stop" });
     logger.info("inbound_opt_out", { tenantId: channel.tenantId, contactId: contact.id });
-  } else if (isOptInKeyword(inbound.text)) {
+    return; // Don't auto-reply after STOP.
+  }
+
+  if (isOptInKeyword(inbound.text)) {
     await consentRepository.grant(channel.tenantId, contact.id, { source: "inbound_start", policyVersion: "v1" });
     await contactRepository.setOptedOut(channel.tenantId, contact.id, false);
     incCounter("contact_opt_ins_total", "Contacts opted in.", { source: "inbound_start" });
     logger.info("inbound_opt_in", { tenantId: channel.tenantId, contactId: contact.id });
+  }
+
+  // Auto-reply evaluation (only text/button messages; skip reactions, read receipts).
+  if (inbound.type === "text" || inbound.type === "button" || inbound.type === "interactive") {
+    const rules = await autoReplyRuleRepository.listEnabled(channel.tenantId);
+    const text = typeof inbound.text === "string" ? inbound.text : undefined;
+    const matched = matchAutoReply(text, rules);
+    if (matched && matched.replyText) {
+      await withTenant(channel.tenantId, async (client) => {
+        await outboxRepository.enqueue(client, channel.tenantId, {
+          topic: EventTopics.WhatsAppOutboundRequested,
+          payload: {
+            tenantId: channel.tenantId,
+            channelId: channel.channelId,
+            conversationId: conversation.id,
+            contactPhoneE164: contact.phoneE164,
+            kind: "text",
+            text: matched.replyText
+          } satisfies WhatsAppOutboundRequest
+        });
+      });
+      incCounter("auto_replies_sent_total", "Auto-reply messages enqueued.", { matchType: matched.matchType });
+      logger.info("auto_reply_enqueued", {
+        tenantId: channel.tenantId,
+        conversationId: conversation.id,
+        ruleId: matched.id
+      });
+    }
   }
 }
 
@@ -313,6 +495,29 @@ async function handleStatus(event: EventEnvelope): Promise<void> {
     metaPatch.error = status.errors[0];
   }
   await messageRepository.applyStatusUpdate(channel.tenantId, status.messageId, mapped, metaPatch);
+
+  // Update delivery funnel in campaign_recipients (best-effort; row may not exist).
+  if (mapped === "delivered" || mapped === "read" || mapped === "failed") {
+    await campaignRecipientRepository
+      .updateByExternalMessageId(channel.tenantId, status.messageId, mapped)
+      .catch(() => undefined);
+  }
+
+  // Update aggregate campaign stats for delivered/read.
+  if (mapped === "delivered" || mapped === "read") {
+    // Look up the message to find campaignId (best-effort).
+    const message = await messageRepository.findByExternalId(channel.tenantId, status.messageId).catch(() => undefined);
+    if (message?.payload && typeof message.payload === "object") {
+      const campaignId = (message.payload as { campaignId?: string }).campaignId;
+      if (campaignId) {
+        if (mapped === "delivered") {
+          await campaignStatsRepository.recordDelivered(channel.tenantId, campaignId).catch(() => undefined);
+        } else if (mapped === "read") {
+          await campaignStatsRepository.recordRead(channel.tenantId, campaignId).catch(() => undefined);
+        }
+      }
+    }
+  }
 }
 
 interface DispatchResultEvent {
@@ -331,8 +536,20 @@ async function handleDispatchResult(event: EventEnvelope): Promise<void> {
   await campaignStatsRepository.recordResult(result.tenantId, result.campaignId, outcome);
 }
 
+function getCurrentHourInTz(tz: string): number {
+  try {
+    const now = new Date();
+    const formatted = new Intl.DateTimeFormat("en-US", { hour: "numeric", hour12: false, timeZone: tz }).format(now);
+    const h = parseInt(formatted, 10);
+    return Number.isFinite(h) ? h % 24 : now.getUTCHours();
+  } catch {
+    return new Date().getUTCHours();
+  }
+}
+
 eventBus.subscribe(EventTopics.CampaignDispatchRequested, "campaign-dispatch", handleDispatch);
 eventBus.subscribe(EventTopics.CampaignDispatchResult, "campaign-results", handleDispatchResult);
+eventBus.subscribe(EventTopics.CampaignRunRequested, "campaign-run", handleCampaignRun);
 eventBus.subscribe(EventTopics.WhatsAppInboundReceived, "inbound-messages", handleInbound);
 eventBus.subscribe(EventTopics.WhatsAppStatusUpdated, "status-updates", handleStatus);
 eventBus.subscribe(EventTopics.WhatsAppOutboundRequested, "outbound-messages", handleOutbound);
@@ -351,7 +568,7 @@ const server = createServer(async (req, res) => {
       db = false;
     }
     sendJson(res, db ? 200 : 503, {
-      service: "message-worker",
+      service: "notification-worker",
       status: db ? "ok" : "degraded",
       database: db,
       timestamp: new Date().toISOString()

@@ -1,0 +1,2456 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>HyFib WhatsApp Business</title>
+    <style>
+      :root {
+        --bg: #0e1117;
+        --surface: #161b22;
+        --surface2: #21262d;
+        --border: #30363d;
+        --brand: #25d366;
+        --brand-dim: rgba(37, 211, 102, 0.12);
+        --brand-dark: #128c7e;
+        --accent: #58a6ff;
+        --text: #e6edf3;
+        --muted: #8b949e;
+        --danger: #f85149;
+        --warn: #d29922;
+        --radius: 10px;
+        --sidebar-w: 200px;
+        --convlist-w: 280px;
+      }
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+      body {
+        font-family: "Segoe UI", system-ui, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        height: 100vh;
+        overflow: hidden;
+        font-size: 14px;
+      }
+      a {
+        color: var(--brand);
+        text-decoration: none;
+      }
+      code {
+        font-family: monospace;
+        background: var(--surface2);
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-size: 12px;
+      }
+      .field {
+        margin-bottom: 14px;
+      }
+      .field label {
+        display: block;
+        font-size: 11px;
+        color: var(--muted);
+        margin-bottom: 5px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+      }
+      .field input,
+      .field select,
+      .field textarea {
+        width: 100%;
+        background: var(--bg);
+        border: 1px solid var(--border);
+        color: var(--text);
+        border-radius: 8px;
+        padding: 9px 12px;
+        font: inherit;
+        font-size: 13px;
+        transition: border-color 0.15s;
+      }
+      .field input:focus,
+      .field select:focus,
+      .field textarea:focus {
+        outline: none;
+        border-color: var(--brand);
+      }
+      .field select option {
+        background: var(--surface2);
+      }
+      .field textarea {
+        resize: vertical;
+        min-height: 72px;
+      }
+      .btn {
+        padding: 9px 16px;
+        border: none;
+        border-radius: 8px;
+        font: inherit;
+        font-weight: 600;
+        font-size: 13px;
+        cursor: pointer;
+        transition: opacity 0.15s;
+      }
+      .btn:hover {
+        opacity: 0.85;
+      }
+      .btn:disabled {
+        opacity: 0.45;
+        cursor: default;
+      }
+      .btn-primary {
+        background: var(--brand);
+        color: #000;
+      }
+      .btn-secondary {
+        background: var(--surface2);
+        color: var(--text);
+        border: 1px solid var(--border);
+      }
+      .btn-danger {
+        background: var(--danger);
+        color: #fff;
+      }
+      .btn-sm {
+        padding: 5px 11px;
+        font-size: 12px;
+      }
+      .btn-icon {
+        padding: 5px 8px;
+        background: var(--surface2);
+        border: 1px solid var(--border);
+        color: var(--text);
+        border-radius: 7px;
+        cursor: pointer;
+        font-size: 15px;
+        line-height: 1;
+      }
+      #setup {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        height: 100vh;
+      }
+      .setup-card {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        padding: 36px;
+        width: 430px;
+      }
+      .setup-card .logo {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 6px;
+      }
+      .setup-card .logo h1 {
+        font-size: 20px;
+      }
+      .setup-card .subtitle {
+        color: var(--muted);
+        font-size: 13px;
+        margin-bottom: 24px;
+      }
+      .steps {
+        display: flex;
+        gap: 6px;
+        margin-bottom: 22px;
+      }
+      .step-dot {
+        flex: 1;
+        height: 3px;
+        border-radius: 2px;
+        background: var(--border);
+      }
+      .step-dot.done {
+        background: var(--brand);
+      }
+      #app {
+        display: grid;
+        grid-template-columns: var(--sidebar-w) 1fr;
+        grid-template-rows: 48px 1fr;
+        height: 100vh;
+      }
+      #topbar {
+        grid-column: 1/-1;
+        background: var(--surface);
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        align-items: center;
+        padding: 0 14px;
+        gap: 10px;
+      }
+      #topbar .brand {
+        font-weight: 700;
+        color: var(--brand);
+        font-size: 15px;
+        white-space: nowrap;
+      }
+      #topbar .sep {
+        color: var(--border);
+      }
+      #topbar .tname {
+        font-size: 13px;
+        color: var(--muted);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 160px;
+      }
+      #topbar .phone-pill {
+        font-size: 11px;
+        background: var(--surface2);
+        border: 1px solid var(--border);
+        padding: 2px 8px;
+        border-radius: 20px;
+        color: var(--muted);
+        white-space: nowrap;
+      }
+      #topbar .spacer {
+        flex: 1;
+      }
+      #topbar select {
+        background: var(--surface2);
+        border: 1px solid var(--border);
+        color: var(--text);
+        padding: 3px 7px;
+        border-radius: 6px;
+        font-size: 11px;
+        max-width: 150px;
+      }
+      .sse-pill {
+        display: flex;
+        align-items: center;
+        gap: 5px;
+        font-size: 11px;
+        color: var(--muted);
+        white-space: nowrap;
+      }
+      .sse-dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--muted);
+      }
+      .sse-dot.on {
+        background: var(--brand);
+      }
+      #sidebar {
+        background: var(--surface);
+        border-right: 1px solid var(--border);
+        padding: 10px 7px;
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+        overflow: hidden;
+      }
+      .nav-btn {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        padding: 8px 9px;
+        border-radius: 8px;
+        cursor: pointer;
+        font-size: 13px;
+        color: var(--muted);
+        border: none;
+        background: none;
+        width: 100%;
+        text-align: left;
+        white-space: nowrap;
+        overflow: hidden;
+      }
+      .nav-btn:hover {
+        background: var(--surface2);
+        color: var(--text);
+      }
+      .nav-btn.active {
+        background: var(--brand-dim);
+        color: var(--brand);
+      }
+      .nav-btn .ni {
+        font-size: 15px;
+        width: 18px;
+        text-align: center;
+        flex-shrink: 0;
+      }
+      #content {
+        overflow: hidden;
+        height: 100%;
+      }
+      .view {
+        display: none;
+        height: 100%;
+      }
+      .view.active {
+        display: flex;
+      }
+      #v-inbox {
+        flex-direction: row;
+        height: 100%;
+      }
+      #conv-list {
+        width: var(--convlist-w);
+        min-width: 220px;
+        flex-shrink: 0;
+        border-right: 1px solid var(--border);
+        display: flex;
+        flex-direction: column;
+        background: var(--surface);
+      }
+      .cl-header {
+        padding: 10px 14px;
+        border-bottom: 1px solid var(--border);
+        font-size: 13px;
+        font-weight: 600;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 6px;
+        flex-wrap: wrap;
+      }
+      .cl-filters {
+        display: flex;
+        gap: 5px;
+        padding: 8px 10px;
+        border-bottom: 1px solid var(--border);
+      }
+      .cl-filters select {
+        background: var(--bg);
+        border: 1px solid var(--border);
+        color: var(--text);
+        padding: 4px 7px;
+        border-radius: 6px;
+        font-size: 11px;
+        flex: 1;
+      }
+      #conv-scroll {
+        flex: 1;
+        overflow-y: auto;
+      }
+      .ci {
+        padding: 11px 14px;
+        cursor: pointer;
+        border-bottom: 1px solid var(--border);
+        transition: background 0.1s;
+      }
+      .ci:hover {
+        background: var(--surface2);
+      }
+      .ci.sel {
+        background: var(--brand-dim);
+        border-left: 3px solid var(--brand);
+      }
+      .ci .ci-name {
+        font-weight: 600;
+        font-size: 13px;
+        margin-bottom: 2px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 180px;
+      }
+      .ci .ci-preview {
+        font-size: 12px;
+        color: var(--muted);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .ci .ci-time {
+        font-size: 10px;
+        color: var(--muted);
+        float: right;
+        margin-top: 2px;
+      }
+      .ci .ci-badges {
+        margin-top: 4px;
+        display: flex;
+        gap: 4px;
+        flex-wrap: wrap;
+      }
+      #chat {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+      }
+      #chat-header {
+        padding: 11px 18px;
+        border-bottom: 1px solid var(--border);
+        background: var(--surface);
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex-shrink: 0;
+        flex-wrap: wrap;
+      }
+      .ch-name {
+        font-weight: 600;
+        font-size: 14px;
+      }
+      .ch-phone {
+        font-size: 11px;
+        color: var(--muted);
+      }
+      .ch-actions {
+        margin-left: auto;
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+      }
+      #msgs {
+        flex: 1;
+        overflow-y: auto;
+        padding: 14px;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .msg {
+        max-width: 62%;
+        padding: 9px 13px;
+        border-radius: 12px;
+        font-size: 13px;
+        line-height: 1.45;
+        word-break: break-word;
+      }
+      .msg.in {
+        align-self: flex-start;
+        background: var(--surface2);
+        border-bottom-left-radius: 3px;
+      }
+      .msg.out {
+        align-self: flex-end;
+        background: var(--brand-dark);
+        color: #fff;
+        border-bottom-right-radius: 3px;
+      }
+      .msg .mt {
+        font-size: 10px;
+        opacity: 0.55;
+        margin-top: 4px;
+        text-align: right;
+      }
+      .msg.in .mt {
+        text-align: left;
+      }
+      #input-row {
+        padding: 10px 14px;
+        border-top: 1px solid var(--border);
+        background: var(--surface);
+        display: flex;
+        gap: 8px;
+        align-items: flex-end;
+        flex-shrink: 0;
+      }
+      #msg-input {
+        flex: 1;
+        background: var(--bg);
+        border: 1px solid var(--border);
+        color: var(--text);
+        border-radius: 9px;
+        padding: 9px 13px;
+        font: inherit;
+        font-size: 13px;
+        resize: none;
+        max-height: 110px;
+        line-height: 1.4;
+      }
+      #msg-input:focus {
+        outline: none;
+        border-color: var(--brand);
+      }
+      #no-conv {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        color: var(--muted);
+        gap: 6px;
+        text-align: center;
+        padding: 20px;
+      }
+      #no-conv .big {
+        font-size: 44px;
+        margin-bottom: 4px;
+      }
+      .pv {
+        flex-direction: column;
+        overflow-y: auto;
+        padding: 22px 26px;
+        gap: 18px;
+      }
+      .pv-head {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 10px;
+        flex-shrink: 0;
+        flex-wrap: wrap;
+      }
+      .pv-head h2 {
+        font-size: 18px;
+        font-weight: 700;
+      }
+      .pv-head .sub {
+        color: var(--muted);
+        font-size: 12px;
+        margin-top: 3px;
+      }
+      .pv-head .acts {
+        display: flex;
+        gap: 7px;
+        flex-wrap: wrap;
+      }
+      .card {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 11px;
+        padding: 18px;
+      }
+      .card-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 14px;
+        gap: 8px;
+      }
+      .card-head h3 {
+        font-size: 11px;
+        font-weight: 600;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.07em;
+      }
+      .kpis {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 10px;
+        flex-shrink: 0;
+      }
+      .kpi {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 14px;
+      }
+      .kpi b {
+        font-size: 22px;
+        display: block;
+        margin-bottom: 3px;
+      }
+      .kpi span {
+        font-size: 11px;
+        color: var(--muted);
+      }
+      .tbl {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 12px;
+      }
+      .tbl th {
+        text-align: left;
+        padding: 7px 11px;
+        color: var(--muted);
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.07em;
+        border-bottom: 1px solid var(--border);
+        font-weight: 600;
+      }
+      .tbl td {
+        padding: 9px 11px;
+        border-bottom: 1px solid var(--border);
+        vertical-align: middle;
+      }
+      .tbl tr:last-child td {
+        border-bottom: none;
+      }
+      .tbl tr:hover td {
+        background: rgba(255, 255, 255, 0.02);
+      }
+      .bdg {
+        display: inline-block;
+        padding: 2px 7px;
+        border-radius: 20px;
+        font-size: 10px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+      .bdg-green {
+        background: rgba(37, 211, 102, 0.14);
+        color: #25d366;
+      }
+      .bdg-yellow {
+        background: rgba(210, 153, 34, 0.14);
+        color: #d29922;
+      }
+      .bdg-red {
+        background: rgba(248, 81, 73, 0.14);
+        color: #f85149;
+      }
+      .bdg-blue {
+        background: rgba(88, 166, 255, 0.14);
+        color: #58a6ff;
+      }
+      .bdg-gray {
+        background: var(--surface2);
+        color: var(--muted);
+      }
+      .overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.65);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 100;
+      }
+      .modal {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 13px;
+        padding: 26px;
+        width: 500px;
+        max-width: 95vw;
+        max-height: 90vh;
+        overflow-y: auto;
+      }
+      .modal h3 {
+        font-size: 16px;
+        font-weight: 700;
+        margin-bottom: 18px;
+      }
+      .modal .mact {
+        display: flex;
+        gap: 8px;
+        justify-content: flex-end;
+        margin-top: 18px;
+      }
+      .alert {
+        padding: 9px 13px;
+        border-radius: 8px;
+        font-size: 12px;
+        margin-bottom: 12px;
+      }
+      .alert-err {
+        background: rgba(248, 81, 73, 0.1);
+        border: 1px solid rgba(248, 81, 73, 0.3);
+        color: var(--danger);
+      }
+      .alert-ok {
+        background: rgba(37, 211, 102, 0.1);
+        border: 1px solid rgba(37, 211, 102, 0.3);
+        color: var(--brand);
+      }
+      .alert-info {
+        background: rgba(88, 166, 255, 0.1);
+        border: 1px solid rgba(88, 166, 255, 0.3);
+        color: var(--accent);
+      }
+      .info-box {
+        background: rgba(88, 166, 255, 0.07);
+        border: 1px solid rgba(88, 166, 255, 0.2);
+        border-radius: 9px;
+        padding: 12px 14px;
+        font-size: 12px;
+        color: var(--accent);
+      }
+      .info-box b {
+        display: block;
+        margin-bottom: 5px;
+        font-size: 13px;
+      }
+      .empty {
+        text-align: center;
+        padding: 32px;
+        color: var(--muted);
+      }
+      .empty .ei {
+        font-size: 32px;
+        margin-bottom: 8px;
+      }
+      .spin {
+        width: 20px;
+        height: 20px;
+        border: 2px solid var(--border);
+        border-top-color: var(--brand);
+        border-radius: 50%;
+        animation: sp 0.6s linear infinite;
+        display: inline-block;
+      }
+      @keyframes sp {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      .loading {
+        display: flex;
+        justify-content: center;
+        padding: 24px;
+      }
+      #toast {
+        position: fixed;
+        bottom: 22px;
+        right: 22px;
+        background: var(--surface2);
+        border: 1px solid var(--border);
+        border-radius: 9px;
+        padding: 10px 16px;
+        font-size: 13px;
+        z-index: 200;
+        opacity: 0;
+        transition: opacity 0.2s;
+        pointer-events: none;
+        max-width: 300px;
+      }
+      #toast.show {
+        opacity: 1;
+      }
+      #toast.tok {
+        border-color: var(--brand);
+        color: var(--brand);
+      }
+      #toast.terr {
+        border-color: var(--danger);
+        color: var(--danger);
+      }
+      .row {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      .funnel {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin-bottom: 14px;
+      }
+      .funnel-bar {
+        flex: 1;
+        min-width: 80px;
+        background: var(--surface2);
+        border-radius: 8px;
+        padding: 12px;
+        text-align: center;
+      }
+      .funnel-bar .fb-n {
+        font-size: 20px;
+        font-weight: 700;
+      }
+      .funnel-bar .fb-l {
+        font-size: 10px;
+        color: var(--muted);
+        margin-top: 3px;
+      }
+      .drop-zone {
+        border: 2px dashed var(--border);
+        border-radius: 10px;
+        padding: 24px;
+        text-align: center;
+        cursor: pointer;
+        color: var(--muted);
+        transition:
+          border-color 0.15s,
+          background 0.15s;
+      }
+      .drop-zone:hover,
+      .drop-zone.drag {
+        border-color: var(--brand);
+        background: var(--brand-dim);
+        color: var(--brand);
+      }
+      .drop-zone input[type="file"] {
+        display: none;
+      }
+      .var-row {
+        display: grid;
+        grid-template-columns: 60px 1fr 1fr;
+        gap: 8px;
+        align-items: center;
+        margin-bottom: 8px;
+        font-size: 12px;
+      }
+      .var-row label {
+        color: var(--muted);
+        text-align: center;
+        font-family: monospace;
+      }
+      ::-webkit-scrollbar {
+        width: 4px;
+      }
+      ::-webkit-scrollbar-thumb {
+        background: var(--border);
+        border-radius: 2px;
+      }
+      @media (max-width: 800px) {
+        :root {
+          --sidebar-w: 48px;
+          --convlist-w: 200px;
+        }
+        .nav-btn span {
+          display: none;
+        }
+        .kpis {
+          grid-template-columns: repeat(2, 1fr);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <div id="toast"></div>
+    <script>
+      // ═══════════════════ STATE ═══════════════════
+      const S = {
+        tenantId: localStorage.getItem("hf_tid") || "",
+        tenantName: localStorage.getItem("hf_tname") || "",
+        channelId: localStorage.getItem("hf_chid") || "",
+        channelPhone: localStorage.getItem("hf_chphone") || "",
+        role: localStorage.getItem("hf_role") || "marketing_manager",
+        setupStep: 1,
+        view: "inbox",
+        conversations: [],
+        activeConvId: null,
+        messages: [],
+        contacts: [],
+        templates: [],
+        campaigns: [],
+        segments: [],
+        autoRules: [],
+        convFilter: { state: "", assignee: "" }
+      };
+
+      // ═══════════════════ UTILS ═══════════════════
+      function esc(s) {
+        return s == null
+          ? ""
+          : String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+      }
+
+      let _tt;
+      function toast(msg, type) {
+        const el = document.getElementById("toast");
+        el.textContent = msg;
+        el.className = "show" + (type === "ok" ? " tok" : type === "err" ? " terr" : "");
+        clearTimeout(_tt);
+        _tt = setTimeout(() => (el.className = ""), 3500);
+      }
+
+      function fmtTime(ts) {
+        if (!ts) return "";
+        let d;
+        if (typeof ts === "number" && ts < 2e10) d = new Date(ts * 1000);
+        else d = new Date(ts);
+        if (isNaN(d)) return "";
+        const now = new Date();
+        if (d.toDateString() === now.toDateString())
+          return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+        return d.toLocaleDateString([], { month: "short", day: "numeric" });
+      }
+
+      function bdg(text, type) {
+        return '<span class="bdg bdg-' + (type || "gray") + '">' + esc(text) + "</span>";
+      }
+
+      function statusBdg(s) {
+        const m = {
+          approved: "green",
+          active: "green",
+          running: "blue",
+          pending: "yellow",
+          rejected: "red",
+          paused: "yellow",
+          draft: "gray",
+          completed: "green",
+          scheduled: "blue",
+          open: "green",
+          closed: "gray",
+          consent_active: "green",
+          sent: "blue",
+          delivered: "green",
+          read: "green",
+          failed: "red",
+          policy_skipped: "yellow"
+        };
+        return bdg(s, m[s] || "gray");
+      }
+
+      function loading() {
+        return '<div class="loading"><div class="spin"></div></div>';
+      }
+      function empty(icon, msg) {
+        return '<div class="empty"><div class="ei">' + icon + "</div><p>" + esc(msg) + "</p></div>";
+      }
+
+      // ═══════════════════ API ═══════════════════
+      async function api(method, path, body, tid, roleOverride) {
+        const tenantId = tid !== undefined ? tid : S.tenantId;
+        const effectiveRole = roleOverride || S.role;
+        const headers = { "content-type": "application/json", "x-role": effectiveRole, "x-actor-id": "portal-user" };
+        if (tenantId) headers["x-tenant-id"] = tenantId;
+        const opts = { method, headers };
+        if (body != null) opts.body = JSON.stringify(body);
+        const res = await fetch("/api/v1" + path, opts);
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok)
+          throw Object.assign(new Error(data.error || data.detail || "HTTP " + res.status), { status: res.status });
+        return data;
+      }
+
+      async function apiUpload(path, formData, tid) {
+        const tenantId = tid !== undefined ? tid : S.tenantId;
+        const headers = { "x-role": S.role, "x-actor-id": "portal-user" };
+        if (tenantId) headers["x-tenant-id"] = tenantId;
+        const res = await fetch("/api/v1" + path, { method: "POST", headers, body: formData });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok)
+          throw Object.assign(new Error(data.error || data.detail || "HTTP " + res.status), { status: res.status });
+        return data;
+      }
+
+      const GET = (p, tid) => api("GET", p, undefined, tid);
+      const POST = (p, b, tid) => api("POST", p, b, tid);
+
+      // ═══════════════════ SSE ═══════════════════
+      let _sseCtrl = null;
+
+      async function connectSSE() {
+        if (!S.tenantId) return;
+        if (_sseCtrl) {
+          _sseCtrl.abort();
+        }
+        _sseCtrl = new AbortController();
+        const dot = () => document.getElementById("sse-dot");
+        const lbl = () => document.getElementById("sse-lbl");
+        try {
+          const res = await fetch("/api/v1/events/stream", {
+            headers: { "x-tenant-id": S.tenantId, "x-role": S.role, "x-actor-id": "portal-user" },
+            signal: _sseCtrl.signal
+          });
+          if (dot()) {
+            dot().className = "sse-dot on";
+            lbl().textContent = "Live";
+          }
+          const reader = res.body.getReader();
+          const dec = new TextDecoder();
+          let buf = "";
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += dec.decode(value, { stream: true });
+            const lines = buf.split("\n");
+            buf = lines.pop();
+            let evt = null;
+            for (const line of lines) {
+              if (line.startsWith("data: ")) {
+                try {
+                  evt = JSON.parse(line.slice(6));
+                } catch {}
+              } else if (line === "" && evt) {
+                onSSE(evt);
+                evt = null;
+              }
+            }
+          }
+        } catch (e) {
+          if (e.name !== "AbortError") {
+            if (dot()) {
+              dot().className = "sse-dot";
+              lbl().textContent = "Offline";
+            }
+            setTimeout(connectSSE, 6000);
+          }
+        }
+      }
+
+      function onSSE(data) {
+        const pl = data.payload || {};
+        const topic = data.topic || "";
+        if (S.view === "inbox") {
+          loadConvList();
+        }
+        if (topic === "conversation.assigned" || topic === "conversation.state_changed") {
+          if (pl.conversationId === S.activeConvId) {
+          }
+          loadConvList();
+        }
+        if (pl.conversationId && pl.conversationId === S.activeConvId) {
+          loadMessages(S.activeConvId);
+        }
+      }
+
+      // ═══════════════════ SETUP ═══════════════════
+      function renderSetup() {
+        document.getElementById("root").innerHTML =
+          '<div id="setup"><div class="setup-card"><div class="logo"><span style="font-size:26px">📱</span><h1>HyFib WA Platform</h1></div><p class="subtitle">Connect your WhatsApp Business account to get started.</p><div id="setup-body"></div></div></div>';
+        if (S.setupStep === 1) renderStep1();
+        else renderStep2();
+      }
+
+      function renderStep1() {
+        document.getElementById("setup-body").innerHTML =
+          '<div class="steps"><div class="step-dot done"></div><div class="step-dot"></div></div>' +
+          '<div id="s-alert"></div>' +
+          '<div class="field"><label>Company Name</label><input id="s-co" placeholder="Acme Corp" /></div>' +
+          '<p style="font-size:11px;color:var(--muted);margin:4px 0 4px">— or use existing workspace —</p>' +
+          '<div class="field"><label>Existing Tenant ID</label><input id="s-tid" placeholder="xxxxxxxx-xxxx-…" /></div>' +
+          '<button class="btn btn-primary" style="width:100%;margin-top:4px" onclick="doStep1()">Continue →</button>';
+        document.getElementById("s-co").focus();
+      }
+
+      async function doStep1() {
+        const co = document.getElementById("s-co").value.trim();
+        const tid = document.getElementById("s-tid").value.trim();
+        const al = document.getElementById("s-alert");
+        if (tid) {
+          S.tenantId = tid;
+          S.tenantName = co || "My Company";
+          localStorage.setItem("hf_tid", S.tenantId);
+          localStorage.setItem("hf_tname", S.tenantName);
+          try {
+            const r = await GET("/channels/whatsapp");
+            const ch = (r.items || [])[0];
+            if (ch) {
+              S.channelId = ch.id;
+              S.channelPhone = ch.displayPhoneNumber || "";
+              localStorage.setItem("hf_chid", ch.id);
+              localStorage.setItem("hf_chphone", ch.displayPhoneNumber || "");
+              initApp();
+              return;
+            }
+          } catch {}
+          S.setupStep = 2;
+          renderSetup();
+          return;
+        }
+        if (!co) {
+          al.innerHTML = '<div class="alert alert-err">Enter your company name.</div>';
+          return;
+        }
+        al.innerHTML = '<div class="alert alert-info">Creating workspace…</div>';
+        try {
+          const t = await api("POST", "/tenants", { name: co }, "", "platform_owner");
+          S.tenantId = t.id;
+          S.tenantName = co;
+          localStorage.setItem("hf_tid", t.id);
+          localStorage.setItem("hf_tname", co);
+          S.setupStep = 2;
+          renderSetup();
+        } catch (e) {
+          al.innerHTML = '<div class="alert alert-err">' + esc(e.message) + "</div>";
+        }
+      }
+
+      function renderStep2() {
+        document.getElementById("setup-body").innerHTML =
+          '<div class="steps"><div class="step-dot done"></div><div class="step-dot done"></div></div>' +
+          '<div class="info-box" style="margin-bottom:14px"><b>📋 Where to find these</b>Meta Business Manager → WhatsApp → API Setup. The Access Token is your System User permanent token.</div>' +
+          '<div id="s-alert"></div>' +
+          '<div class="field"><label>WABA ID</label><input id="s-waba" placeholder="1234567890123456" /></div>' +
+          '<div class="field"><label>Phone Number ID</label><input id="s-pnid" placeholder="1234567890123456" /></div>' +
+          '<div class="field"><label>Display Phone Number</label><input id="s-dph" placeholder="+15551234567" /></div>' +
+          '<div class="field"><label>Permanent Access Token</label><input id="s-tok" type="password" placeholder="EAAx…" /></div>' +
+          '<div style="display:flex;gap:8px;margin-top:6px">' +
+          '<button class="btn btn-secondary" onclick="S.setupStep=1;renderSetup()">← Back</button>' +
+          '<button class="btn btn-primary" style="flex:1" onclick="doStep2()">Connect →</button>' +
+          "</div>" +
+          '<button class="btn btn-secondary" style="width:100%;margin-top:8px;font-size:11px" onclick="doStep2Skip()">Skip — use local test credentials</button>';
+        document.getElementById("s-waba").focus();
+      }
+
+      async function doStep2() {
+        const wabaId = document.getElementById("s-waba").value.trim();
+        const pnId = document.getElementById("s-pnid").value.trim();
+        const dph = document.getElementById("s-dph").value.trim();
+        const tok = document.getElementById("s-tok").value.trim();
+        const al = document.getElementById("s-alert");
+        if (!wabaId || !pnId || !dph) {
+          al.innerHTML = '<div class="alert alert-err">WABA ID, Phone Number ID, and Display Phone are required.</div>';
+          return;
+        }
+        al.innerHTML = '<div class="alert alert-info">Registering channel…</div>';
+        try {
+          const body = { wabaId, phoneNumberId: pnId, displayPhoneNumber: dph };
+          if (tok) body.accessToken = tok;
+          const ch = await api("POST", "/channels/whatsapp", body, undefined, "tenant_admin");
+          S.channelId = ch.id;
+          S.channelPhone = dph;
+          localStorage.setItem("hf_chid", ch.id);
+          localStorage.setItem("hf_chphone", dph);
+          initApp();
+        } catch (e) {
+          al.innerHTML = '<div class="alert alert-err">' + esc(e.message) + "</div>";
+        }
+      }
+
+      async function doStep2Skip() {
+        const al = document.getElementById("s-alert");
+        al.innerHTML = '<div class="alert alert-info">Registering test channel…</div>';
+        try {
+          const pnId = String(Date.now());
+          const ch = await api(
+            "POST",
+            "/channels/whatsapp",
+            { wabaId: "000000000000000", phoneNumberId: pnId, displayPhoneNumber: "+15550001111" },
+            undefined,
+            "tenant_admin"
+          );
+          S.channelId = ch.id;
+          S.channelPhone = "+15550001111";
+          localStorage.setItem("hf_chid", ch.id);
+          localStorage.setItem("hf_chphone", "+15550001111");
+          initApp();
+        } catch (e) {
+          al.innerHTML = '<div class="alert alert-err">' + esc(e.message) + "</div>";
+        }
+      }
+
+      // ═══════════════════ APP SHELL ═══════════════════
+      function initApp() {
+        const roles = [
+          "platform_owner",
+          "tenant_admin",
+          "marketing_manager",
+          "sales_agent",
+          "support_agent",
+          "analyst",
+          "compliance_auditor"
+        ];
+        const nav = [
+          { id: "inbox", icon: "💬", label: "Inbox" },
+          { id: "contacts", icon: "👥", label: "Contacts" },
+          { id: "segments", icon: "🎯", label: "Segments" },
+          { id: "campaigns", icon: "📢", label: "Campaigns" },
+          { id: "analytics", icon: "📊", label: "Analytics" },
+          { id: "settings", icon: "⚙️", label: "Settings" }
+        ];
+        document.getElementById("root").innerHTML =
+          '<div id="app">' +
+          '<div id="topbar">' +
+          '<span class="brand">📱 HyFib</span>' +
+          '<span class="sep">·</span>' +
+          '<span class="tname">' +
+          esc(S.tenantName || "Workspace") +
+          "</span>" +
+          (S.channelPhone ? '<span class="phone-pill">' + esc(S.channelPhone) + "</span>" : "") +
+          '<div class="spacer"></div>' +
+          '<div class="sse-pill"><div class="sse-dot" id="sse-dot"></div><span id="sse-lbl">Connecting…</span></div>' +
+          '<select title="Active role" onchange="S.role=this.value;localStorage.setItem(\'hf_role\',this.value)">' +
+          roles
+            .map(
+              (r) =>
+                '<option value="' +
+                r +
+                '"' +
+                (r === S.role ? " selected" : "") +
+                ">" +
+                r.replace(/_/g, " ") +
+                "</option>"
+            )
+            .join("") +
+          "</select>" +
+          "</div>" +
+          '<div id="sidebar">' +
+          nav
+            .map(
+              (n) =>
+                '<button class="nav-btn' +
+                (n.id === S.view ? " active" : "") +
+                '" data-view="' +
+                n.id +
+                '" onclick="switchView(\'' +
+                n.id +
+                '\')"><span class="ni">' +
+                n.icon +
+                "</span><span>" +
+                n.label +
+                "</span></button>"
+            )
+            .join("") +
+          '<div style="flex:1"></div>' +
+          '<button class="nav-btn" onclick="logout()"><span class="ni">🚪</span><span>Logout</span></button>' +
+          "</div>" +
+          '<div id="content">' +
+          nav
+            .map((n) => '<div id="v-' + n.id + '" class="view' + (n.id === S.view ? " active" : "") + '"></div>')
+            .join("") +
+          "</div>" +
+          "</div>";
+        connectSSE();
+        renderView(S.view);
+      }
+
+      function switchView(v) {
+        S.view = v;
+        document
+          .querySelectorAll(".nav-btn[data-view]")
+          .forEach((b) => b.classList.toggle("active", b.dataset.view === v));
+        document.querySelectorAll(".view").forEach((el) => el.classList.remove("active"));
+        document.getElementById("v-" + v).classList.add("active");
+        renderView(v);
+      }
+
+      function renderView(v) {
+        ({
+          inbox: renderInbox,
+          contacts: renderContacts,
+          segments: renderSegments,
+          campaigns: renderCampaigns,
+          analytics: renderAnalytics,
+          settings: renderSettings
+        })[v]?.();
+      }
+
+      function logout() {
+        if (!confirm("Clear workspace and logout?")) return;
+        ["hf_tid", "hf_tname", "hf_chid", "hf_chphone", "hf_role"].forEach((k) => localStorage.removeItem(k));
+        Object.assign(S, { tenantId: "", tenantName: "", channelId: "", channelPhone: "", setupStep: 1 });
+        if (_sseCtrl) {
+          _sseCtrl.abort();
+          _sseCtrl = null;
+        }
+        renderSetup();
+      }
+
+      // ═══════════════════ INBOX ═══════════════════
+      function renderInbox() {
+        const el = document.getElementById("v-inbox");
+        el.innerHTML =
+          '<div id="conv-list">' +
+          '<div class="cl-header"><span>Inbox</span>' +
+          '<div style="display:flex;gap:5px">' +
+          '<button class="btn-icon" title="Auto-reply rules" onclick="showAutoRules()">🤖</button>' +
+          '<button class="btn-icon" title="New campaign" onclick="switchView(\'campaigns\')">📢</button>' +
+          "</div>" +
+          "</div>" +
+          '<div class="cl-filters">' +
+          '<select title="Filter by state" onchange="S.convFilter.state=this.value;loadConvList()">' +
+          '<option value="">All states</option>' +
+          '<option value="open">Open</option>' +
+          '<option value="pending">Pending</option>' +
+          '<option value="closed">Closed</option>' +
+          "</select>" +
+          "</div>" +
+          '<div id="conv-scroll">' +
+          loading() +
+          "</div>" +
+          "</div>" +
+          '<div id="chat">' +
+          '<div id="no-conv"><div class="big">💬</div><p>Select a conversation</p>' +
+          '<p style="font-size:12px;color:var(--muted);margin-top:6px">Or <a href="#" onclick="switchView(\'campaigns\');return false">launch a campaign</a> to start new ones</p>' +
+          "</div>" +
+          "</div>";
+        loadConvList();
+      }
+
+      async function loadConvList() {
+        const el = document.getElementById("conv-scroll");
+        if (!el) return;
+        try {
+          const qs = [];
+          if (S.convFilter.state) qs.push("state=" + encodeURIComponent(S.convFilter.state));
+          const d = await GET("/conversations" + (qs.length ? "?" + qs.join("&") : ""));
+          S.conversations = d.items || [];
+          if (!S.conversations.length) {
+            el.innerHTML = empty("📭", "No conversations yet.");
+            return;
+          }
+          el.innerHTML = S.conversations
+            .map((c) => {
+              const stateCls = c.state === "open" ? "green" : c.state === "closed" ? "gray" : "yellow";
+              return (
+                '<div class="ci' +
+                (c.id === S.activeConvId ? " sel" : "") +
+                '" data-cid="' +
+                esc(c.id) +
+                '" onclick="selectConv(\'' +
+                c.id +
+                "','" +
+                esc(c.contactPhone || "") +
+                "','" +
+                esc(c.contactName || "") +
+                "')\">" +
+                '<span class="ci-time">' +
+                fmtTime(c.updatedAt || c.createdAt) +
+                "</span>" +
+                '<div class="ci-name">' +
+                esc(c.contactName || c.contactPhone || "Unknown") +
+                "</div>" +
+                '<div class="ci-preview">' +
+                esc(c.lastMessage || "—") +
+                "</div>" +
+                '<div class="ci-badges">' +
+                bdg(c.state || "open", stateCls) +
+                (c.assignedUserId ? bdg("assigned", "blue") : "") +
+                "</div>" +
+                "</div>"
+              );
+            })
+            .join("");
+        } catch (e) {
+          if (el) el.innerHTML = '<div class="alert alert-err" style="margin:10px">' + esc(e.message) + "</div>";
+        }
+      }
+
+      async function selectConv(id, phone, name) {
+        S.activeConvId = id;
+        document.querySelectorAll(".ci").forEach((el) => el.classList.toggle("sel", el.dataset.cid === id));
+        const conv = S.conversations.find((c) => c.id === id) || {};
+        const chat = document.getElementById("chat");
+        chat.innerHTML =
+          '<div id="chat-header">' +
+          '<div><div class="ch-name">' +
+          esc(name || phone || "Unknown") +
+          '</div><div class="ch-phone">' +
+          esc(phone) +
+          "</div></div>" +
+          '<div class="ch-actions">' +
+          statusBdg(conv.state || "open") +
+          '<button class="btn btn-secondary btn-sm" onclick="assignConv(\'' +
+          id +
+          "')\">👤 Assign</button>" +
+          "<select onchange=\"changeConvState('" +
+          id +
+          '\',this.value)" style="background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:7px;font-size:12px">' +
+          ["open", "pending", "closed"]
+            .map(
+              (s) =>
+                '<option value="' + s + '"' + (s === (conv.state || "open") ? " selected" : "") + ">" + s + "</option>"
+            )
+            .join("") +
+          "</select>" +
+          "</div>" +
+          "</div>" +
+          '<div id="msgs">' +
+          loading() +
+          "</div>" +
+          '<div id="input-row">' +
+          '<textarea id="msg-input" rows="1" placeholder="Type a reply… (Enter to send, Shift+Enter newline)" onkeydown="msgKey(event)"></textarea>' +
+          '<button class="btn btn-primary" onclick="sendMsg()" style="flex-shrink:0">Send</button>' +
+          "</div>";
+        await loadMessages(id);
+        const inp = document.getElementById("msg-input");
+        if (inp) inp.focus();
+      }
+
+      async function loadMessages(convId) {
+        const el = document.getElementById("msgs");
+        if (!el) return;
+        try {
+          const d = await GET("/conversations/" + convId + "/messages");
+          S.messages = d.items || [];
+          if (!S.messages.length) {
+            el.innerHTML = empty("💬", "No messages yet");
+            return;
+          }
+          el.innerHTML = S.messages
+            .map((m) => {
+              const text =
+                (m.payload && m.payload.text) ||
+                m.text ||
+                (m.payload && m.payload.media && m.payload.media.caption) ||
+                "[" + (m.kind || m.payload?.kind || "message") + "]";
+              const dir = m.direction === "outbound" ? "out" : "in";
+              return (
+                '<div class="msg ' +
+                dir +
+                '">' +
+                esc(text) +
+                '<div class="mt">' +
+                fmtTime(m.occurredAt || m.createdAt) +
+                "</div></div>"
+              );
+            })
+            .join("");
+          el.scrollTop = el.scrollHeight;
+        } catch (e) {
+          if (el) el.innerHTML = '<div class="alert alert-err">' + esc(e.message) + "</div>";
+        }
+      }
+
+      async function sendMsg() {
+        if (!S.activeConvId) return;
+        const inp = document.getElementById("msg-input");
+        const text = inp.value.trim();
+        if (!text) return;
+        inp.value = "";
+        inp.disabled = true;
+        try {
+          await POST("/conversations/" + S.activeConvId + "/messages", { kind: "text", text });
+          toast("Sent ✓", "ok");
+          await loadMessages(S.activeConvId);
+        } catch (e) {
+          toast(e.message, "err");
+          inp.value = text;
+        } finally {
+          inp.disabled = false;
+          inp.focus();
+        }
+      }
+
+      function msgKey(e) {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          sendMsg();
+        }
+      }
+
+      async function assignConv(convId) {
+        const d = await GET("/users").catch(() => ({ items: [] }));
+        const users = d.items || [];
+        showModal(
+          "Assign Conversation",
+          '<div class="field"><label>Assign to</label><select id="as-uid">' +
+            '<option value="">Unassigned</option>' +
+            users.map((u) => '<option value="' + u.id + '">' + esc(u.displayName || u.email) + "</option>").join("") +
+            "</select></div>",
+          null,
+          {
+            submit: "Assign",
+            onOk: async () => {
+              const uid = document.getElementById("as-uid").value || null;
+              await POST("/conversations/" + convId + "/assign", { userId: uid });
+              toast("Assigned", "ok");
+              loadConvList();
+            }
+          }
+        );
+      }
+
+      async function changeConvState(convId, state) {
+        try {
+          await POST("/conversations/" + convId + "/state", { state });
+          toast("State: " + state, "ok");
+          loadConvList();
+        } catch (e) {
+          toast(e.message, "err");
+        }
+      }
+
+      // Auto-reply rules
+      function showAutoRules() {
+        const load = async () => {
+          const d = await GET("/auto-reply-rules").catch(() => ({ items: [] }));
+          S.autoRules = d.items || [];
+          const body = document.getElementById("ar-body");
+          if (!body) return;
+          if (!S.autoRules.length) {
+            body.innerHTML = '<p style="color:var(--muted);font-size:12px">No rules yet. Create one below.</p>';
+            return;
+          }
+          body.innerHTML =
+            '<table class="tbl"><thead><tr><th>Match</th><th>Keyword</th><th>Reply</th><th>Status</th><th></th></tr></thead><tbody>' +
+            S.autoRules
+              .map(
+                (r) =>
+                  "<tr><td>" +
+                  bdg(r.matchType, "blue") +
+                  '</td><td style="font-family:monospace">' +
+                  esc(r.keyword || "—") +
+                  "</td>" +
+                  '<td style="max-width:180px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' +
+                  esc(r.replyText || "—") +
+                  "</td>" +
+                  '<td><label style="display:flex;align-items:center;gap:5px;cursor:pointer"><input type="checkbox"' +
+                  (r.enabled ? " checked" : "") +
+                  " onchange=\"toggleRule('" +
+                  r.id +
+                  "',this.checked)\" /> Enabled</label></td>" +
+                  "<td></td></tr>"
+              )
+              .join("") +
+            "</tbody></table>";
+        };
+        showModal(
+          "Auto-Reply Rules",
+          '<div id="ar-body">' +
+            loading() +
+            "</div>" +
+            '<hr style="border:none;border-top:1px solid var(--border);margin:14px 0">' +
+            '<h4 style="font-size:12px;color:var(--muted);margin-bottom:10px">ADD RULE</h4>' +
+            '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">' +
+            '<div class="field"><label>Match Type</label><select id="ar-mt"><option value="keyword">Exact keyword</option><option value="contains">Contains</option><option value="regex">Regex</option><option value="any">Any message</option></select></div>' +
+            '<div class="field"><label>Keyword</label><input id="ar-kw" placeholder="MENU, HELP, etc." /></div>' +
+            "</div>" +
+            '<div class="field"><label>Auto-reply text</label><textarea id="ar-rt" placeholder="Hi! Here are our options…" style="min-height:60px"></textarea></div>',
+          null,
+          {
+            submit: "Save Rule",
+            onOk: async () => {
+              const mt = document.getElementById("ar-mt").value;
+              const kw = document.getElementById("ar-kw").value.trim();
+              const rt = document.getElementById("ar-rt").value.trim();
+              if (!rt) {
+                toast("Reply text is required", "err");
+                return false;
+              }
+              await POST("/auto-reply-rules", {
+                matchType: mt,
+                keyword: kw || undefined,
+                replyKind: "text",
+                replyText: rt,
+                enabled: true,
+                priority: S.autoRules.length + 1
+              });
+              toast("Rule saved", "ok");
+              return false; // keep modal open to show updated list
+            }
+          }
+        );
+        setTimeout(load, 50);
+      }
+
+      async function toggleRule(ruleId, enabled) {
+        try {
+          await api("PATCH", "/auto-reply-rules/" + ruleId, { enabled });
+          toast(enabled ? "Rule enabled" : "Rule disabled", "ok");
+        } catch (e) {
+          toast(e.message, "err");
+        }
+      }
+
+      // ═══════════════════ CONTACTS ═══════════════════
+      function renderContacts() {
+        const el = document.getElementById("v-contacts");
+        el.innerHTML =
+          '<div class="pv">' +
+          '<div class="pv-head"><div><h2>Contacts</h2><div class="sub">Manage customers and consent</div></div>' +
+          '<div class="acts">' +
+          '<button class="btn btn-secondary btn-sm" onclick="showImportCsv()">📤 Import CSV</button>' +
+          '<button class="btn btn-primary btn-sm" onclick="showAddContact()">+ Add Contact</button>' +
+          "</div>" +
+          "</div>" +
+          '<div class="card"><div id="ct-wrap">' +
+          loading() +
+          "</div></div>" +
+          "</div>";
+        loadContacts();
+      }
+
+      async function loadContacts() {
+        const el = document.getElementById("ct-wrap");
+        if (!el) return;
+        try {
+          const d = await GET("/contacts");
+          S.contacts = d.items || [];
+          if (!S.contacts.length) {
+            el.innerHTML = empty("👥", "No contacts yet. Import a CSV or add manually.");
+            return;
+          }
+          el.innerHTML =
+            '<table class="tbl"><thead><tr><th>Name</th><th>Phone</th><th>Tags</th><th>Status</th><th>Actions</th></tr></thead><tbody>' +
+            S.contacts
+              .map(
+                (c) =>
+                  "<tr><td><b>" +
+                  esc(((c.firstName || "") + " " + (c.lastName || "")).trim() || "—") +
+                  "</b></td>" +
+                  '<td style="font-family:monospace">' +
+                  esc(c.phoneE164) +
+                  "</td>" +
+                  "<td>" +
+                  (c.tags && c.tags.length
+                    ? c.tags.map((t) => bdg(t, "blue")).join(" ")
+                    : '<span style="color:var(--muted)">—</span>') +
+                  "</td>" +
+                  "<td>" +
+                  (c.optedOut ? bdg("opted out", "red") : bdg("active", "green")) +
+                  "</td>" +
+                  '<td style="display:flex;gap:5px;flex-wrap:wrap;padding:6px 11px">' +
+                  '<button class="btn btn-secondary btn-sm" onclick="grantConsent(\'' +
+                  c.id +
+                  "')\">✓ Consent</button>" +
+                  (!c.optedOut
+                    ? '<button class="btn btn-danger btn-sm" onclick="doOptOut(\'' + c.id + "')\">Opt Out</button>"
+                    : "") +
+                  "</td></tr>"
+              )
+              .join("") +
+            "</tbody></table>";
+        } catch (e) {
+          if (el) el.innerHTML = '<div class="alert alert-err">' + esc(e.message) + "</div>";
+        }
+      }
+
+      function showImportCsv() {
+        let csvResult = null;
+        showModal(
+          "Import Contacts from CSV",
+          '<div class="alert alert-info" style="margin-bottom:12px">Required column: <code>phone_e164</code>. Optional: <code>first_name, last_name, country, timezone, tags</code> (pipe-separated), <code>consent</code> (true/false).</div>' +
+            '<div class="drop-zone" id="csv-dz" onclick="document.getElementById(\'csv-fi\').click()" ondragover="event.preventDefault();this.classList.add(\'drag\')" ondragleave="this.classList.remove(\'drag\')" ondrop="handleCsvDrop(event)">' +
+            '<input type="file" id="csv-fi" accept=".csv,text/csv" onchange="handleCsvFile(this.files[0])">' +
+            '<div id="csv-dz-label">Drag CSV here or click to browse</div>' +
+            "</div>" +
+            '<div id="csv-preview" style="margin-top:12px"></div>',
+          null,
+          {
+            submit: "Import",
+            onOk: async () => {
+              const fi = document.getElementById("csv-fi");
+              if (!fi.files.length && !csvResult) {
+                toast("Select a CSV file first", "err");
+                return false;
+              }
+              if (fi.files.length) {
+                const form = new FormData();
+                form.append("file", fi.files[0]);
+                const r = await apiUpload("/contacts/import", form);
+                csvResult = r;
+              }
+              if (csvResult) {
+                toast("Imported: +" + csvResult.created + " new, " + csvResult.updated + " updated", "ok");
+                loadContacts();
+              }
+            }
+          }
+        );
+      }
+
+      function handleCsvFile(file) {
+        if (!file) return;
+        const label = document.getElementById("csv-dz-label");
+        if (label)
+          label.textContent = "📄 " + file.name + " (" + Math.round(file.size / 1024) + "KB) — ready to import";
+        document.getElementById("csv-dz").classList.remove("drag");
+      }
+
+      function handleCsvDrop(e) {
+        e.preventDefault();
+        document.getElementById("csv-dz").classList.remove("drag");
+        const file = e.dataTransfer.files[0];
+        if (file) {
+          document.getElementById("csv-fi").files;
+          handleCsvFile(file);
+          const dt = new DataTransfer();
+          dt.items.add(file);
+          document.getElementById("csv-fi").files = dt.files;
+        }
+      }
+
+      function showAddContact() {
+        showModal(
+          "Add Contact",
+          '<div class="field"><label>Phone Number (E.164)</label><input id="ac-ph" placeholder="+15551234567" /></div>' +
+            '<div class="field"><label>First Name</label><input id="ac-fn" placeholder="John" /></div>' +
+            '<div class="field"><label>Last Name</label><input id="ac-ln" placeholder="Smith" /></div>' +
+            '<div class="field"><label>Timezone (e.g. America/New_York)</label><input id="ac-tz" placeholder="UTC" /></div>' +
+            '<div class="field"><label style="display:flex;align-items:center;gap:8px;cursor:pointer;text-transform:none;font-size:13px"><input type="checkbox" id="ac-cs" checked /> Grant consent immediately</label></div>',
+          null,
+          {
+            submit: "Add Contact",
+            onOk: async () => {
+              const ph = document.getElementById("ac-ph").value.trim();
+              const fn = document.getElementById("ac-fn").value.trim();
+              const ln = document.getElementById("ac-ln").value.trim();
+              const tz = document.getElementById("ac-tz").value.trim();
+              const cs = document.getElementById("ac-cs").checked;
+              if (!ph) {
+                toast("Phone number is required", "err");
+                return false;
+              }
+              const ct = await POST("/contacts", {
+                phoneE164: ph,
+                firstName: fn || undefined,
+                lastName: ln || undefined,
+                timezone: tz || undefined
+              });
+              if (cs) await POST("/contacts/" + ct.id + "/consent", { source: "manual", policyVersion: "v1" });
+              toast("Contact added", "ok");
+              loadContacts();
+            }
+          }
+        );
+        setTimeout(() => {
+          const el = document.getElementById("ac-ph");
+          if (el) el.focus();
+        }, 50);
+      }
+
+      async function grantConsent(id) {
+        try {
+          await POST("/contacts/" + id + "/consent", { source: "manual", policyVersion: "v1" });
+          toast("Consent granted", "ok");
+          loadContacts();
+        } catch (e) {
+          toast(e.message, "err");
+        }
+      }
+
+      async function doOptOut(id) {
+        if (!confirm("Opt this contact out?")) return;
+        try {
+          await POST("/contacts/" + id + "/opt-out", { reason: "manual_opt_out" });
+          toast("Opted out", "ok");
+          loadContacts();
+        } catch (e) {
+          toast(e.message, "err");
+        }
+      }
+
+      // ═══════════════════ SEGMENTS ═══════════════════
+      function renderSegments() {
+        const el = document.getElementById("v-segments");
+        el.innerHTML =
+          '<div class="pv">' +
+          '<div class="pv-head"><div><h2>Segments</h2><div class="sub">Define audience groups to target in campaigns</div></div>' +
+          '<button class="btn btn-primary btn-sm" onclick="showCreateSegment()">+ Create Segment</button>' +
+          "</div>" +
+          '<div class="card"><div id="seg-wrap">' +
+          loading() +
+          "</div></div>" +
+          "</div>";
+        loadSegments();
+      }
+
+      async function loadSegments() {
+        const el = document.getElementById("seg-wrap");
+        if (!el) return;
+        try {
+          const d = await GET("/segments");
+          S.segments = d.items || [];
+          if (!S.segments.length) {
+            el.innerHTML = empty("🎯", "No segments yet. Create one to use as a campaign audience.");
+            return;
+          }
+          el.innerHTML =
+            '<table class="tbl"><thead><tr><th>Name</th><th>Filters</th><th>Created</th><th>Actions</th></tr></thead><tbody>' +
+            S.segments
+              .map((s) => {
+                const def = s.definition || {};
+                const filters = [];
+                if (def.tags && def.tags.length) filters.push("Tags: " + def.tags.join(", "));
+                if (def.country) filters.push("Country: " + def.country);
+                if (def.optedInOnly) filters.push("Opted-in only");
+                if (def.hasConsent) filters.push("Has consent");
+                return (
+                  "<tr><td><b>" +
+                  esc(s.name) +
+                  "</b></td>" +
+                  '<td style="color:var(--muted);font-size:12px">' +
+                  (filters.length ? filters.join(" · ") : "All contacts") +
+                  "</td>" +
+                  "<td>" +
+                  fmtTime(s.createdAt) +
+                  "</td>" +
+                  '<td><button class="btn btn-secondary btn-sm" onclick="previewSegment(\'' +
+                  s.id +
+                  "','" +
+                  esc(s.name) +
+                  "')\">Preview</button></td>" +
+                  "</tr>"
+                );
+              })
+              .join("") +
+            "</tbody></table>";
+        } catch (e) {
+          if (el) el.innerHTML = '<div class="alert alert-err">' + esc(e.message) + "</div>";
+        }
+      }
+
+      function showCreateSegment() {
+        showModal(
+          "Create Segment",
+          '<div class="field"><label>Segment Name</label><input id="sg-nm" placeholder="High-value customers" /></div>' +
+            '<div class="field"><label>Tags (comma-separated, contacts must have ALL)</label><input id="sg-tg" placeholder="vip, active" /></div>' +
+            '<div class="field"><label>Country Code</label><input id="sg-co" placeholder="US" /></div>' +
+            '<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px">' +
+            '<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px"><input type="checkbox" id="sg-oi" /> Opted-in only (no opt-out contacts)</label>' +
+            '<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px"><input type="checkbox" id="sg-hc" checked /> Has active consent</label>' +
+            "</div>" +
+            '<div id="sg-preview" style="color:var(--muted);font-size:12px"></div>',
+          null,
+          {
+            submit: "Create Segment",
+            onOk: async () => {
+              const nm = document.getElementById("sg-nm").value.trim();
+              if (!nm) {
+                toast("Name is required", "err");
+                return false;
+              }
+              const tagsRaw = document.getElementById("sg-tg").value.trim();
+              const country = document.getElementById("sg-co").value.trim();
+              const optedInOnly = document.getElementById("sg-oi").checked;
+              const hasConsent = document.getElementById("sg-hc").checked;
+              const definition = {};
+              if (tagsRaw)
+                definition.tags = tagsRaw
+                  .split(",")
+                  .map((t) => t.trim())
+                  .filter(Boolean);
+              if (country) definition.country = country.toUpperCase();
+              if (optedInOnly) definition.optedInOnly = true;
+              if (hasConsent) definition.hasConsent = true;
+              await POST("/segments", { name: nm, definition });
+              toast("Segment created", "ok");
+              loadSegments();
+            }
+          }
+        );
+        setTimeout(() => document.getElementById("sg-nm")?.focus(), 50);
+      }
+
+      async function previewSegment(segId, segName) {
+        const el = document.getElementById("v-segments");
+        showModal("Preview: " + segName, '<div id="sp-body">' + loading() + "</div>", null, { noAct: true });
+        try {
+          const d = await GET("/segments/" + segId + "/preview");
+          document.getElementById("sp-body").innerHTML =
+            '<div class="alert alert-ok">' +
+            d.count +
+            " contact(s) match this segment.</div>" +
+            (d.sample && d.sample.length
+              ? '<table class="tbl"><thead><tr><th>Name</th><th>Phone</th></tr></thead><tbody>' +
+                d.sample
+                  .map(
+                    (c) =>
+                      "<tr><td>" +
+                      esc(((c.firstName || "") + " " + (c.lastName || "")).trim() || "—") +
+                      '</td><td style="font-family:monospace">' +
+                      esc(c.phoneE164) +
+                      "</td></tr>"
+                  )
+                  .join("") +
+                "</tbody></table>"
+              : "") +
+            '<div class="mact"><button class="btn btn-secondary" onclick="closeModal()">Close</button></div>';
+        } catch (e) {
+          const b = document.getElementById("sp-body");
+          if (b) b.innerHTML = '<div class="alert alert-err">' + esc(e.message) + "</div>";
+        }
+      }
+
+      // ═══════════════════ CAMPAIGNS ═══════════════════
+      function renderCampaigns() {
+        const el = document.getElementById("v-campaigns");
+        el.innerHTML =
+          '<div class="pv">' +
+          '<div class="pv-head"><div><h2>Campaigns</h2><div class="sub">Broadcast template messages to your audiences</div></div>' +
+          '<div class="acts">' +
+          (S.channelId
+            ? '<button class="btn btn-secondary btn-sm" onclick="syncTemplates()">↻ Sync Templates</button>'
+            : "") +
+          '<button class="btn btn-primary btn-sm" onclick="showCreateCampaign()">+ New Campaign</button>' +
+          "</div>" +
+          "</div>" +
+          '<div class="card">' +
+          '<div class="card-head"><h3>Message Templates</h3>' +
+          '<button class="btn btn-secondary btn-sm" onclick="showCreateTemplate()">+ Create</button>' +
+          "</div>" +
+          '<div id="tpl-wrap">' +
+          loading() +
+          "</div>" +
+          "</div>" +
+          '<div class="card">' +
+          '<div class="card-head"><h3>Campaigns</h3></div>' +
+          '<div id="camp-wrap">' +
+          loading() +
+          "</div>" +
+          "</div>" +
+          "</div>";
+        loadTemplates();
+        loadCampaigns();
+      }
+
+      async function loadTemplates() {
+        const el = document.getElementById("tpl-wrap");
+        if (!el) return;
+        try {
+          const d = await GET("/templates");
+          S.templates = d.items || [];
+          if (!S.templates.length) {
+            el.innerHTML = empty("📄", "No templates. Sync from Meta or create one.");
+            return;
+          }
+          el.innerHTML =
+            '<table class="tbl"><thead><tr><th>Name</th><th>Category</th><th>Lang</th><th>Status</th><th>Preview</th></tr></thead><tbody>' +
+            S.templates
+              .map(
+                (t) =>
+                  "<tr><td><b>" +
+                  esc(t.name) +
+                  "</b></td><td>" +
+                  bdg(t.category, "blue") +
+                  "</td><td>" +
+                  esc(t.language) +
+                  "</td><td>" +
+                  statusBdg(t.status) +
+                  '</td><td style="color:var(--muted);max-width:200px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' +
+                  esc(t.body || "") +
+                  "</td></tr>"
+              )
+              .join("") +
+            "</tbody></table>";
+        } catch (e) {
+          if (el) el.innerHTML = '<div class="alert alert-err">' + esc(e.message) + "</div>";
+        }
+      }
+
+      async function loadCampaigns() {
+        const el = document.getElementById("camp-wrap");
+        if (!el) return;
+        try {
+          const d = await GET("/campaigns");
+          S.campaigns = d.items || [];
+          if (!S.campaigns.length) {
+            el.innerHTML = empty("📢", "No campaigns yet. Create one.");
+            return;
+          }
+          el.innerHTML =
+            '<table class="tbl"><thead><tr><th>Name</th><th>Template</th><th>Audience</th><th>Status</th><th>Actions</th></tr></thead><tbody>' +
+            S.campaigns
+              .map(
+                (c) =>
+                  "<tr><td><b>" +
+                  esc(c.name) +
+                  "</b></td>" +
+                  '<td style="font-family:monospace;font-size:11px">' +
+                  esc(c.templateName || c.templateId || "") +
+                  "</td>" +
+                  '<td style="font-size:11px;color:var(--muted)">' +
+                  (c.segmentId ? "Segment" : "Manual") +
+                  "</td>" +
+                  "<td>" +
+                  statusBdg(c.status) +
+                  "</td>" +
+                  '<td style="display:flex;gap:5px;flex-wrap:wrap;padding:6px 11px">' +
+                  (c.status === "draft" || c.status === "paused"
+                    ? '<button class="btn btn-primary btn-sm" onclick="runCampaign(\'' +
+                      c.id +
+                      "','" +
+                      esc(c.name) +
+                      "')\">🚀 Run</button>"
+                    : "") +
+                  '<button class="btn btn-secondary btn-sm" onclick="showDispatch(\'' +
+                  c.id +
+                  "','" +
+                  esc(c.name) +
+                  "')\">Test Send</button>" +
+                  '<button class="btn btn-secondary btn-sm" onclick="showCampaignReport(\'' +
+                  c.id +
+                  "','" +
+                  esc(c.name) +
+                  "')\">📊 Report</button>" +
+                  "</td></tr>"
+              )
+              .join("") +
+            "</tbody></table>";
+        } catch (e) {
+          if (el) el.innerHTML = '<div class="alert alert-err">' + esc(e.message) + "</div>";
+        }
+      }
+
+      async function syncTemplates() {
+        if (!S.channelId) {
+          toast("No channel configured", "err");
+          return;
+        }
+        toast("Syncing…");
+        try {
+          const r = await POST("/channels/whatsapp/" + S.channelId + "/sync-templates", {});
+          toast("Synced " + (r.synced || 0) + " template(s)", "ok");
+          loadTemplates();
+        } catch (e) {
+          toast(e.message, "err");
+        }
+      }
+
+      function showCreateTemplate() {
+        showModal(
+          "Create Template",
+          '<div class="alert alert-info" style="margin-bottom:14px">Templates need Meta approval. To use already-approved templates, use <b>Sync from Meta</b>.</div>' +
+            '<div class="field"><label>Template Name (lowercase, underscores)</label><input id="ct-nm" placeholder="welcome_offer" /></div>' +
+            '<div class="field"><label>Category</label><select id="ct-ca"><option value="marketing">Marketing</option><option value="utility">Utility</option><option value="authentication">Authentication</option><option value="service">Service</option></select></div>' +
+            '<div class="field"><label>Language</label><input id="ct-la" value="en" /></div>' +
+            '<div class="field"><label>Body (use {{1}}, {{2}} for parameters)</label><textarea id="ct-bd" placeholder="Hi {{1}}, here is your 20% offer!"></textarea></div>',
+          null,
+          {
+            submit: "Create Template",
+            onOk: async () => {
+              const nm = document.getElementById("ct-nm").value.trim();
+              const ca = document.getElementById("ct-ca").value;
+              const la = document.getElementById("ct-la").value.trim() || "en";
+              const bd = document.getElementById("ct-bd").value.trim();
+              if (!nm || !bd) {
+                toast("Name and body are required", "err");
+                return false;
+              }
+              await POST("/templates", { name: nm, category: ca, language: la, body: bd });
+              toast("Template created (pending Meta approval)", "ok");
+              loadTemplates();
+            }
+          }
+        );
+      }
+
+      function showCreateCampaign() {
+        // Load segments async, then re-render modal options.
+        const approvedTpl = S.templates.filter((t) => t.category === "marketing" && t.status === "approved");
+        const segOpts = S.segments.map((s) => '<option value="' + s.id + '">' + esc(s.name) + "</option>").join("");
+
+        // Count {{N}} params in template body.
+        let varCount = 0;
+        function updateVarMap() {
+          const tplId = document.getElementById("cc-tpl")?.value;
+          const tpl = S.templates.find((t) => t.id === tplId);
+          const body = tpl?.body || "";
+          const matches = [...body.matchAll(/\{\{(\d+)\}\}/g)];
+          const indices = [...new Set(matches.map((m) => parseInt(m[1])))].sort((a, b) => a - b);
+          varCount = indices.length;
+          const container = document.getElementById("cc-vars");
+          if (!container) return;
+          if (!indices.length) {
+            container.innerHTML =
+              '<p style="color:var(--muted);font-size:12px">This template has no {{N}} parameters.</p>';
+            return;
+          }
+          container.innerHTML =
+            '<div style="font-size:11px;color:var(--muted);margin-bottom:8px">MAP TEMPLATE VARIABLES</div>' +
+            '<div class="var-row"><label>Param</label><label>Contact Field</label><label>Or Fixed Value</label></div>' +
+            indices
+              .map(
+                (i) =>
+                  '<div class="var-row"><label>{{' +
+                  i +
+                  "}}</label>" +
+                  '<select id="vm-field-' +
+                  i +
+                  '" onchange="document.getElementById(\'vm-lit-' +
+                  i +
+                  "').disabled=this.value!=='__lit'\">" +
+                  '<option value="firstName">First Name</option>' +
+                  '<option value="lastName">Last Name</option>' +
+                  '<option value="phoneE164">Phone</option>' +
+                  '<option value="country">Country</option>' +
+                  '<option value="__lit">Fixed value →</option>' +
+                  "</select>" +
+                  '<input id="vm-lit-' +
+                  i +
+                  '" placeholder="Fixed text" disabled />' +
+                  "</div>"
+              )
+              .join("");
+        }
+
+        showModal(
+          "Create Campaign",
+          (approvedTpl.length === 0
+            ? '<div class="alert alert-info">No approved marketing templates. Sync from Meta first.</div>'
+            : "") +
+            '<div class="field"><label>Campaign Name</label><input id="cc-nm" placeholder="Summer Sale 2025" /></div>' +
+            '<div class="field"><label>Template</label><select id="cc-tpl" onchange="updateVarMap()">' +
+            (!approvedTpl.length ? '<option value="">— no approved templates —</option>' : "") +
+            approvedTpl
+              .map((t) => '<option value="' + t.id + '">' + esc(t.name) + " (" + esc(t.language) + ")</option>")
+              .join("") +
+            "</select></div>" +
+            '<div id="cc-vars" style="margin-bottom:14px"></div>' +
+            '<div class="field"><label>Audience Segment</label><select id="cc-seg">' +
+            '<option value="">— pick a segment —</option>' +
+            segOpts +
+            "</select></div>" +
+            '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">' +
+            '<div class="field"><label>Send rate (msgs/min)</label><input id="cc-rp" type="number" min="1" max="1000" placeholder="60" /></div>' +
+            '<div class="field"><label>Schedule at (optional)</label><input id="cc-sc" type="datetime-local" /></div>' +
+            "</div>" +
+            '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">' +
+            '<div class="field"><label>Quiet hours start (local hr)</label><input id="cc-qs" type="number" min="0" max="23" placeholder="21" /></div>' +
+            '<div class="field"><label>Quiet hours end (local hr)</label><input id="cc-qe" type="number" min="0" max="23" placeholder="8" /></div>' +
+            "</div>",
+          null,
+          {
+            submit: "Create Campaign",
+            onOk: async () => {
+              const nm = document.getElementById("cc-nm").value.trim();
+              const tplId = document.getElementById("cc-tpl").value;
+              const segId = document.getElementById("cc-seg").value;
+              const rp = parseInt(document.getElementById("cc-rp").value) || undefined;
+              const scRaw = document.getElementById("cc-sc").value;
+              const scheduledAt = scRaw ? new Date(scRaw).toISOString() : undefined;
+              const qs = parseInt(document.getElementById("cc-qs").value);
+              const qe = parseInt(document.getElementById("cc-qe").value);
+              if (!nm) {
+                toast("Campaign name is required", "err");
+                return false;
+              }
+              if (!tplId) {
+                toast("Select a template", "err");
+                return false;
+              }
+              // Build variable mapping from UI
+              const variableMapping = {};
+              const tpl = S.templates.find((t) => t.id === tplId);
+              const body = tpl?.body || "";
+              const matches = [...body.matchAll(/\{\{(\d+)\}\}/g)];
+              const indices = [...new Set(matches.map((m) => parseInt(m[1])))].sort((a, b) => a - b);
+              for (const i of indices) {
+                const fieldEl = document.getElementById("vm-field-" + i);
+                const litEl = document.getElementById("vm-lit-" + i);
+                if (!fieldEl) continue;
+                const fv = fieldEl.value;
+                if (fv === "__lit") {
+                  const lit = litEl?.value || "";
+                  variableMapping[String(i)] = { literal: lit };
+                } else {
+                  variableMapping[String(i)] = fv;
+                }
+              }
+              const payload = { name: nm, templateId: tplId };
+              if (segId) payload.segmentId = segId;
+              if (scheduledAt) payload.scheduledAt = scheduledAt;
+              if (rp) payload.ratePerMinute = rp;
+              if (Object.keys(variableMapping).length) payload.variableMapping = variableMapping;
+              if (!isNaN(qs) && !isNaN(qe)) payload.quietHours = { startHour: qs, endHour: qe };
+              await POST("/campaigns", payload);
+              toast("Campaign created", "ok");
+              loadCampaigns();
+            }
+          }
+        );
+        setTimeout(() => {
+          document.getElementById("cc-nm")?.focus();
+          updateVarMap();
+        }, 50);
+      }
+
+      async function runCampaign(campId, campName) {
+        if (
+          !confirm(
+            'Launch campaign "' +
+              campName +
+              '" to all segment contacts? This will start sending immediately (or at scheduled time).'
+          )
+        )
+          return;
+        try {
+          const r = await POST("/campaigns/" + campId + "/run", {});
+          toast("Campaign launched! " + (r.recipientCount || 0) + " recipients queued.", "ok");
+          loadCampaigns();
+        } catch (e) {
+          toast(e.message, "err");
+        }
+      }
+
+      // Test-send (single phone, no policy fields sent — server computes all).
+      function showDispatch(campId, campName) {
+        showModal(
+          "Test Send: " + campName,
+          '<div class="info-box" style="margin-bottom:14px"><b>📋 Test send</b>For a test to a single phone number. Policy (consent, opt-out, quiet hours) is enforced server-side.</div>' +
+            '<div class="field"><label>Customer Phone (E.164)</label><input id="dd-ph" placeholder="+15551234567" /></div>' +
+            '<div class="field"><label>Template Variables (comma-separated, in order)</label><input id="dd-pr" placeholder="John, 20% off, Dec 31" /></div>',
+          null,
+          {
+            submit: "📤 Send Test",
+            onOk: async () => {
+              const ph = document.getElementById("dd-ph").value.trim();
+              const pr = document.getElementById("dd-pr").value.trim();
+              if (!ph) {
+                toast("Phone number is required", "err");
+                return false;
+              }
+              const params = pr
+                ? pr
+                    .split(",")
+                    .map((p) => p.trim())
+                    .filter(Boolean)
+                : [];
+              await POST("/campaigns/" + campId + "/dispatch", { contactPhoneE164: ph, parameters: params });
+              toast("Test send queued ✓", "ok");
+            }
+          }
+        );
+        setTimeout(() => document.getElementById("dd-ph")?.focus(), 50);
+      }
+
+      async function showCampaignReport(campId, campName) {
+        showModal("Report: " + campName, '<div id="rpt-body">' + loading() + "</div>", null, { noAct: true });
+        try {
+          const d = await GET("/campaigns/" + campId + "/report");
+          const f = d.funnel || {};
+          const total = f.total || 0;
+          const funnelBars = [
+            { label: "Pending", n: f.pending || 0, color: "var(--muted)" },
+            { label: "Sent", n: f.sent || 0, color: "var(--accent)" },
+            { label: "Delivered", n: f.delivered || 0, color: "var(--brand)" },
+            { label: "Read", n: f.read || 0, color: "#25d366" },
+            { label: "Failed", n: f.failed || 0, color: "var(--danger)" },
+            { label: "Skipped", n: f.policy_skipped || 0, color: "var(--warn)" }
+          ];
+          const recipients = (d.recipients || []).slice(0, 100);
+          document.getElementById("rpt-body").innerHTML =
+            '<div class="funnel" style="margin-bottom:18px">' +
+            funnelBars
+              .map(
+                (fb) =>
+                  '<div class="funnel-bar"><div class="fb-n" style="color:' +
+                  fb.color +
+                  '">' +
+                  fb.n +
+                  '</div><div class="fb-l">' +
+                  fb.label +
+                  "</div></div>"
+              )
+              .join("") +
+            "</div>" +
+            (total
+              ? '<div style="font-size:11px;color:var(--muted);margin-bottom:12px">Total: ' + total + "</div>"
+              : "") +
+            (recipients.length
+              ? '<table class="tbl" style="font-size:11px"><thead><tr><th>Phone</th><th>Status</th><th>Sent</th><th>Error</th></tr></thead><tbody>' +
+                recipients
+                  .map(
+                    (r) =>
+                      '<tr><td style="font-family:monospace">' +
+                      esc(r.phoneE164) +
+                      "</td><td>" +
+                      statusBdg(r.status) +
+                      "</td><td>" +
+                      fmtTime(r.sentAt) +
+                      '</td><td style="color:var(--muted)">' +
+                      esc(r.error || r.skipReason || "") +
+                      "</td></tr>"
+                  )
+                  .join("") +
+                "</tbody></table>"
+              : "") +
+            '<div class="mact"><button class="btn btn-secondary" onclick="closeModal()">Close</button></div>';
+        } catch (e) {
+          const b = document.getElementById("rpt-body");
+          if (b) b.innerHTML = '<div class="alert alert-err">' + esc(e.message) + "</div>";
+        }
+      }
+
+      // ═══════════════════ ANALYTICS ═══════════════════
+      async function renderAnalytics() {
+        const el = document.getElementById("v-analytics");
+        el.innerHTML =
+          '<div class="pv"><div class="pv-head"><div><h2>Analytics</h2><div class="sub">Activity overview</div></div></div><div id="an-body">' +
+          loading() +
+          "</div></div>";
+        try {
+          const d = await GET("/analytics");
+          const t = d.totals || {};
+          document.getElementById("an-body").innerHTML =
+            '<div class="kpis">' +
+            ["contacts", "templates", "campaigns", "conversations"]
+              .map(
+                (k) =>
+                  '<div class="kpi"><b>' +
+                  (t[k] || 0) +
+                  "</b><span>" +
+                  k.charAt(0).toUpperCase() +
+                  k.slice(1) +
+                  "</span></div>"
+              )
+              .join("") +
+            "</div>" +
+            '<div class="card"><div class="card-head"><h3>Audit Log</h3></div><div id="au-body">' +
+            loading() +
+            "</div></div>";
+          try {
+            const a = await GET("/audit");
+            const items = (a.items || []).slice(0, 60);
+            if (!items.length) {
+              document.getElementById("au-body").innerHTML = empty("📋", "No audit events yet");
+              return;
+            }
+            document.getElementById("au-body").innerHTML =
+              '<table class="tbl"><thead><tr><th>Time</th><th>Action</th><th>Resource</th><th>Actor</th></tr></thead><tbody>' +
+              items
+                .map(
+                  (a) =>
+                    '<tr><td style="white-space:nowrap">' +
+                    fmtTime(a.occurredAt || a.createdAt) +
+                    "</td>" +
+                    '<td style="font-family:monospace">' +
+                    esc(a.action) +
+                    "</td>" +
+                    "<td>" +
+                    esc(a.resourceType || "") +
+                    (a.resourceId
+                      ? ' <span style="color:var(--muted);font-size:10px">' + esc(a.resourceId.slice(0, 8)) + "…</span>"
+                      : "") +
+                    "</td>" +
+                    '<td style="color:var(--muted)">' +
+                    esc(a.actorId || "system") +
+                    "</td></tr>"
+                )
+                .join("") +
+              "</tbody></table>";
+          } catch (e) {
+            document.getElementById("au-body").innerHTML = '<div class="alert alert-err">' + esc(e.message) + "</div>";
+          }
+        } catch (e) {
+          document.getElementById("an-body").innerHTML = '<div class="alert alert-err">' + esc(e.message) + "</div>";
+        }
+      }
+
+      // ═══════════════════ SETTINGS ═══════════════════
+      async function renderSettings() {
+        const el = document.getElementById("v-settings");
+        el.innerHTML =
+          '<div class="pv">' +
+          '<div class="pv-head"><div><h2>Settings</h2><div class="sub">Workspace and WhatsApp channel configuration</div></div></div>' +
+          '<div class="card"><div class="card-head"><h3>Workspace</h3></div>' +
+          '<table class="tbl"><tbody>' +
+          '<tr><td style="color:var(--muted);width:160px">Company</td><td>' +
+          esc(S.tenantName) +
+          "</td></tr>" +
+          '<tr><td style="color:var(--muted)">Tenant ID</td><td><code>' +
+          esc(S.tenantId) +
+          "</code></td></tr>" +
+          '<tr><td style="color:var(--muted)">Role</td><td>' +
+          bdg(S.role, "blue") +
+          "</td></tr>" +
+          "</tbody></table>" +
+          "</div>" +
+          '<div class="card"><div class="card-head"><h3>WhatsApp Channel</h3>' +
+          '<button class="btn btn-secondary btn-sm" onclick="showUpdateChannel()">Update Credentials</button></div>' +
+          '<div id="ch-info">' +
+          loading() +
+          "</div>" +
+          "</div>" +
+          '<div class="card"><div class="card-head"><h3>Meta Webhook Setup</h3></div>' +
+          '<div class="info-box">' +
+          "<b>Configure in Meta Business Manager → WhatsApp → Configuration</b>" +
+          '<p style="margin-top:8px"><b>Callback URL:</b></p>' +
+          '<code style="display:block;margin:5px 0;padding:8px 12px;background:var(--bg);border-radius:6px;font-size:12px">https://your-domain.com/api/v1/webhooks/meta/whatsapp</code>' +
+          '<p style="margin-top:8px">Subscribe to webhook fields: <b>messages</b></p>' +
+          '<p style="margin-top:6px">Verify Token: set <code>WEBHOOK_VERIFY_TOKEN</code> in your server .env</p>' +
+          "</div>" +
+          "</div>" +
+          '<div style="display:flex;gap:10px;flex-wrap:wrap">' +
+          '<button class="btn btn-secondary" onclick="showUpdateChannel()">⚙️ Update WhatsApp Credentials</button>' +
+          '<button class="btn btn-danger" onclick="logout()">🚪 Clear Workspace</button>' +
+          "</div>" +
+          "</div>";
+
+        try {
+          const d = await GET("/channels/whatsapp");
+          const ch = (d.items || [])[0];
+          if (!ch) {
+            document.getElementById("ch-info").innerHTML = empty("📡", "No channel configured");
+            return;
+          }
+          document.getElementById("ch-info").innerHTML =
+            '<table class="tbl"><tbody>' +
+            '<tr><td style="color:var(--muted);width:160px">Channel ID</td><td><code>' +
+            esc(ch.id) +
+            "</code></td></tr>" +
+            '<tr><td style="color:var(--muted)">WABA ID</td><td><code>' +
+            esc(ch.wabaId) +
+            "</code></td></tr>" +
+            '<tr><td style="color:var(--muted)">Phone Number ID</td><td><code>' +
+            esc(ch.phoneNumberId) +
+            "</code></td></tr>" +
+            '<tr><td style="color:var(--muted)">Display Phone</td><td>' +
+            esc(ch.displayPhoneNumber) +
+            "</td></tr>" +
+            '<tr><td style="color:var(--muted)">Status</td><td>' +
+            statusBdg(ch.status) +
+            "</td></tr>" +
+            '<tr><td style="color:var(--muted)">Access Token</td><td>' +
+            (ch.hasAccessToken ? bdg("stored", "green") : bdg("not set", "red")) +
+            "</td></tr>" +
+            "</tbody></table>";
+        } catch (e) {
+          document.getElementById("ch-info").innerHTML = '<div class="alert alert-err">' + esc(e.message) + "</div>";
+        }
+      }
+
+      function showUpdateChannel() {
+        showModal(
+          "Update WhatsApp Credentials",
+          '<div class="field"><label>WABA ID</label><input id="uc-wa" placeholder="1234567890123456" /></div>' +
+            '<div class="field"><label>Phone Number ID</label><input id="uc-pn" placeholder="1234567890123456" /></div>' +
+            '<div class="field"><label>Display Phone Number</label><input id="uc-dp" placeholder="+15551234567" /></div>' +
+            '<div class="field"><label>Access Token (leave blank to keep existing)</label><input id="uc-tk" type="password" placeholder="EAAx…" /></div>',
+          null,
+          {
+            submit: "Save",
+            onOk: async () => {
+              const wa = document.getElementById("uc-wa").value.trim();
+              const pn = document.getElementById("uc-pn").value.trim();
+              const dp = document.getElementById("uc-dp").value.trim();
+              const tk = document.getElementById("uc-tk").value.trim();
+              if (!wa || !pn || !dp) {
+                toast("All fields required", "err");
+                return false;
+              }
+              const body = { wabaId: wa, phoneNumberId: pn, displayPhoneNumber: dp };
+              if (tk) body.accessToken = tk;
+              const ch = await api("POST", "/channels/whatsapp", body, undefined, "tenant_admin");
+              S.channelId = ch.id;
+              S.channelPhone = dp;
+              localStorage.setItem("hf_chid", ch.id);
+              localStorage.setItem("hf_chphone", dp);
+              toast("Channel updated", "ok");
+              renderSettings();
+            }
+          }
+        );
+        setTimeout(() => document.getElementById("uc-wa")?.focus(), 50);
+      }
+
+      // ═══════════════════ MODAL ═══════════════════
+      function showModal(title, body, rawBody, opts) {
+        closeModal();
+        opts = opts || {};
+        const ov = document.createElement("div");
+        ov.className = "overlay";
+        ov.id = "modal-ov";
+        ov.innerHTML =
+          '<div class="modal"><h3>' +
+          esc(title) +
+          '</h3><div id="modal-body">' +
+          (rawBody || body || "") +
+          "</div>" +
+          (!opts.noAct
+            ? '<div class="mact"><button class="btn btn-secondary" onclick="closeModal()">Cancel</button>' +
+              (opts.submit ? '<button class="btn btn-primary" id="modal-ok">' + esc(opts.submit) + "</button>" : "") +
+              "</div>"
+            : "") +
+          "</div>";
+        ov.addEventListener("click", (e) => {
+          if (e.target === ov) closeModal();
+        });
+        document.body.appendChild(ov);
+        if (opts.onOk) {
+          const okBtn = document.getElementById("modal-ok");
+          if (okBtn) {
+            okBtn.addEventListener("click", async () => {
+              okBtn.disabled = true;
+              try {
+                const result = await opts.onOk();
+                if (result !== false) closeModal();
+              } catch (e) {
+                toast(e.message, "err");
+              } finally {
+                if (okBtn.isConnected) okBtn.disabled = false;
+              }
+            });
+          }
+        }
+      }
+
+      function closeModal() {
+        const m = document.getElementById("modal-ov");
+        if (m) m.remove();
+      }
+
+      // ═══════════════════ BOOT ═══════════════════
+      if (S.tenantId) {
+        initApp();
+      } else {
+        renderSetup();
+      }
+    </script>
+  </body>
+</html>

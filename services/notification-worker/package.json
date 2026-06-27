@@ -16,6 +16,8 @@
     "@hyfib/config": "workspace:*",
     "@hyfib/event-bus": "workspace:*",
     "@hyfib/persistence": "workspace:*",
+    "@hyfib/policy-engine": "workspace:*",
+    "@hyfib/ratelimit": "workspace:*",
     "@hyfib/shared-core": "workspace:*"
   }
 }

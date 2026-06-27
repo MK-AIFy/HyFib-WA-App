@@ -18,6 +18,53 @@ export interface OutboundAdapterCall {
  * so each kind's wiring can be unit-tested.
  */
 export function buildOutboundAdapterCall(command: WhatsAppOutboundRequest, channel: SendChannel): OutboundAdapterCall {
+  if (command.kind === "product" && command.product) {
+    return {
+      endpoint: "/internal/v1/whatsapp/send-product",
+      payload: {
+        phoneNumberId: channel.phoneNumberId,
+        to: command.contactPhoneE164,
+        catalogId: command.product.catalogId,
+        productRetailerId: command.product.productRetailerId,
+        bodyText: command.product.bodyText,
+        accessToken: channel.accessToken
+      },
+      persistedPayload: { kind: "product", product: command.product, actorId: command.actorId }
+    };
+  }
+  if (command.kind === "catalog" && command.catalog) {
+    return {
+      endpoint: "/internal/v1/whatsapp/send-catalog",
+      payload: {
+        phoneNumberId: channel.phoneNumberId,
+        to: command.contactPhoneE164,
+        catalogId: command.catalog.catalogId,
+        sections: command.catalog.sections,
+        headerText: command.catalog.headerText,
+        bodyText: command.catalog.bodyText,
+        footerText: command.catalog.footerText,
+        accessToken: channel.accessToken
+      },
+      persistedPayload: { kind: "catalog", catalog: command.catalog, actorId: command.actorId }
+    };
+  }
+  if (command.kind === "flow" && command.flow) {
+    return {
+      endpoint: "/internal/v1/whatsapp/send-flow",
+      payload: {
+        phoneNumberId: channel.phoneNumberId,
+        to: command.contactPhoneE164,
+        flowId: command.flow.flowId,
+        flowToken: command.flow.flowToken,
+        bodyText: command.flow.bodyText,
+        ctaButtonText: command.flow.ctaButtonText,
+        headerText: command.flow.headerText,
+        footerText: command.flow.footerText,
+        accessToken: channel.accessToken
+      },
+      persistedPayload: { kind: "flow", flow: command.flow, actorId: command.actorId }
+    };
+  }
   if (command.kind === "interactive" && command.interactive) {
     return {
       endpoint: "/internal/v1/whatsapp/send-interactive",

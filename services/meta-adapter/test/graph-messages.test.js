@@ -8,7 +8,10 @@ import {
   buildMarkReadBody,
   buildMediaUploadForm,
   mapMetaTemplateStatus,
-  extractTemplateBody
+  extractTemplateBody,
+  buildProductMessage,
+  buildCatalogMessage,
+  buildFlowMessage
 } from "../dist/graph-messages.js";
 
 test("template body falls back to positional params", () => {
@@ -132,4 +135,78 @@ test("extracts body text from meta components", () => {
   ];
   assert.equal(extractTemplateBody(components), "Your order {{1}} shipped");
   assert.equal(extractTemplateBody(undefined), "");
+});
+
+test("buildProductMessage shapes a single-product interactive body", () => {
+  const body = buildProductMessage({
+    to: "+15551230000",
+    catalogId: "cat-1",
+    productRetailerId: "sku-42",
+    bodyText: "Check this out"
+  });
+  assert.equal(body.messaging_product, "whatsapp");
+  assert.equal(body.type, "interactive");
+  assert.equal(body.interactive.type, "product");
+  assert.equal(body.interactive.action.catalog_id, "cat-1");
+  assert.equal(body.interactive.action.product_retailer_id, "sku-42");
+  assert.equal(body.interactive.body.text, "Check this out");
+});
+
+test("buildProductMessage defaults bodyText to a space", () => {
+  const body = buildProductMessage({ to: "1", catalogId: "c", productRetailerId: "p" });
+  assert.equal(body.interactive.body.text, " ");
+});
+
+test("buildCatalogMessage shapes a multi-product list", () => {
+  const body = buildCatalogMessage({
+    to: "+15551230000",
+    catalogId: "cat-1",
+    sections: [{ title: "Shoes", productItems: [{ productRetailerId: "shoe-1" }, { productRetailerId: "shoe-2" }] }],
+    headerText: "Our Catalogue",
+    footerText: "Tap to order"
+  });
+  assert.equal(body.type, "interactive");
+  assert.equal(body.interactive.type, "product_list");
+  assert.equal(body.interactive.header.text, "Our Catalogue");
+  assert.equal(body.interactive.footer.text, "Tap to order");
+  assert.equal(body.interactive.action.sections[0].title, "Shoes");
+  assert.equal(body.interactive.action.sections[0].product_items[0].product_retailer_id, "shoe-1");
+});
+
+test("buildCatalogMessage omits header/footer when not provided", () => {
+  const body = buildCatalogMessage({ to: "1", catalogId: "c", sections: [] });
+  assert.equal("header" in body.interactive, false);
+  assert.equal("footer" in body.interactive, false);
+});
+
+test("buildFlowMessage shapes a flow interactive body", () => {
+  const body = buildFlowMessage({
+    to: "+15551230000",
+    flowId: "flow-99",
+    flowToken: "tok-abc",
+    bodyText: "Complete your profile",
+    ctaButtonText: "Start",
+    headerText: "Setup",
+    footerText: "Powered by HyFib"
+  });
+  assert.equal(body.type, "interactive");
+  assert.equal(body.interactive.type, "flow");
+  assert.equal(body.interactive.action.parameters.flow_id, "flow-99");
+  assert.equal(body.interactive.action.parameters.flow_token, "tok-abc");
+  assert.equal(body.interactive.action.parameters.flow_cta, "Start");
+  assert.equal(body.interactive.header.text, "Setup");
+  assert.equal(body.interactive.footer.text, "Powered by HyFib");
+  assert.equal("mode" in body.interactive.action.parameters, false);
+});
+
+test("buildFlowMessage includes draft mode when specified", () => {
+  const body = buildFlowMessage({
+    to: "1",
+    flowId: "f",
+    flowToken: "t",
+    bodyText: "body",
+    ctaButtonText: "Go",
+    mode: "draft"
+  });
+  assert.equal(body.interactive.action.parameters.mode, "draft");
 });

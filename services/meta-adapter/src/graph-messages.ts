@@ -130,6 +130,113 @@ export function buildInteractiveBody(
   };
 }
 
+export interface ProductMessageInput {
+  to: string;
+  catalogId: string;
+  productRetailerId: string;
+  bodyText?: string;
+}
+
+/** Builds a single-product (MPM) message body for the `/messages` endpoint. */
+export function buildProductMessage(input: ProductMessageInput): Record<string, unknown> {
+  return {
+    messaging_product: "whatsapp",
+    recipient_type: "individual",
+    to: input.to,
+    type: "interactive",
+    interactive: {
+      type: "product",
+      body: { text: input.bodyText ?? " " },
+      action: { catalog_id: input.catalogId, product_retailer_id: input.productRetailerId }
+    }
+  };
+}
+
+export interface ProductSection {
+  title: string;
+  productItems: Array<{ productRetailerId: string }>;
+}
+
+export interface CatalogMessageInput {
+  to: string;
+  catalogId: string;
+  sections: ProductSection[];
+  headerText?: string;
+  bodyText?: string;
+  footerText?: string;
+}
+
+/** Builds a multi-product catalog message body for the `/messages` endpoint. */
+export function buildCatalogMessage(input: CatalogMessageInput): Record<string, unknown> {
+  const interactive: Record<string, unknown> = {
+    type: "product_list",
+    body: { text: input.bodyText ?? " " },
+    action: {
+      catalog_id: input.catalogId,
+      sections: input.sections.map((s) => ({
+        title: s.title,
+        product_items: s.productItems.map((p) => ({ product_retailer_id: p.productRetailerId }))
+      }))
+    }
+  };
+  if (input.headerText) {
+    interactive.header = { type: "text", text: input.headerText };
+  }
+  if (input.footerText) {
+    interactive.footer = { text: input.footerText };
+  }
+  return {
+    messaging_product: "whatsapp",
+    recipient_type: "individual",
+    to: input.to,
+    type: "interactive",
+    interactive
+  };
+}
+
+export interface FlowMessageInput {
+  to: string;
+  flowId: string;
+  flowToken: string;
+  headerText?: string;
+  bodyText: string;
+  footerText?: string;
+  ctaButtonText: string;
+  mode?: "draft" | "published";
+}
+
+/** Builds a WhatsApp Flow message body for the `/messages` endpoint. */
+export function buildFlowMessage(input: FlowMessageInput): Record<string, unknown> {
+  const interactive: Record<string, unknown> = {
+    type: "flow",
+    body: { text: input.bodyText },
+    action: {
+      name: "flow",
+      parameters: {
+        flow_message_version: "3",
+        flow_token: input.flowToken,
+        flow_id: input.flowId,
+        flow_cta: input.ctaButtonText,
+        flow_action: "navigate",
+        ...(input.mode === "draft" ? { mode: "draft" } : {})
+      }
+    }
+  };
+  if (input.headerText) {
+    interactive.header = { type: "text", text: input.headerText };
+  }
+  if (input.footerText) {
+    interactive.footer = { text: input.footerText };
+  }
+  return {
+    messaging_product: "whatsapp",
+    recipient_type: "individual",
+    to: input.to,
+    type: "interactive",
+    interactive
+  };
+}
+
 export interface MediaUploadInput {
   buffer: Buffer;
   mimeType: string;

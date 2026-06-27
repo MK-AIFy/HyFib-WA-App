@@ -73,7 +73,21 @@ export interface Contact {
   optedOut: boolean;
   country?: string;
   tags: string[];
+  timezone?: string;
 }
+
+export interface QuietHoursConfig {
+  startHour: number;
+  endHour: number;
+}
+
+export interface FrequencyCapConfig {
+  maxMessages: number;
+  periodHours: number;
+}
+
+/** Variable mapping: key = positional index (1-based), value = contact field name or {literal:string}. */
+export type VariableMapping = Record<string, string | { literal: string }>;
 
 export interface Campaign {
   id: string;
@@ -83,6 +97,53 @@ export interface Campaign {
   templateCategory: MessageCategory;
   status: "draft" | "scheduled" | "running" | "paused" | "completed";
   createdAt: string;
+  segmentId?: string;
+  scheduledAt?: string;
+  variableMapping?: VariableMapping;
+  ratePerMinute?: number;
+  quietHours?: QuietHoursConfig;
+  frequencyCap?: FrequencyCapConfig;
+}
+
+export interface Segment {
+  id: string;
+  tenantId: string;
+  name: string;
+  definition: {
+    tags?: string[];
+    country?: string;
+    hasConsent?: boolean;
+    optedInOnly?: boolean;
+  };
+  createdAt: string;
+}
+
+export interface CampaignRecipient {
+  id: string;
+  tenantId: string;
+  campaignId: string;
+  contactId: string;
+  phoneE164: string;
+  status: "pending" | "policy_skipped" | "sent" | "delivered" | "read" | "failed";
+  externalMessageId?: string;
+  error?: string;
+  skipReason?: string;
+  sentAt?: string;
+  deliveredAt?: string;
+  readAt?: string;
+  createdAt: string;
+}
+
+export interface AutoReplyRule {
+  id: string;
+  tenantId: string;
+  matchType: "keyword" | "contains" | "regex" | "any";
+  keyword?: string;
+  replyKind: "text";
+  replyText?: string;
+  enabled: boolean;
+  priority: number;
+  createdAt: string;
 }
 
 export interface Conversation {
@@ -91,6 +152,9 @@ export interface Conversation {
   contactId: string;
   channelId: string;
   lastMessageAt?: string;
+  lastInboundAt?: string;
+  assignedUserId?: string;
+  state: "open" | "pending" | "closed";
 }
 
 export interface Message {
@@ -144,6 +208,22 @@ export interface CampaignDispatchRequest {
   templateCategory: MessageCategory;
   contactPhoneE164: string;
   parameters: string[];
+  /** Set when dispatched as part of a fan-out run; tracks funnel row. */
+  recipientId?: string;
+}
+
+/** Triggers a full audience fan-out from the notification worker. */
+export interface CampaignRunRequest {
+  campaignId: string;
+  tenantId: string;
+  channelId: string;
+  templateName: string;
+  templateLanguage: string;
+  templateCategory: MessageCategory;
+  variableMapping?: VariableMapping;
+  quietHours?: QuietHoursConfig;
+  frequencyCap?: FrequencyCapConfig;
+  ratePerMinute?: number;
 }
 
 export interface CampaignDispatchResult {
@@ -195,6 +275,36 @@ export interface WhatsAppSendRequest {
 }
 
 export type WhatsAppMediaKind = "image" | "video" | "audio" | "document" | "sticker";
+
+/** WhatsApp catalog/product message (Commerce API). */
+export interface WhatsAppProductSendRequest {
+  phoneNumberId: string;
+  to: string;
+  /** Meta catalog ID. */
+  catalogId: string;
+  /** Single product SKU (send-product) or undefined (multi-product/catalog). */
+  productRetailerId?: string;
+  /** Sections of products for multi-product messages. */
+  sections?: Array<{ title: string; productItems: Array<{ productRetailerId: string }> }>;
+  bodyText?: string;
+  footerText?: string;
+  headerText?: string;
+  accessToken?: string;
+}
+
+/** WhatsApp Flow message (interactive flow type). */
+export interface WhatsAppFlowSendRequest {
+  phoneNumberId: string;
+  to: string;
+  flowId: string;
+  flowToken: string;
+  headerText?: string;
+  bodyText: string;
+  footerText?: string;
+  ctaButtonText: string;
+  mode?: "draft" | "published";
+  accessToken?: string;
+}
 
 export interface WhatsAppTextSendRequest {
   phoneNumberId: string;
@@ -278,11 +388,27 @@ export interface WhatsAppOutboundRequest {
   channelId: string;
   conversationId: string;
   contactPhoneE164: string;
-  kind: "text" | "media" | "interactive";
+  kind: "text" | "media" | "interactive" | "product" | "catalog" | "flow";
   text?: string;
   previewUrl?: boolean;
   media?: { mediaType: WhatsAppMediaKind; link?: string; mediaId?: string; caption?: string; filename?: string };
   interactive?: WhatsAppInteractivePayload;
+  product?: { catalogId: string; productRetailerId: string; bodyText?: string };
+  catalog?: {
+    catalogId: string;
+    sections: Array<{ title: string; productItems: Array<{ productRetailerId: string }> }>;
+    headerText?: string;
+    bodyText?: string;
+    footerText?: string;
+  };
+  flow?: {
+    flowId: string;
+    flowToken: string;
+    bodyText: string;
+    ctaButtonText: string;
+    headerText?: string;
+    footerText?: string;
+  };
   actorId?: string;
 }
 
@@ -293,6 +419,7 @@ export const EventTopics = {
   TemplateStatusUpdated: "template.status.updated",
   CampaignDispatchRequested: "campaign.dispatch.requested",
   CampaignDispatchResult: "campaign.dispatch.result",
+  CampaignRunRequested: "campaign.run.requested",
   CommerceOrderEvent: "commerce.order.event",
   ComplianceOptOutEvent: "compliance.optout.event"
 } as const;

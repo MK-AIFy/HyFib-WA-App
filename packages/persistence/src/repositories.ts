@@ -3,16 +3,22 @@ import { loadConfig } from "@hyfib/config";
 import { decryptSecret, encryptSecret } from "@hyfib/shared-core";
 import type {
   AuditEvent,
+  AutoReplyRule,
   Campaign,
+  CampaignRecipient,
   Contact,
   Conversation,
+  FrequencyCapConfig,
   Message,
   MessageCategory,
   Order,
+  QuietHoursConfig,
   Role,
+  Segment,
   Template,
   Tenant,
   User,
+  VariableMapping,
   WhatsAppChannel
 } from "@hyfib/shared-core";
 
@@ -21,6 +27,8 @@ export type CampaignWithTemplate = Campaign & {
   templateLanguage: string;
   sentCount: number;
   failedCount: number;
+  deliveredCount: number;
+  readCount: number;
 };
 
 interface TenantRow {
@@ -298,6 +306,14 @@ interface CampaignRow {
   template_category: string;
   sent_count: string | null;
   failed_count: string | null;
+  delivered_count: string | null;
+  read_count: string | null;
+  segment_id: string | null;
+  scheduled_at: Date | null;
+  variable_mapping: VariableMapping | null;
+  rate_per_minute: number | null;
+  quiet_hours: QuietHoursConfig | null;
+  frequency_cap: FrequencyCapConfig | null;
 }
 
 function mapCampaign(row: CampaignRow): CampaignWithTemplate {
@@ -312,25 +328,62 @@ function mapCampaign(row: CampaignRow): CampaignWithTemplate {
     templateName: row.template_name,
     templateLanguage: row.template_language,
     sentCount: Number(row.sent_count ?? "0"),
-    failedCount: Number(row.failed_count ?? "0")
+    failedCount: Number(row.failed_count ?? "0"),
+    deliveredCount: Number(row.delivered_count ?? "0"),
+    readCount: Number(row.read_count ?? "0"),
+    segmentId: row.segment_id ?? undefined,
+    scheduledAt: row.scheduled_at?.toISOString(),
+    variableMapping: row.variable_mapping ?? undefined,
+    ratePerMinute: row.rate_per_minute ?? undefined,
+    quietHours: row.quiet_hours ?? undefined,
+    frequencyCap: row.frequency_cap ?? undefined
   };
 }
 
 const CAMPAIGN_SELECT = `
   SELECT c.id, c.tenant_id, c.name, c.template_id, c.status, c.created_at,
+         c.segment_id, c.scheduled_at, c.variable_mapping, c.rate_per_minute,
+         c.quiet_hours, c.frequency_cap,
          t.name AS template_name, t.language AS template_language, t.category AS template_category,
-         s.sent_count, s.failed_count
+         s.sent_count, s.failed_count, s.delivered_count, s.read_count
   FROM campaigns c
   JOIN templates t ON t.id = c.template_id
   LEFT JOIN campaign_stats s ON s.campaign_id = c.id
 `;
 
 export const campaignRepository = {
-  async create(tenantId: string, input: { name: string; templateId: string }): Promise<CampaignWithTemplate> {
+  async create(
+    tenantId: string,
+    input: {
+      name: string;
+      templateId: string;
+      segmentId?: string;
+      scheduledAt?: string;
+      variableMapping?: VariableMapping;
+      ratePerMinute?: number;
+      quietHours?: QuietHoursConfig;
+      frequencyCap?: FrequencyCapConfig;
+    }
+  ): Promise<CampaignWithTemplate> {
     return withTenant(tenantId, async (client) => {
       const inserted = await client.query<{ id: string }>(
-        "INSERT INTO campaigns (tenant_id, name, template_id, status) VALUES ($1, $2, $3, 'draft') RETURNING id",
-        [tenantId, input.name, input.templateId]
+        `INSERT INTO campaigns
+           (tenant_id, name, template_id, status, segment_id, scheduled_at, variable_mapping, rate_per_minute, quiet_hours, frequency_cap)
+         VALUES ($1, $2, $3,
+           CASE WHEN $4::timestamptz IS NOT NULL THEN 'scheduled' ELSE 'draft' END,
+           $5, $4, $6::jsonb, $7, $8::jsonb, $9::jsonb)
+         RETURNING id`,
+        [
+          tenantId,
+          input.name,
+          input.templateId,
+          input.scheduledAt ?? null,
+          input.segmentId ?? null,
+          input.variableMapping ? JSON.stringify(input.variableMapping) : null,
+          input.ratePerMinute ?? null,
+          input.quietHours ? JSON.stringify(input.quietHours) : null,
+          input.frequencyCap ? JSON.stringify(input.frequencyCap) : null
+        ]
       );
       const result = await client.query<CampaignRow>(`${CAMPAIGN_SELECT} WHERE c.id = $1`, [inserted.rows[0]!.id]);
       return mapCampaign(result.rows[0]!);
@@ -369,6 +422,28 @@ export const campaignStatsRepository = {
         [tenantId, campaignId, outcome === "sent" ? 1 : 0, outcome === "failed" ? 1 : 0]
       );
     });
+  },
+  async recordDelivered(tenantId: string, campaignId: string): Promise<void> {
+    await withTenant(tenantId, async (client) => {
+      await client.query(
+        `INSERT INTO campaign_stats (tenant_id, campaign_id, delivered_count, last_result_at)
+         VALUES ($1, $2, 1, now())
+         ON CONFLICT (tenant_id, campaign_id) DO UPDATE
+           SET delivered_count = campaign_stats.delivered_count + 1, last_result_at = now()`,
+        [tenantId, campaignId]
+      );
+    });
+  },
+  async recordRead(tenantId: string, campaignId: string): Promise<void> {
+    await withTenant(tenantId, async (client) => {
+      await client.query(
+        `INSERT INTO campaign_stats (tenant_id, campaign_id, read_count, last_result_at)
+         VALUES ($1, $2, 1, now())
+         ON CONFLICT (tenant_id, campaign_id) DO UPDATE
+           SET read_count = campaign_stats.read_count + 1, last_result_at = now()`,
+        [tenantId, campaignId]
+      );
+    });
   }
 };
 
@@ -378,6 +453,7 @@ interface ContactRow {
   phone_e164: string;
   first_name: string | null;
   last_name: string | null;
+  timezone: string | null;
   metadata: { optedOut?: boolean; country?: string; tags?: string[] };
 }
 
@@ -390,40 +466,54 @@ function mapContact(row: ContactRow): Contact {
     lastName: row.last_name ?? undefined,
     optedOut: row.metadata?.optedOut ?? false,
     country: row.metadata?.country,
-    tags: row.metadata?.tags ?? []
+    tags: row.metadata?.tags ?? [],
+    timezone: row.timezone ?? undefined
   };
 }
+
+const CONTACT_SELECT = "SELECT id, tenant_id, phone_e164, first_name, last_name, timezone, metadata";
 
 export const contactRepository = {
   async create(
     tenantId: string,
-    input: { phoneE164: string; firstName?: string; lastName?: string; country?: string; tags?: string[] }
+    input: {
+      phoneE164: string;
+      firstName?: string;
+      lastName?: string;
+      country?: string;
+      tags?: string[];
+      timezone?: string;
+    }
   ): Promise<Contact> {
     return withTenant(tenantId, async (client) => {
       const metadata = { optedOut: false, country: input.country, tags: input.tags ?? [] };
       const result = await client.query<ContactRow>(
-        `INSERT INTO contacts (tenant_id, phone_e164, first_name, last_name, metadata)
-         VALUES ($1, $2, $3, $4, $5::jsonb)
-         RETURNING id, tenant_id, phone_e164, first_name, last_name, metadata`,
-        [tenantId, input.phoneE164, input.firstName ?? null, input.lastName ?? null, JSON.stringify(metadata)]
+        `INSERT INTO contacts (tenant_id, phone_e164, first_name, last_name, timezone, metadata)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+         RETURNING id, tenant_id, phone_e164, first_name, last_name, timezone, metadata`,
+        [
+          tenantId,
+          input.phoneE164,
+          input.firstName ?? null,
+          input.lastName ?? null,
+          input.timezone ?? null,
+          JSON.stringify(metadata)
+        ]
       );
       return mapContact(result.rows[0]!);
     });
   },
   async list(tenantId: string): Promise<Contact[]> {
     return withTenant(tenantId, async (client) => {
-      const result = await client.query<ContactRow>(
-        "SELECT id, tenant_id, phone_e164, first_name, last_name, metadata FROM contacts ORDER BY created_at DESC"
-      );
+      const result = await client.query<ContactRow>(`${CONTACT_SELECT} FROM contacts ORDER BY created_at DESC`);
       return result.rows.map(mapContact);
     });
   },
   async findByPhone(tenantId: string, phoneE164: string): Promise<Contact | undefined> {
     return withTenant(tenantId, async (client) => {
-      const result = await client.query<ContactRow>(
-        "SELECT id, tenant_id, phone_e164, first_name, last_name, metadata FROM contacts WHERE phone_e164 = $1",
-        [phoneE164]
-      );
+      const result = await client.query<ContactRow>(`${CONTACT_SELECT} FROM contacts WHERE phone_e164 = $1`, [
+        phoneE164
+      ]);
       return result.rows[0] ? mapContact(result.rows[0]) : undefined;
     });
   },
@@ -434,7 +524,7 @@ export const contactRepository = {
         `INSERT INTO contacts (tenant_id, phone_e164, metadata)
          VALUES ($1, $2, '{"optedOut":false,"tags":[]}'::jsonb)
          ON CONFLICT (tenant_id, phone_e164) DO UPDATE SET phone_e164 = EXCLUDED.phone_e164
-         RETURNING id, tenant_id, phone_e164, first_name, last_name, metadata`,
+         RETURNING id, tenant_id, phone_e164, first_name, last_name, timezone, metadata`,
         [tenantId, phoneE164]
       );
       return mapContact(inserted.rows[0]!);
@@ -442,10 +532,7 @@ export const contactRepository = {
   },
   async getById(tenantId: string, id: string): Promise<Contact | undefined> {
     return withTenant(tenantId, async (client) => {
-      const result = await client.query<ContactRow>(
-        "SELECT id, tenant_id, phone_e164, first_name, last_name, metadata FROM contacts WHERE id = $1",
-        [id]
-      );
+      const result = await client.query<ContactRow>(`${CONTACT_SELECT} FROM contacts WHERE id = $1`, [id]);
       return result.rows[0] ? mapContact(result.rows[0]) : undefined;
     });
   },
@@ -456,6 +543,70 @@ export const contactRepository = {
         [contactId, optedOut]
       );
     });
+  },
+  /**
+   * Bulk-upsert contacts from a CSV/JSON import.
+   * Returns { created, updated, skipped } counts.
+   * Processes in chunks of 500 to stay under pg parameter limits.
+   */
+  async bulkUpsert(
+    tenantId: string,
+    rows: Array<{
+      phoneE164: string;
+      firstName?: string;
+      lastName?: string;
+      country?: string;
+      tags?: string[];
+      timezone?: string;
+      grantConsent?: boolean;
+    }>
+  ): Promise<{ created: number; updated: number; skipped: number }> {
+    let created = 0;
+    let updated = 0;
+    let skipped = 0;
+    const CHUNK = 500;
+    for (let i = 0; i < rows.length; i += CHUNK) {
+      const chunk = rows.slice(i, i + CHUNK);
+      await withTenant(tenantId, async (client) => {
+        for (const row of chunk) {
+          if (!row.phoneE164) {
+            skipped++;
+            continue;
+          }
+          const metadata = JSON.stringify({
+            optedOut: false,
+            country: row.country,
+            tags: row.tags ?? []
+          });
+          const res = await client.query<{ id: string; xmax: string }>(
+            `INSERT INTO contacts (tenant_id, phone_e164, first_name, last_name, timezone, metadata)
+             VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+             ON CONFLICT (tenant_id, phone_e164) DO UPDATE
+               SET first_name = COALESCE(EXCLUDED.first_name, contacts.first_name),
+                   last_name  = COALESCE(EXCLUDED.last_name,  contacts.last_name),
+                   timezone   = COALESCE(EXCLUDED.timezone,   contacts.timezone)
+             RETURNING id, xmax::text`,
+            [tenantId, row.phoneE164, row.firstName ?? null, row.lastName ?? null, row.timezone ?? null, metadata]
+          );
+          const upserted = res.rows[0]!;
+          const wasInsert = upserted.xmax === "0";
+          if (wasInsert) {
+            created++;
+          } else {
+            updated++;
+          }
+          if (row.grantConsent) {
+            await client.query(
+              `INSERT INTO consent_records (tenant_id, contact_id, channel, source, policy_version, granted_at)
+               VALUES ($1, $2, 'whatsapp', 'csv_import', 'v1', now())
+               ON CONFLICT DO NOTHING`,
+              [tenantId, upserted.id]
+            );
+          }
+        }
+      });
+    }
+    return { created, updated, skipped };
   }
 };
 
@@ -607,6 +758,9 @@ interface ConversationRow {
   contact_id: string;
   channel_id: string;
   last_message_at: Date | null;
+  last_inbound_at: Date | null;
+  assigned_user_id: string | null;
+  state: string;
 }
 
 function mapConversation(row: ConversationRow): Conversation {
@@ -615,46 +769,86 @@ function mapConversation(row: ConversationRow): Conversation {
     tenantId: row.tenant_id,
     contactId: row.contact_id,
     channelId: row.channel_id,
-    lastMessageAt: row.last_message_at?.toISOString()
+    lastMessageAt: row.last_message_at?.toISOString(),
+    lastInboundAt: row.last_inbound_at?.toISOString(),
+    assignedUserId: row.assigned_user_id ?? undefined,
+    state: (row.state ?? "open") as Conversation["state"]
   };
 }
 
+const CONV_SELECT =
+  "SELECT id, tenant_id, contact_id, channel_id, last_message_at, last_inbound_at, assigned_user_id, state";
+
 export const conversationRepository = {
-  async list(tenantId: string): Promise<Conversation[]> {
+  async list(tenantId: string, opts?: { state?: string; assignedUserId?: string }): Promise<Conversation[]> {
     return withTenant(tenantId, async (client) => {
+      const conditions: string[] = [];
+      const params: unknown[] = [];
+      if (opts?.state) {
+        params.push(opts.state);
+        conditions.push(`state = $${params.length}`);
+      }
+      if (opts?.assignedUserId) {
+        params.push(opts.assignedUserId);
+        conditions.push(`assigned_user_id = $${params.length}`);
+      }
+      const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
       const result = await client.query<ConversationRow>(
-        `SELECT id, tenant_id, contact_id, channel_id, last_message_at
-         FROM conversations ORDER BY last_message_at DESC NULLS LAST LIMIT 200`
+        `${CONV_SELECT} FROM conversations ${where} ORDER BY last_message_at DESC NULLS LAST LIMIT 200`,
+        params
       );
       return result.rows.map(mapConversation);
     });
   },
   async getById(tenantId: string, id: string): Promise<Conversation | undefined> {
     return withTenant(tenantId, async (client) => {
-      const result = await client.query<ConversationRow>(
-        `SELECT id, tenant_id, contact_id, channel_id, last_message_at FROM conversations WHERE id = $1`,
-        [id]
-      );
+      const result = await client.query<ConversationRow>(`${CONV_SELECT} FROM conversations WHERE id = $1`, [id]);
       return result.rows[0] ? mapConversation(result.rows[0]) : undefined;
     });
   },
   async findOrCreate(tenantId: string, contactId: string, channelId: string): Promise<Conversation> {
     return withTenant(tenantId, async (client) => {
       const existing = await client.query<ConversationRow>(
-        `SELECT id, tenant_id, contact_id, channel_id, last_message_at
-         FROM conversations WHERE contact_id = $1 AND channel_id = $2 LIMIT 1`,
+        `${CONV_SELECT} FROM conversations WHERE contact_id = $1 AND channel_id = $2 LIMIT 1`,
         [contactId, channelId]
       );
       if (existing.rows[0]) {
         return mapConversation(existing.rows[0]);
       }
       const inserted = await client.query<ConversationRow>(
-        `INSERT INTO conversations (tenant_id, contact_id, channel_id)
-         VALUES ($1, $2, $3)
-         RETURNING id, tenant_id, contact_id, channel_id, last_message_at`,
+        `INSERT INTO conversations (tenant_id, contact_id, channel_id, state)
+         VALUES ($1, $2, $3, 'open')
+         RETURNING id, tenant_id, contact_id, channel_id, last_message_at, last_inbound_at, assigned_user_id, state`,
         [tenantId, contactId, channelId]
       );
       return mapConversation(inserted.rows[0]!);
+    });
+  },
+  async touchInbound(tenantId: string, conversationId: string): Promise<void> {
+    await withTenant(tenantId, async (client) => {
+      await client.query("UPDATE conversations SET last_inbound_at = now(), last_message_at = now() WHERE id = $1", [
+        conversationId
+      ]);
+    });
+  },
+  async assign(tenantId: string, conversationId: string, userId: string | null): Promise<void> {
+    await withTenant(tenantId, async (client) => {
+      await client.query("UPDATE conversations SET assigned_user_id = $2 WHERE id = $1", [conversationId, userId]);
+    });
+  },
+  async setState(tenantId: string, conversationId: string, state: "open" | "pending" | "closed"): Promise<void> {
+    await withTenant(tenantId, async (client) => {
+      await client.query("UPDATE conversations SET state = $2 WHERE id = $1", [conversationId, state]);
+    });
+  },
+  /** Returns the timestamp of the last inbound message for a contact across all channels (for 24h window check). */
+  async lastInboundAt(tenantId: string, contactId: string): Promise<Date | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<{ last_inbound_at: Date | null }>(
+        "SELECT MAX(last_inbound_at) AS last_inbound_at FROM conversations WHERE contact_id = $1",
+        [contactId]
+      );
+      return result.rows[0]?.last_inbound_at ?? undefined;
     });
   }
 };
@@ -767,6 +961,34 @@ export const messageRepository = {
       // Return chronological (oldest first) for natural thread rendering.
       return result.rows.map(mapMessage).reverse();
     });
+  },
+  /**
+   * Count outbound messages sent to a contact within a given time window.
+   * Used for server-side frequency-cap enforcement.
+   */
+  async findByExternalId(tenantId: string, externalMessageId: string): Promise<Message | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<MessageRow>(
+        `SELECT id, tenant_id, conversation_id, direction, category, external_message_id, payload, status, created_at
+         FROM messages WHERE external_message_id = $1 LIMIT 1`,
+        [externalMessageId]
+      );
+      return result.rows[0] ? mapMessage(result.rows[0]) : undefined;
+    });
+  },
+  async countOutboundSince(tenantId: string, contactId: string, sinceISO: string): Promise<number> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<{ count: string }>(
+        `SELECT COUNT(*)::text AS count
+         FROM messages m
+         JOIN conversations c ON c.id = m.conversation_id
+         WHERE c.contact_id = $1
+           AND m.direction = 'outbound'
+           AND m.created_at >= $2::timestamptz`,
+        [contactId, sinceISO]
+      );
+      return Number(result.rows[0]?.count ?? "0");
+    });
   }
 };
 
@@ -868,3 +1090,399 @@ export async function tenantAnalytics(tenantId: string): Promise<TenantAnalytics
     };
   });
 }
+
+// ─── Segments ──────────────────────────────────────────────────────────────────
+
+interface SegmentRow {
+  id: string;
+  tenant_id: string;
+  name: string;
+  definition: Segment["definition"];
+  created_at: Date;
+}
+
+function mapSegment(row: SegmentRow): Segment {
+  return {
+    id: row.id,
+    tenantId: row.tenant_id,
+    name: row.name,
+    definition: row.definition ?? {},
+    createdAt: row.created_at.toISOString()
+  };
+}
+
+export const segmentRepository = {
+  async create(tenantId: string, input: { name: string; definition: Segment["definition"] }): Promise<Segment> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<SegmentRow>(
+        `INSERT INTO segments (tenant_id, name, definition)
+         VALUES ($1, $2, $3::jsonb)
+         RETURNING id, tenant_id, name, definition, created_at`,
+        [tenantId, input.name, JSON.stringify(input.definition)]
+      );
+      return mapSegment(result.rows[0]!);
+    });
+  },
+  async list(tenantId: string): Promise<Segment[]> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<SegmentRow>(
+        "SELECT id, tenant_id, name, definition, created_at FROM segments ORDER BY created_at DESC"
+      );
+      return result.rows.map(mapSegment);
+    });
+  },
+  async getById(tenantId: string, id: string): Promise<Segment | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<SegmentRow>(
+        "SELECT id, tenant_id, name, definition, created_at FROM segments WHERE id = $1",
+        [id]
+      );
+      return result.rows[0] ? mapSegment(result.rows[0]) : undefined;
+    });
+  },
+  /**
+   * Resolves contacts matching a segment definition.
+   * Returns lightweight rows suitable for fan-out (id, phone_e164).
+   */
+  async resolveContacts(
+    tenantId: string,
+    definition: Segment["definition"]
+  ): Promise<Array<{ id: string; phoneE164: string; firstName?: string; lastName?: string; timezone?: string }>> {
+    return withTenant(tenantId, async (client) => {
+      const conditions: string[] = ["(c.metadata->>'optedOut')::boolean IS NOT TRUE"];
+      const params: unknown[] = [];
+
+      if (definition.country) {
+        params.push(definition.country);
+        conditions.push(`c.metadata->>'country' = $${params.length}`);
+      }
+      if (definition.tags && definition.tags.length > 0) {
+        params.push(JSON.stringify(definition.tags));
+        conditions.push(`c.metadata->'tags' @> $${params.length}::jsonb`);
+      }
+
+      let join = "";
+      if (definition.hasConsent !== false) {
+        join = "JOIN consent_records cr ON cr.contact_id = c.id AND cr.revoked_at IS NULL";
+        // Deduplicate contacts with multiple consent records.
+        conditions.push("TRUE");
+      }
+
+      const where = conditions.join(" AND ");
+      const sql = `
+        SELECT DISTINCT ON (c.id) c.id, c.phone_e164, c.first_name, c.last_name, c.timezone
+        FROM contacts c
+        ${join}
+        WHERE ${where}
+        ORDER BY c.id`;
+
+      const result = await client.query<{
+        id: string;
+        phone_e164: string;
+        first_name: string | null;
+        last_name: string | null;
+        timezone: string | null;
+      }>(sql, params);
+
+      return result.rows.map((r) => ({
+        id: r.id,
+        phoneE164: r.phone_e164,
+        firstName: r.first_name ?? undefined,
+        lastName: r.last_name ?? undefined,
+        timezone: r.timezone ?? undefined
+      }));
+    });
+  },
+  async previewCount(tenantId: string, definition: Segment["definition"]): Promise<number> {
+    const contacts = await segmentRepository.resolveContacts(tenantId, definition);
+    return contacts.length;
+  }
+};
+
+// ─── Campaign recipients ────────────────────────────────────────────────────────
+
+interface CampaignRecipientRow {
+  id: string;
+  tenant_id: string;
+  campaign_id: string;
+  contact_id: string;
+  phone_e164: string;
+  status: string;
+  external_message_id: string | null;
+  error: string | null;
+  skip_reason: string | null;
+  sent_at: Date | null;
+  delivered_at: Date | null;
+  read_at: Date | null;
+  created_at: Date;
+}
+
+function mapRecipient(row: CampaignRecipientRow): CampaignRecipient {
+  return {
+    id: row.id,
+    tenantId: row.tenant_id,
+    campaignId: row.campaign_id,
+    contactId: row.contact_id,
+    phoneE164: row.phone_e164,
+    status: row.status as CampaignRecipient["status"],
+    externalMessageId: row.external_message_id ?? undefined,
+    error: row.error ?? undefined,
+    skipReason: row.skip_reason ?? undefined,
+    sentAt: row.sent_at?.toISOString(),
+    deliveredAt: row.delivered_at?.toISOString(),
+    readAt: row.read_at?.toISOString(),
+    createdAt: row.created_at.toISOString()
+  };
+}
+
+export const campaignRecipientRepository = {
+  /** Bulk-insert recipient rows (pending status) for a new campaign run. */
+  async insertBatch(
+    tenantId: string,
+    campaignId: string,
+    contacts: Array<{ id: string; phoneE164: string }>
+  ): Promise<void> {
+    if (contacts.length === 0) return;
+    const CHUNK = 200;
+    for (let i = 0; i < contacts.length; i += CHUNK) {
+      const chunk = contacts.slice(i, i + CHUNK);
+      await withTenant(tenantId, async (client) => {
+        for (const c of chunk) {
+          await client.query(
+            `INSERT INTO campaign_recipients (tenant_id, campaign_id, contact_id, phone_e164, status)
+             VALUES ($1, $2, $3, $4, 'pending')
+             ON CONFLICT (campaign_id, contact_id) DO NOTHING`,
+            [tenantId, campaignId, c.id, c.phoneE164]
+          );
+        }
+      });
+    }
+  },
+  async updateStatus(
+    tenantId: string,
+    recipientId: string,
+    update: {
+      status: CampaignRecipient["status"];
+      externalMessageId?: string;
+      error?: string;
+      skipReason?: string;
+    }
+  ): Promise<void> {
+    await withTenant(tenantId, async (client) => {
+      await client.query(
+        `UPDATE campaign_recipients
+         SET status = $2,
+             external_message_id = COALESCE($3, external_message_id),
+             error = $4,
+             skip_reason = $5,
+             sent_at = CASE WHEN $2 = 'sent' THEN now() ELSE sent_at END
+         WHERE id = $1`,
+        [recipientId, update.status, update.externalMessageId ?? null, update.error ?? null, update.skipReason ?? null]
+      );
+    });
+  },
+  async updateByExternalMessageId(
+    tenantId: string,
+    externalMessageId: string,
+    status: "delivered" | "read" | "failed",
+    error?: string
+  ): Promise<{ campaignId: string | undefined }> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<{ campaign_id: string }>(
+        `UPDATE campaign_recipients
+         SET status = $2,
+             error = $3,
+             delivered_at = CASE WHEN $2 = 'delivered' THEN now() ELSE delivered_at END,
+             read_at      = CASE WHEN $2 = 'read'      THEN now() ELSE read_at      END
+         WHERE external_message_id = $1
+         RETURNING campaign_id`,
+        [externalMessageId, status, error ?? null]
+      );
+      return { campaignId: result.rows[0]?.campaign_id };
+    });
+  },
+  async listByCampaign(
+    tenantId: string,
+    campaignId: string,
+    opts?: { limit?: number; status?: string }
+  ): Promise<CampaignRecipient[]> {
+    const limit = Math.min(opts?.limit ?? 200, 1000);
+    return withTenant(tenantId, async (client) => {
+      const params: unknown[] = [campaignId];
+      let where = "campaign_id = $1";
+      if (opts?.status) {
+        params.push(opts.status);
+        where += ` AND status = $${params.length}`;
+      }
+      params.push(limit);
+      const result = await client.query<CampaignRecipientRow>(
+        `SELECT id, tenant_id, campaign_id, contact_id, phone_e164, status,
+                external_message_id, error, skip_reason, sent_at, delivered_at, read_at, created_at
+         FROM campaign_recipients WHERE ${where}
+         ORDER BY created_at ASC LIMIT $${params.length}`,
+        params
+      );
+      return result.rows.map(mapRecipient);
+    });
+  },
+  async funnelCounts(tenantId: string, campaignId: string): Promise<Record<string, number>> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<{ status: string; count: string }>(
+        `SELECT status, COUNT(*)::text AS count
+         FROM campaign_recipients WHERE campaign_id = $1 GROUP BY status`,
+        [campaignId]
+      );
+      const counts: Record<string, number> = {};
+      for (const row of result.rows) {
+        counts[row.status] = Number(row.count);
+      }
+      return counts;
+    });
+  },
+  /** Returns next batch of pending recipients to fan-out (cursor-based pagination). */
+  async claimPendingBatch(tenantId: string, campaignId: string, batchSize: number): Promise<CampaignRecipient[]> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<CampaignRecipientRow>(
+        `SELECT id, tenant_id, campaign_id, contact_id, phone_e164, status,
+                external_message_id, error, skip_reason, sent_at, delivered_at, read_at, created_at
+         FROM campaign_recipients
+         WHERE campaign_id = $1 AND status = 'pending'
+         ORDER BY created_at ASC
+         LIMIT $2
+         FOR UPDATE SKIP LOCKED`,
+        [campaignId, batchSize]
+      );
+      return result.rows.map(mapRecipient);
+    });
+  }
+};
+
+// ─── Auto-reply rules ──────────────────────────────────────────────────────────
+
+interface AutoReplyRuleRow {
+  id: string;
+  tenant_id: string;
+  match_type: string;
+  keyword: string | null;
+  reply_kind: string;
+  reply_text: string | null;
+  enabled: boolean;
+  priority: number;
+  created_at: Date;
+}
+
+function mapAutoReplyRule(row: AutoReplyRuleRow): AutoReplyRule {
+  return {
+    id: row.id,
+    tenantId: row.tenant_id,
+    matchType: row.match_type as AutoReplyRule["matchType"],
+    keyword: row.keyword ?? undefined,
+    replyKind: row.reply_kind as AutoReplyRule["replyKind"],
+    replyText: row.reply_text ?? undefined,
+    enabled: row.enabled,
+    priority: row.priority,
+    createdAt: row.created_at.toISOString()
+  };
+}
+
+export const autoReplyRuleRepository = {
+  async create(
+    tenantId: string,
+    input: {
+      matchType?: AutoReplyRule["matchType"];
+      keyword?: string;
+      replyKind?: AutoReplyRule["replyKind"];
+      replyText?: string;
+      enabled?: boolean;
+      priority?: number;
+    }
+  ): Promise<AutoReplyRule> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<AutoReplyRuleRow>(
+        `INSERT INTO auto_reply_rules (tenant_id, match_type, keyword, reply_kind, reply_text, enabled, priority)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         RETURNING id, tenant_id, match_type, keyword, reply_kind, reply_text, enabled, priority, created_at`,
+        [
+          tenantId,
+          input.matchType ?? "keyword",
+          input.keyword ?? null,
+          input.replyKind ?? "text",
+          input.replyText ?? null,
+          input.enabled ?? true,
+          input.priority ?? 0
+        ]
+      );
+      return mapAutoReplyRule(result.rows[0]!);
+    });
+  },
+  async list(tenantId: string): Promise<AutoReplyRule[]> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<AutoReplyRuleRow>(
+        "SELECT id, tenant_id, match_type, keyword, reply_kind, reply_text, enabled, priority, created_at FROM auto_reply_rules ORDER BY priority DESC, created_at ASC"
+      );
+      return result.rows.map(mapAutoReplyRule);
+    });
+  },
+  async listEnabled(tenantId: string): Promise<AutoReplyRule[]> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<AutoReplyRuleRow>(
+        "SELECT id, tenant_id, match_type, keyword, reply_kind, reply_text, enabled, priority, created_at FROM auto_reply_rules WHERE enabled = true ORDER BY priority DESC, created_at ASC"
+      );
+      return result.rows.map(mapAutoReplyRule);
+    });
+  },
+  async setEnabled(tenantId: string, id: string, enabled: boolean): Promise<void> {
+    await withTenant(tenantId, async (client) => {
+      await client.query("UPDATE auto_reply_rules SET enabled = $2 WHERE id = $1", [id, enabled]);
+    });
+  }
+};
+
+// ─── Contact imports ────────────────────────────────────────────────────────────
+
+export const contactImportRepository = {
+  async create(
+    tenantId: string,
+    input: { filename?: string; total: number; created: number; updated: number; skipped: number }
+  ): Promise<{ id: string }> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<{ id: string }>(
+        `INSERT INTO contact_imports (tenant_id, filename, total, created_count, updated_count, skipped_count)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+        [tenantId, input.filename ?? null, input.total, input.created, input.updated, input.skipped]
+      );
+      return { id: result.rows[0]!.id };
+    });
+  }
+};
+
+// ─── Link clicks ────────────────────────────────────────────────────────────────
+
+export const linkClickRepository = {
+  async create(
+    tenantId: string,
+    input: { token: string; destination: string; campaignId?: string; contactId?: string }
+  ): Promise<void> {
+    await withTenant(tenantId, async (client) => {
+      await client.query(
+        `INSERT INTO link_clicks (tenant_id, token, destination, campaign_id, contact_id)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (token) DO NOTHING`,
+        [tenantId, input.token, input.destination, input.campaignId ?? null, input.contactId ?? null]
+      );
+    });
+  },
+  async recordClick(token: string): Promise<{ destination: string; tenantId: string } | undefined> {
+    const result = await query<{ destination: string; tenant_id: string }>(
+      `UPDATE link_clicks
+       SET clicked_count = clicked_count + 1,
+           first_clicked_at = COALESCE(first_clicked_at, now()),
+           last_clicked_at = now()
+       WHERE token = $1
+       RETURNING destination, tenant_id`,
+      [token]
+    );
+    const row = result.rows[0];
+    return row ? { destination: row.destination, tenantId: row.tenant_id } : undefined;
+  }
+};

@@ -17,12 +17,19 @@ export interface KeycloakConfig {
   audience: string;
 }
 
+export interface RedisConfig {
+  host: string;
+  port: number;
+  password: string;
+}
+
 export interface PlatformConfig {
   nodeEnv: string;
   logLevel: string;
   platformBaseUrl: string;
   database: DatabaseConfig;
   keycloak: KeycloakConfig;
+  redis: RedisConfig;
   authEnabled: boolean;
   eventBus: "rabbitmq" | "memory";
   rabbitmqUrl: string;
@@ -119,6 +126,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PlatformConfig
       issuer: keycloakIssuer,
       jwksUri: env.KEYCLOAK_JWKS_URI ?? `${keycloakIssuer}/protocol/openid-connect/certs`,
       audience: env.KEYCLOAK_AUDIENCE ?? "hyfib-platform"
+    },
+    redis: {
+      host: env.REDIS_HOST ?? "redis-master",
+      port: parseNumber("REDIS_PORT", env.REDIS_PORT, 6379),
+      password: env.REDIS_PASSWORD ?? ""
     },
     authEnabled: parseBoolean(env.AUTH_ENABLED, true),
     eventBus: (env.EVENT_BUS ?? "rabbitmq") === "memory" ? "memory" : "rabbitmq",

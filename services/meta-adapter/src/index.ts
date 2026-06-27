@@ -21,10 +21,13 @@ import {
   type WhatsAppTextSendRequest
 } from "@hyfib/shared-core";
 import {
+  buildCatalogMessage,
+  buildFlowMessage,
   buildInteractiveBody,
   buildMarkReadBody,
   buildMediaBody,
   buildMediaUploadForm,
+  buildProductMessage,
   buildTemplateBody,
   buildTextBody,
   extractTemplateBody,
@@ -304,6 +307,106 @@ const server = createServer(async (req, res) => {
       buttons: payload.buttons,
       buttonLabel: payload.buttonLabel,
       sections: payload.sections
+    });
+    await dispatchSend(res, ctx.requestId, payload.phoneNumberId, graphBody, payload.accessToken);
+    return;
+  }
+
+  if (path === "/internal/v1/whatsapp/send-product") {
+    if (method !== "POST") {
+      methodNotAllowed(res);
+      return;
+    }
+    const payload = await readJsonBody<{
+      phoneNumberId?: string;
+      to?: string;
+      catalogId?: string;
+      productRetailerId?: string;
+      bodyText?: string;
+      accessToken?: string;
+    }>(req);
+    if (!payload.phoneNumberId || !payload.to || !payload.catalogId || !payload.productRetailerId) {
+      sendJson(res, 400, { error: "phoneNumberId, to, catalogId and productRetailerId are required" });
+      return;
+    }
+    const graphBody = buildProductMessage({
+      to: payload.to,
+      catalogId: payload.catalogId,
+      productRetailerId: payload.productRetailerId,
+      bodyText: payload.bodyText
+    });
+    await dispatchSend(res, ctx.requestId, payload.phoneNumberId, graphBody, payload.accessToken);
+    return;
+  }
+
+  if (path === "/internal/v1/whatsapp/send-catalog") {
+    if (method !== "POST") {
+      methodNotAllowed(res);
+      return;
+    }
+    const payload = await readJsonBody<{
+      phoneNumberId?: string;
+      to?: string;
+      catalogId?: string;
+      sections?: Array<{ title: string; productItems: Array<{ productRetailerId: string }> }>;
+      headerText?: string;
+      bodyText?: string;
+      footerText?: string;
+      accessToken?: string;
+    }>(req);
+    if (!payload.phoneNumberId || !payload.to || !payload.catalogId || !payload.sections?.length) {
+      sendJson(res, 400, { error: "phoneNumberId, to, catalogId and sections are required" });
+      return;
+    }
+    const graphBody = buildCatalogMessage({
+      to: payload.to,
+      catalogId: payload.catalogId,
+      sections: payload.sections,
+      headerText: payload.headerText,
+      bodyText: payload.bodyText,
+      footerText: payload.footerText
+    });
+    await dispatchSend(res, ctx.requestId, payload.phoneNumberId, graphBody, payload.accessToken);
+    return;
+  }
+
+  if (path === "/internal/v1/whatsapp/send-flow") {
+    if (method !== "POST") {
+      methodNotAllowed(res);
+      return;
+    }
+    const payload = await readJsonBody<{
+      phoneNumberId?: string;
+      to?: string;
+      flowId?: string;
+      flowToken?: string;
+      bodyText?: string;
+      ctaButtonText?: string;
+      headerText?: string;
+      footerText?: string;
+      mode?: "draft" | "published";
+      accessToken?: string;
+    }>(req);
+    if (
+      !payload.phoneNumberId ||
+      !payload.to ||
+      !payload.flowId ||
+      !payload.flowToken ||
+      !payload.bodyText ||
+      !payload.ctaButtonText
+    ) {
+      sendJson(res, 400, { error: "phoneNumberId, to, flowId, flowToken, bodyText and ctaButtonText are required" });
+      return;
+    }
+    const graphBody = buildFlowMessage({
+      to: payload.to,
+      flowId: payload.flowId,
+      flowToken: payload.flowToken,
+      bodyText: payload.bodyText,
+      ctaButtonText: payload.ctaButtonText,
+      headerText: payload.headerText,
+      footerText: payload.footerText,
+      mode: payload.mode
     });
     await dispatchSend(res, ctx.requestId, payload.phoneNumberId, graphBody, payload.accessToken);
     return;
