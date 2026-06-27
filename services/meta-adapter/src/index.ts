@@ -564,9 +564,14 @@ const server = createServer(async (req, res) => {
     }
     const query = parseQuery(req.url);
     const wabaId = query.get("wabaId") ?? config.whatsappWabaId;
-    const accessToken = query.get("accessToken") ?? undefined;
+    const accessToken = query.get("accessToken") ?? config.whatsappAccessToken ?? undefined;
     if (!wabaId) {
       sendJson(res, 400, { error: "wabaId is required" });
+      return;
+    }
+    // No token — cannot call Meta API; return empty list so callers degrade gracefully.
+    if (!accessToken) {
+      sendJson(res, 200, { items: [], warning: "no_access_token" });
       return;
     }
     try {
@@ -596,7 +601,7 @@ const server = createServer(async (req, res) => {
       sendJson(res, 200, { items: templates });
     } catch (error) {
       sendJson(res, 503, {
-        error: "meta_adapter_unavailable",
+        error: "meta_templates_failed",
         details: error instanceof Error ? error.message : String(error)
       });
     }

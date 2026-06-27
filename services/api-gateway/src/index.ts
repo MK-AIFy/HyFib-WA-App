@@ -400,9 +400,19 @@ async function syncTemplates(
   let items: MetaTemplateItem[];
   try {
     const response = await fetch(url, { headers: { "x-tenant-id": tenantId, "x-request-id": randomUUID() } });
-    const body = (await response.json()) as { items?: MetaTemplateItem[]; error?: string };
+    const body = (await response.json()) as { items?: MetaTemplateItem[]; error?: string; warning?: string };
     if (!response.ok) {
       return { status: 502, body: { error: "template_sync_failed", detail: body.error ?? "meta error" } };
+    }
+    if (body.warning === "no_access_token") {
+      return {
+        status: 200,
+        body: {
+          synced: 0,
+          warning:
+            "No WhatsApp access token configured — add a permanent token in Settings to sync templates from Meta."
+        }
+      };
     }
     items = body.items ?? [];
   } catch (error) {

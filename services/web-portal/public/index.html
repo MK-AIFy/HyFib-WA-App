@@ -721,6 +721,10 @@
         border-color: var(--danger);
         color: var(--danger);
       }
+      #toast.twarn {
+        border-color: var(--warn);
+        color: var(--warn);
+      }
       .row {
         display: flex;
         gap: 8px;
@@ -839,7 +843,7 @@
       function toast(msg, type) {
         const el = document.getElementById("toast");
         el.textContent = msg;
-        el.className = "show" + (type === "ok" ? " tok" : type === "err" ? " terr" : "");
+        el.className = "show" + (type === "ok" ? " tok" : type === "err" ? " terr" : type === "warn" ? " twarn" : "");
         clearTimeout(_tt);
         _tt = setTimeout(() => (el.className = ""), 3500);
       }
@@ -1955,8 +1959,12 @@
         toast("Syncing…");
         try {
           const r = await POST("/channels/whatsapp/" + S.channelId + "/sync-templates", {});
-          toast("Synced " + (r.synced || 0) + " template(s)", "ok");
-          loadTemplates();
+          if (r.warning) {
+            toast(r.warning, "warn");
+          } else {
+            toast("Synced " + (r.synced || 0) + " template(s)", "ok");
+            loadTemplates();
+          }
         } catch (e) {
           toast(e.message, "err");
         }
