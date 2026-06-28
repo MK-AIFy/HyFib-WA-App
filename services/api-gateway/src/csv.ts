@@ -46,6 +46,8 @@ function parseCsvLine(line: string): string[] {
 }
 
 const TRUTHY = new Set(["1", "true", "yes", "y", "on"]);
+const MAX_CSV_ROWS = 50_000;
+const MAX_TAG_LENGTH = 100;
 
 /**
  * Parses CSV bytes into structured contact rows.
@@ -82,6 +84,10 @@ export function parseCsv(buffer: Buffer): { rows: ParsedCsvRow[]; errors: string
   const errors: string[] = [];
 
   for (let i = 1; i < rawLines.length; i++) {
+    if (rows.length >= MAX_CSV_ROWS) {
+      errors.push(`Import truncated at ${MAX_CSV_ROWS} rows; subsequent rows were ignored`);
+      break;
+    }
     const fields = parseCsvLine(rawLines[i]!);
     const phone = fields[phoneIdx]?.trim();
     if (!phone) {
@@ -96,7 +102,7 @@ export function parseCsv(buffer: Buffer): { rows: ParsedCsvRow[]; errors: string
     const tags = tagsRaw
       ? tagsRaw
           .split("|")
-          .map((t) => t.trim())
+          .map((t) => t.trim().slice(0, MAX_TAG_LENGTH))
           .filter(Boolean)
       : [];
     const consentRaw = consentIdx !== -1 ? fields[consentIdx]?.trim().toLowerCase() : undefined;
@@ -113,3 +119,37 @@ export function parseCsv(buffer: Buffer): { rows: ParsedCsvRow[]; errors: string
 
   return { rows, errors };
 }
+
+/** Escapes a value for CSV output, quoting when it contains a delimiter/quote/newline. */
+function csvCell(value: string | undefined): string {
+  const s = value ?? "";
+  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+export interface ExportableContact {
+  phoneE164: string;
+  firstName?: string;
+  lastName?: string;
+  country?: string;
+  timezone?: string;
+  tags: string[];
+  optedOut: boolean;
+}
+
+/** Serializes contacts to the same column shape the importer accepts. */
+export function serializeContactsCsv(contacts: readonly ExportableContact[]): string {
+  const header = "phone_e164,first_name,last_name,country,timezone,tags,opted_out";
+  const lines = contacts.map((c) =>
+    [
+      csvCell(c.phoneE164),
+      csvCell(c.firstName),
+      csvCell(c.lastName),
+      csvCell(c.country),
+      csvCell(c.timezone),
+      csvCell((c.tags ?? []).join("|")),
+      c.optedOut ? "true" : "false"
+    ].join(",")
+  );
+  return [header, ...lines].join("\n");
+}
+

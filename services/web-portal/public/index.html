@@ -811,6 +811,7 @@
   <body>
     <div id="root"></div>
     <div id="toast"></div>
+    <script type="module" src="/lib.mjs"></script>
     <script>
       // ═══════════════════ STATE ═══════════════════
       const S = {
@@ -833,11 +834,7 @@
       };
 
       // ═══════════════════ UTILS ═══════════════════
-      function esc(s) {
-        return s == null
-          ? ""
-          : String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-      }
+      // esc/fmtTime/pagerHtml/buildQuery are provided by /lib.mjs (attached to window).
 
       let _tt;
       function toast(msg, type) {
@@ -846,18 +843,6 @@
         el.className = "show" + (type === "ok" ? " tok" : type === "err" ? " terr" : type === "warn" ? " twarn" : "");
         clearTimeout(_tt);
         _tt = setTimeout(() => (el.className = ""), 3500);
-      }
-
-      function fmtTime(ts) {
-        if (!ts) return "";
-        let d;
-        if (typeof ts === "number" && ts < 2e10) d = new Date(ts * 1000);
-        else d = new Date(ts);
-        if (isNaN(d)) return "";
-        const now = new Date();
-        if (d.toDateString() === now.toDateString())
-          return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-        return d.toLocaleDateString([], { month: "short", day: "numeric" });
       }
 
       function bdg(text, type) {
@@ -978,6 +963,10 @@
       function onSSE(data) {
         const pl = data.payload || {};
         const topic = data.topic || "";
+        if (topic === "task.reminder") {
+          toast("⏰ Reminder: " + (pl.title || "Task due"), "ok");
+          return;
+        }
         if (S.view === "inbox") {
           loadConvList();
         }
@@ -1133,7 +1122,14 @@
           { id: "contacts", icon: "👥", label: "Contacts" },
           { id: "segments", icon: "🎯", label: "Segments" },
           { id: "campaigns", icon: "📢", label: "Campaigns" },
+          { id: "tasks", icon: "✅", label: "Tasks" },
+          { id: "automation", icon: "⚡", label: "Automation" },
+          { id: "teams", icon: "🤝", label: "Teams" },
           { id: "analytics", icon: "📊", label: "Analytics" },
+          { id: "reports", icon: "📈", label: "Reports" },
+          { id: "usage", icon: "💰", label: "Usage" },
+          { id: "ai", icon: "🤖", label: "AI Tools" },
+          { id: "tenants", icon: "🏢", label: "Tenants" },
           { id: "settings", icon: "⚙️", label: "Settings" }
         ];
         document.getElementById("root").innerHTML =
@@ -1208,7 +1204,14 @@
           contacts: renderContacts,
           segments: renderSegments,
           campaigns: renderCampaigns,
+          tasks: renderTasks,
+          automation: renderAutomation,
+          teams: renderTeams,
           analytics: renderAnalytics,
+          reports: renderReports,
+          usage: renderUsage,
+          ai: renderAI,
+          tenants: renderTenants,
           settings: renderSettings
         })[v]?.();
       }
@@ -1236,7 +1239,7 @@
           "</div>" +
           "</div>" +
           '<div class="cl-filters">' +
-          '<select title="Filter by state" onchange="S.convFilter.state=this.value;loadConvList()">' +
+          '<select title="Filter by state" onchange="S.convFilter.state=this.value;S.convOffset=0;loadConvList()">' +
           '<option value="">All states</option>' +
           '<option value="open">Open</option>' +
           '<option value="pending">Pending</option>' +
@@ -1259,10 +1262,12 @@
         const el = document.getElementById("conv-scroll");
         if (!el) return;
         try {
-          const qs = [];
+          const qs = ["offset=" + (S.convOffset || 0)];
           if (S.convFilter.state) qs.push("state=" + encodeURIComponent(S.convFilter.state));
-          const d = await GET("/conversations" + (qs.length ? "?" + qs.join("&") : ""));
+          const d = await GET("/conversations?" + qs.join("&"));
           S.conversations = d.items || [];
+          S.convTotal = d.total || 0;
+          S.convLimit = d.limit || 25;
           if (!S.conversations.length) {
             el.innerHTML = empty("📭", "No conversations yet.");
             return;
@@ -1280,7 +1285,7 @@
                 "','" +
                 esc(c.contactPhone || "") +
                 "','" +
-                esc(c.contactName || "") +
+                jsStr(c.contactName || "") +
                 "')\">" +
                 '<span class="ci-time">' +
                 fmtTime(c.updatedAt || c.createdAt) +
@@ -1298,10 +1303,16 @@
                 "</div>"
               );
             })
-            .join("");
+            .join("") +
+            pagerHtml("convPage", S.convTotal || 0, S.convOffset || 0, S.convLimit || 25, S.conversations.length);
         } catch (e) {
           if (el) el.innerHTML = '<div class="alert alert-err" style="margin:10px">' + esc(e.message) + "</div>";
         }
+      }
+
+      function convPage(dir) {
+        S.convOffset = Math.max(0, (S.convOffset || 0) + dir * 25);
+        loadConvList();
       }
 
       async function selectConv(id, phone, name) {
@@ -1321,6 +1332,12 @@
           '<button class="btn btn-secondary btn-sm" onclick="assignConv(\'' +
           id +
           "')\">👤 Assign</button>" +
+          '<button class="btn btn-secondary btn-sm" onclick="assignConvTeam(\'' +
+          id +
+          "')\">🤝 Team</button>" +
+          '<button class="btn btn-secondary btn-sm" onclick="addConvNote(\'' +
+          id +
+          "')\">📝 Note</button>" +
           "<select onchange=\"changeConvState('" +
           id +
           '\',this.value)" style="background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:7px;font-size:12px">' +
@@ -1337,6 +1354,7 @@
           loading() +
           "</div>" +
           '<div id="input-row">' +
+          '<button class="btn btn-secondary" onclick="showSavedReplies()" style="flex-shrink:0" title="Saved replies">💬</button>' +
           '<textarea id="msg-input" rows="1" placeholder="Type a reply… (Enter to send, Shift+Enter newline)" onkeydown="msgKey(event)"></textarea>' +
           '<button class="btn btn-primary" onclick="sendMsg()" style="flex-shrink:0">Send</button>' +
           "</div>";
@@ -1429,6 +1447,79 @@
         );
       }
 
+      async function assignConvTeam(convId) {
+        const d = await GET("/teams").catch(() => ({ items: [] }));
+        const teams = d.items || [];
+        showModal(
+          "Assign to Team",
+          '<div class="field"><label>Team</label><select id="as-tid">' +
+            '<option value="">Unassigned</option>' +
+            teams.map((t) => '<option value="' + t.id + '">' + esc(t.name) + "</option>").join("") +
+            "</select></div>",
+          null,
+          {
+            submit: "Assign",
+            onOk: async () => {
+              const tid = document.getElementById("as-tid").value || null;
+              await POST("/conversations/" + convId + "/assign-team", { teamId: tid });
+              toast("Team assigned", "ok");
+              loadConvList();
+            }
+          }
+        );
+      }
+
+      async function showSavedReplies() {
+        const d = await GET("/saved-replies").catch(() => ({ items: [] }));
+        const replies = d.items || [];
+        const list = replies.length
+          ? replies
+              .map(
+                (r) =>
+                  '<div style="border:1px solid var(--border);border-radius:7px;padding:8px;margin-bottom:6px;cursor:pointer" onclick="insertSavedReply(' +
+                  JSON.stringify(r.body).replace(/"/g, "&quot;") +
+                  ')"><b>' +
+                  esc(r.title) +
+                  '</b><div style="color:var(--muted);font-size:12px;margin-top:3px">' +
+                  esc(r.body.slice(0, 90)) +
+                  "</div></div>"
+              )
+              .join("")
+          : '<span style="color:var(--muted);font-size:12px">No saved replies. Create one below.</span>';
+        showModal(
+          "Saved Replies",
+          "<div>" +
+            list +
+            '</div><hr style="border:none;border-top:1px solid var(--border);margin:12px 0" />' +
+            '<div class="field"><label>New reply title</label><input id="sr-title" placeholder="Greeting" /></div>' +
+            '<div class="field"><label>Body</label><textarea id="sr-body" style="min-height:60px"></textarea></div>',
+          null,
+          {
+            submit: "Save Reply",
+            onOk: async () => {
+              const title = document.getElementById("sr-title").value.trim();
+              const body = document.getElementById("sr-body").value.trim();
+              if (!title || !body) {
+                toast("Title and body required", "err");
+                return false;
+              }
+              await POST("/saved-replies", { title, body });
+              toast("Saved", "ok");
+              return false;
+            }
+          }
+        );
+      }
+
+      function insertSavedReply(body) {
+        const inp = document.getElementById("msg-input");
+        if (inp) {
+          inp.value = inp.value ? inp.value + " " + body : body;
+          inp.focus();
+        }
+        closeModal();
+      }
+
       async function changeConvState(convId, state) {
         try {
           await POST("/conversations/" + convId + "/state", { state });
@@ -1437,6 +1528,43 @@
         } catch (e) {
           toast(e.message, "err");
         }
+      }
+
+      async function addConvNote(convId) {
+        const d = await GET("/conversations/" + convId + "/notes").catch(() => ({ items: [] }));
+        const items = d.items || [];
+        showModal(
+          "Internal Notes",
+          '<div id="cv-notes" style="margin-bottom:10px">' +
+            (items.length
+              ? items
+                  .map(
+                    (n) =>
+                      '<div style="border:1px solid var(--border);border-radius:7px;padding:6px 9px;margin-bottom:5px;font-size:12px">' +
+                      esc(n.note) +
+                      '<div class="mt" style="color:var(--muted)">' +
+                      fmtTime(n.createdAt) +
+                      "</div></div>"
+                  )
+                  .join("")
+              : '<span style="color:var(--muted);font-size:12px">No internal notes yet</span>') +
+            "</div>" +
+            '<div class="field"><label>Add internal note (not sent to customer)</label><textarea id="cv-note" style="min-height:60px"></textarea></div>',
+          null,
+          {
+            submit: "Save Note",
+            onOk: async () => {
+              const note = document.getElementById("cv-note").value.trim();
+              if (!note) {
+                toast("Note is required", "err");
+                return false;
+              }
+              await POST("/conversations/" + convId + "/notes", { note });
+              toast("Note saved", "ok");
+              return false;
+            }
+          }
+        );
       }
 
       // Auto-reply rules
@@ -1528,25 +1656,71 @@
           '<div class="pv">' +
           '<div class="pv-head"><div><h2>Contacts</h2><div class="sub">Manage customers and consent</div></div>' +
           '<div class="acts">' +
+          '<button class="btn btn-secondary btn-sm" onclick="exportContacts()">📥 Export CSV</button>' +
           '<button class="btn btn-secondary btn-sm" onclick="showImportCsv()">📤 Import CSV</button>' +
           '<button class="btn btn-primary btn-sm" onclick="showAddContact()">+ Add Contact</button>' +
           "</div>" +
           "</div>" +
-          '<div class="card"><div id="ct-wrap">' +
+          '<div class="card"><div style="margin-bottom:10px"><input id="ct-search" placeholder="Search name or phone…" oninput="onContactSearch()" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:8px 11px;border-radius:7px;font-size:13px" /></div><div id="ct-wrap">' +
           loading() +
           "</div></div>" +
           "</div>";
         loadContacts();
       }
 
+      let ctSearchTimer = null;
+      function onContactSearch() {
+        clearTimeout(ctSearchTimer);
+        ctSearchTimer = setTimeout(() => {
+          S.ctOffset = 0;
+          loadContacts();
+        }, 250);
+      }
+
+      function contactsPage(dir) {
+        const limit = 25;
+        S.ctOffset = Math.max(0, (S.ctOffset || 0) + dir * limit);
+        loadContacts();
+      }
+
+      async function exportContacts() {
+        try {
+          const term = (document.getElementById("ct-search") || {}).value;
+          const qs = term && term.trim() ? "?q=" + encodeURIComponent(term.trim()) : "";
+          const res = await fetch("/api/v1/contacts/export" + qs, {
+            headers: { "x-role": S.role, "x-actor-id": "portal-user", "x-tenant-id": S.tenantId }
+          });
+          if (!res.ok) {
+            toast("Export failed (" + res.status + ")", "err");
+            return;
+          }
+          const blob = await res.blob();
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = "contacts.csv";
+          a.click();
+          URL.revokeObjectURL(url);
+          toast("Exported", "ok");
+        } catch (e) {
+          toast(e.message, "err");
+        }
+      }
+
       async function loadContacts() {
         const el = document.getElementById("ct-wrap");
         if (!el) return;
         try {
-          const d = await GET("/contacts");
+          const term = (document.getElementById("ct-search") || {}).value;
+          const offset = S.ctOffset || 0;
+          const params = ["offset=" + offset];
+          if (term && term.trim()) params.push("q=" + encodeURIComponent(term.trim()));
+          const d = await GET("/contacts?" + params.join("&"));
           S.contacts = d.items || [];
+          const total = d.total || 0;
+          const limit = d.limit || 25;
           if (!S.contacts.length) {
-            el.innerHTML = empty("👥", "No contacts yet. Import a CSV or add manually.");
+            el.innerHTML = empty("👥", "No contacts found.");
             return;
           }
           el.innerHTML =
@@ -1569,6 +1743,9 @@
                   (c.optedOut ? bdg("opted out", "red") : bdg("active", "green")) +
                   "</td>" +
                   '<td style="display:flex;gap:5px;flex-wrap:wrap;padding:6px 11px">' +
+                  '<button class="btn btn-secondary btn-sm" onclick="showContactProfile(\'' +
+                  c.id +
+                  "')\">👤 Profile</button>" +
                   '<button class="btn btn-secondary btn-sm" onclick="grantConsent(\'' +
                   c.id +
                   "')\">✓ Consent</button>" +
@@ -1699,6 +1876,134 @@
         }
       }
 
+      async function showContactProfile(id) {
+        const c = S.contacts.find((x) => x.id === id) || {};
+        const name = ((c.firstName || "") + " " + (c.lastName || "")).trim() || c.phoneE164 || "Contact";
+        showModal(
+          "👤 " + esc(name),
+          '<div class="sub" style="margin-bottom:10px">' +
+            esc(c.phoneE164 || "") +
+            " " +
+            (c.optedOut ? bdg("opted out", "red") : bdg("active", "green")) +
+            "</div>" +
+            '<div class="field"><label>Tags</label><div id="cp-tags" style="margin-bottom:6px">' +
+            ((c.tags || []).map((t) => bdg(t, "blue")).join(" ") || '<span style="color:var(--muted)">No tags</span>') +
+            "</div>" +
+            '<div style="display:flex;gap:6px"><input id="cp-tag" placeholder="Add tag…" style="flex:1;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:6px 9px;border-radius:7px;font-size:12px" />' +
+            '<button class="btn btn-secondary btn-sm" onclick="addContactTag(\'' +
+            id +
+            "')\">+ Tag</button></div></div>" +
+            '<div class="field"><label>Custom fields</label><div id="cp-fields" style="margin-bottom:6px">' +
+            (Object.keys(c.customFields || {}).length
+              ? Object.entries(c.customFields)
+                  .map(
+                    ([k, v]) =>
+                      '<div style="font-size:12px;display:flex;justify-content:space-between;border:1px solid var(--border);border-radius:7px;padding:4px 8px;margin-bottom:4px"><span><b>' +
+                      esc(k) +
+                      "</b>: " +
+                      esc(v) +
+                      '</span><span style="cursor:pointer;color:var(--muted)" onclick="setContactField(\'' +
+                      id +
+                      "','" +
+                      jsStr(k) +
+                      "',null)\">✕</span></div>"
+                  )
+                  .join("")
+              : '<span style="color:var(--muted)">No custom fields</span>') +
+            "</div>" +
+            '<div style="display:flex;gap:6px"><input id="cp-fkey" placeholder="key" style="width:35%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:6px 9px;border-radius:7px;font-size:12px" />' +
+            '<input id="cp-fval" placeholder="value" style="flex:1;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:6px 9px;border-radius:7px;font-size:12px" />' +
+            '<button class="btn btn-secondary btn-sm" onclick="addContactField(\'' +
+            id +
+            "')\">+ Field</button></div></div>" +
+            '<div class="field"><label>Notes</label><div id="cp-notes">' +
+            loading() +
+            "</div>" +
+            '<div style="display:flex;gap:6px;margin-top:6px"><input id="cp-note" placeholder="Add a note…" style="flex:1;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:6px 9px;border-radius:7px;font-size:12px" />' +
+            '<button class="btn btn-primary btn-sm" onclick="addContactNote(\'' +
+            id +
+            "')\">Save</button></div></div>",
+          null,
+          { submit: "Close", onOk: async () => {} }
+        );
+        setTimeout(() => loadContactNotes(id), 50);
+      }
+
+      async function loadContactNotes(id) {
+        const el = document.getElementById("cp-notes");
+        if (!el) return;
+        try {
+          const d = await GET("/contacts/" + id + "/notes");
+          const items = d.items || [];
+          el.innerHTML = items.length
+            ? items
+                .map(
+                  (n) =>
+                    '<div style="border:1px solid var(--border);border-radius:7px;padding:6px 9px;margin-bottom:5px;font-size:12px">' +
+                    esc(n.note) +
+                    '<div class="mt" style="color:var(--muted)">' +
+                    fmtTime(n.createdAt) +
+                    "</div></div>"
+                )
+                .join("")
+            : '<span style="color:var(--muted);font-size:12px">No notes yet</span>';
+        } catch (e) {
+          el.innerHTML = '<span style="color:var(--muted)">' + esc(e.message) + "</span>";
+        }
+      }
+
+      async function addContactNote(id) {
+        const inp = document.getElementById("cp-note");
+        const note = inp && inp.value.trim();
+        if (!note) return;
+        try {
+          await POST("/contacts/" + id + "/notes", { note });
+          inp.value = "";
+          loadContactNotes(id);
+        } catch (e) {
+          toast(e.message, "err");
+        }
+      }
+
+      async function addContactTag(id) {
+        const inp = document.getElementById("cp-tag");
+        const tag = inp && inp.value.trim();
+        if (!tag) return;
+        try {
+          await POST("/contacts/" + id + "/tags", { tag });
+          inp.value = "";
+          toast("Tagged", "ok");
+          await loadContacts();
+          const c = S.contacts.find((x) => x.id === id);
+          const tagsEl = document.getElementById("cp-tags");
+          if (tagsEl && c)
+            tagsEl.innerHTML =
+              (c.tags || []).map((t) => bdg(t, "blue")).join(" ") ||
+              '<span style="color:var(--muted)">No tags</span>';
+        } catch (e) {
+          toast(e.message, "err");
+        }
+      }
+
+      async function addContactField(id) {
+        const key = (document.getElementById("cp-fkey") || {}).value?.trim();
+        const value = (document.getElementById("cp-fval") || {}).value?.trim();
+        if (!key || !value) return;
+        await setContactField(id, key, value);
+      }
+
+      async function setContactField(id, key, value) {
+        try {
+          await api("PATCH", "/contacts/" + id + "/fields", { key, value });
+          toast(value === null ? "Field removed" : "Field saved", "ok");
+          await loadContacts();
+          closeModal();
+          showContactProfile(id);
+        } catch (e) {
+          toast(e.message, "err");
+        }
+      }
+
       // ═══════════════════ SEGMENTS ═══════════════════
       function renderSegments() {
         const el = document.getElementById("v-segments");
@@ -1747,7 +2052,7 @@
                   '<td><button class="btn btn-secondary btn-sm" onclick="previewSegment(\'' +
                   s.id +
                   "','" +
-                  esc(s.name) +
+                  jsStr(s.name) +
                   "')\">Preview</button></td>" +
                   "</tr>"
                 );
@@ -1901,8 +2206,11 @@
         const el = document.getElementById("camp-wrap");
         if (!el) return;
         try {
-          const d = await GET("/campaigns");
+          const offset = S.campOffset || 0;
+          const d = await GET("/campaigns?offset=" + offset);
           S.campaigns = d.items || [];
+          const total = d.total || 0;
+          const limit = d.limit || 25;
           if (!S.campaigns.length) {
             el.innerHTML = empty("📢", "No campaigns yet. Create one.");
             return;
@@ -1929,26 +2237,32 @@
                     ? '<button class="btn btn-primary btn-sm" onclick="runCampaign(\'' +
                       c.id +
                       "','" +
-                      esc(c.name) +
+                      jsStr(c.name) +
                       "')\">🚀 Run</button>"
                     : "") +
                   '<button class="btn btn-secondary btn-sm" onclick="showDispatch(\'' +
                   c.id +
                   "','" +
-                  esc(c.name) +
+                  jsStr(c.name) +
                   "')\">Test Send</button>" +
                   '<button class="btn btn-secondary btn-sm" onclick="showCampaignReport(\'' +
                   c.id +
                   "','" +
-                  esc(c.name) +
+                  jsStr(c.name) +
                   "')\">📊 Report</button>" +
                   "</td></tr>"
               )
               .join("") +
-            "</tbody></table>";
+            "</tbody></table>" +
+            pagerHtml("campaignsPage", total, offset, limit, S.campaigns.length);
         } catch (e) {
           if (el) el.innerHTML = '<div class="alert alert-err">' + esc(e.message) + "</div>";
         }
+      }
+
+      function campaignsPage(dir) {
+        S.campOffset = Math.max(0, (S.campOffset || 0) + dir * 25);
+        loadCampaigns();
       }
 
       async function syncTemplates() {
@@ -2235,6 +2549,350 @@
         }
       }
 
+      // ═══════════════════ TASKS ═══════════════════
+      function renderTasks() {
+        const el = document.getElementById("v-tasks");
+        el.innerHTML =
+          '<div class="pv">' +
+          '<div class="pv-head"><div><h2>Tasks</h2><div class="sub">Follow-ups and reminders</div></div>' +
+          '<button class="btn btn-primary btn-sm" onclick="showAddTask()">+ New Task</button>' +
+          "</div>" +
+          '<div class="card"><div id="tk-wrap">' +
+          loading() +
+          "</div></div>" +
+          "</div>";
+        loadTasks();
+      }
+
+      async function loadTasks() {
+        const el = document.getElementById("tk-wrap");
+        if (!el) return;
+        try {
+          const offset = S.tkOffset || 0;
+          const d = await GET("/tasks?offset=" + offset);
+          S.tasks = d.items || [];
+          const total = d.total || 0;
+          const limit = d.limit || 25;
+          if (!S.tasks.length) {
+            el.innerHTML = empty("✅", "No tasks yet. Create a follow-up or let automation add them.");
+            return;
+          }
+          el.innerHTML =
+            '<table class="tbl"><thead><tr><th>Task</th><th>Status</th><th>Due</th><th>Source</th><th>Actions</th></tr></thead><tbody>' +
+            S.tasks
+              .map((t) => {
+                const stCls = t.status === "open" ? "yellow" : t.status === "done" ? "green" : "gray";
+                return (
+                  "<tr><td><b>" +
+                  esc(t.title) +
+                  "</b></td><td>" +
+                  bdg(t.status, stCls) +
+                  '</td><td style="font-size:12px">' +
+                  (t.dueAt ? fmtTime(t.dueAt) : '<span style="color:var(--muted)">—</span>') +
+                  "</td><td>" +
+                  bdg(t.source, "blue") +
+                  '</td><td style="display:flex;gap:5px;padding:6px 11px">' +
+                  (t.status === "open"
+                    ? '<button class="btn btn-secondary btn-sm" onclick="setTaskStatus(\'' +
+                      t.id +
+                      "','done')\">✓ Done</button>" +
+                      '<button class="btn btn-danger btn-sm" onclick="setTaskStatus(\'' +
+                      t.id +
+                      "','cancelled')\">Cancel</button>"
+                    : '<span style="color:var(--muted);font-size:12px">—</span>') +
+                  "</td></tr>"
+                );
+              })
+              .join("") +
+            "</tbody></table>" +
+            pagerHtml("tasksPage", total, offset, limit, S.tasks.length);
+        } catch (e) {
+          if (el) el.innerHTML = '<div class="alert alert-err">' + esc(e.message) + "</div>";
+        }
+      }
+
+      function pagerHtml(fn, total, offset, limit, count) {
+        return window.pagerHtml(fn, total, offset, limit, count);
+      }
+
+      function tasksPage(dir) {
+        S.tkOffset = Math.max(0, (S.tkOffset || 0) + dir * 25);
+        loadTasks();
+      }
+
+      function showAddTask() {
+        showModal(
+          "New Task",
+          '<div class="field"><label>Title</label><input id="tk-title" placeholder="Follow up with customer…" /></div>' +
+            '<div class="field"><label>Due (optional)</label><input id="tk-due" type="datetime-local" /></div>',
+          null,
+          {
+            submit: "Create Task",
+            onOk: async () => {
+              const title = document.getElementById("tk-title").value.trim();
+              if (!title) {
+                toast("Title is required", "err");
+                return false;
+              }
+              const dueRaw = document.getElementById("tk-due").value;
+              await POST("/tasks", { title, dueAt: dueRaw ? new Date(dueRaw).toISOString() : undefined });
+              toast("Task created", "ok");
+              loadTasks();
+            }
+          }
+        );
+      }
+
+      async function setTaskStatus(id, status) {
+        try {
+          await api("PATCH", "/tasks/" + id, { status });
+          toast("Task " + status, "ok");
+          loadTasks();
+        } catch (e) {
+          toast(e.message, "err");
+        }
+      }
+
+      // ═══════════════════ AUTOMATION ═══════════════════
+      function renderAutomation() {
+        const el = document.getElementById("v-automation");
+        el.innerHTML =
+          '<div class="pv">' +
+          '<div class="pv-head"><div><h2>Automation</h2><div class="sub">Trigger → action rules</div></div>' +
+          '<button class="btn btn-primary btn-sm" onclick="showAddAutomation()">+ New Rule</button>' +
+          "</div>" +
+          '<div class="card"><div id="au-wrap">' +
+          loading() +
+          "</div></div>" +
+          "</div>";
+        loadAutomation();
+      }
+
+      async function loadAutomation() {
+        const el = document.getElementById("au-wrap");
+        if (!el) return;
+        try {
+          const offset = S.auOffset || 0;
+          const d = await GET("/automation-rules?offset=" + offset);
+          const rules = d.items || [];
+          const total = d.total || 0;
+          const limit = d.limit || 25;
+          if (!rules.length) {
+            el.innerHTML = empty("⚡", "No automation rules yet.");
+            return;
+          }
+          el.innerHTML =
+            '<table class="tbl"><thead><tr><th>Name</th><th>Trigger</th><th>Action</th><th>Status</th><th></th></tr></thead><tbody>' +
+            rules
+              .map(
+                (r) =>
+                  "<tr><td><b>" +
+                  esc(r.name) +
+                  "</b></td><td>" +
+                  bdg(r.triggerType, "blue") +
+                  "</td><td>" +
+                  bdg(r.actionType, "green") +
+                  '</td><td><label style="display:flex;align-items:center;gap:5px;cursor:pointer"><input type="checkbox"' +
+                  (r.enabled ? " checked" : "") +
+                  " onchange=\"toggleAutomation('" +
+                  r.id +
+                  "',this.checked)\" /> Enabled</label></td><td></td></tr>"
+              )
+              .join("") +
+            "</tbody></table>" +
+            pagerHtml("automationPage", total, offset, limit, rules.length);
+        } catch (e) {
+          if (el) el.innerHTML = '<div class="alert alert-err">' + esc(e.message) + "</div>";
+        }
+      }
+
+      function automationPage(dir) {
+        S.auOffset = Math.max(0, (S.auOffset || 0) + dir * 25);
+        loadAutomation();
+      }
+
+      function showAddAutomation() {
+        showModal(
+          "New Automation Rule",
+          '<div class="field"><label>Name</label><input id="au-name" placeholder="Tag VIPs on keyword" /></div>' +
+            '<div class="field"><label>Trigger</label><select id="au-trig"><option value="new_message">New message</option><option value="tag_added">Tag added</option><option value="conversation_assigned">Conversation assigned</option><option value="no_reply">No reply after delay</option></select></div>' +
+            '<div class="field"><label>Condition keyword (new_message)</label><input id="au-kw" placeholder="optional" /></div>' +
+            '<div class="field"><label>Condition tag (tag_added)</label><input id="au-ctag" placeholder="optional" /></div>' +
+            '<div class="field"><label>Delay minutes (no_reply)</label><input id="au-delay" type="number" placeholder="60" /></div>' +
+            '<div class="field"><label>Action</label><select id="au-act"><option value="add_tag">Add tag</option><option value="assign_agent">Assign agent</option><option value="create_task">Create task</option><option value="send_template">Send template</option></select></div>' +
+            '<div class="field"><label>Action tag (add_tag)</label><input id="au-atag" placeholder="vip" /></div>' +
+            '<div class="field"><label>Assignee user id (assign_agent)</label><input id="au-uid" placeholder="uuid" /></div>' +
+            '<div class="field"><label>Task title (create_task)</label><input id="au-task" placeholder="Follow up" /></div>' +
+            '<div class="field"><label>Template name / language (send_template)</label><input id="au-tpl" placeholder="welcome" /> <input id="au-lang" placeholder="en_US" /></div>',
+          null,
+          {
+            submit: "Create Rule",
+            onOk: async () => {
+              const name = document.getElementById("au-name").value.trim();
+              const triggerType = document.getElementById("au-trig").value;
+              const actionType = document.getElementById("au-act").value;
+              if (!name) {
+                toast("Name is required", "err");
+                return false;
+              }
+              const conditions = {};
+              const kw = document.getElementById("au-kw").value.trim();
+              const ctag = document.getElementById("au-ctag").value.trim();
+              const delay = document.getElementById("au-delay").value.trim();
+              if (kw) conditions.keyword = kw;
+              if (ctag) conditions.tag = ctag;
+              if (delay) conditions.delayMinutes = Number(delay);
+              const actionConfig = {};
+              const atag = document.getElementById("au-atag").value.trim();
+              const uid = document.getElementById("au-uid").value.trim();
+              const task = document.getElementById("au-task").value.trim();
+              const tpl = document.getElementById("au-tpl").value.trim();
+              const lang = document.getElementById("au-lang").value.trim();
+              if (atag) actionConfig.tag = atag;
+              if (uid) actionConfig.assigneeUserId = uid;
+              if (task) actionConfig.taskTitle = task;
+              if (tpl) actionConfig.templateName = tpl;
+              if (lang) actionConfig.templateLanguage = lang;
+              await POST("/automation-rules", { name, triggerType, conditions, actionType, actionConfig });
+              toast("Rule created", "ok");
+              loadAutomation();
+            }
+          }
+        );
+      }
+
+      async function toggleAutomation(id, enabled) {
+        try {
+          await api("PATCH", "/automation-rules/" + id, { enabled });
+          toast(enabled ? "Enabled" : "Disabled", "ok");
+        } catch (e) {
+          toast(e.message, "err");
+        }
+      }
+
+      // ═══════════════════ TEAMS ═══════════════════
+      function renderTeams() {
+        const el = document.getElementById("v-teams");
+        el.innerHTML =
+          '<div class="pv">' +
+          '<div class="pv-head"><div><h2>Teams</h2><div class="sub">Group agents for inbox routing</div></div>' +
+          '<button class="btn btn-primary btn-sm" onclick="showAddTeam()">+ New Team</button>' +
+          "</div>" +
+          '<div class="card"><div id="tm-wrap">' +
+          loading() +
+          "</div></div>" +
+          "</div>";
+        loadTeams();
+      }
+
+      async function loadTeams() {
+        const el = document.getElementById("tm-wrap");
+        if (!el) return;
+        try {
+          const d = await GET("/teams");
+          const teams = d.items || [];
+          if (!teams.length) {
+            el.innerHTML = empty("🤝", "No teams yet.");
+            return;
+          }
+          el.innerHTML =
+            '<table class="tbl"><thead><tr><th>Name</th><th>Default</th><th>Actions</th></tr></thead><tbody>' +
+            teams
+              .map(
+                (t) =>
+                  "<tr><td><b>" +
+                  esc(t.name) +
+                  "</b></td><td>" +
+                  (t.isDefault ? bdg("default", "green") : "—") +
+                  '</td><td><button class="btn btn-secondary btn-sm" onclick="showTeamMembers(\'' +
+                  t.id +
+                  "','" +
+                  jsStr(t.name) +
+                  "')\">Members</button></td></tr>"
+              )
+              .join("") +
+            "</tbody></table>";
+        } catch (e) {
+          if (el) el.innerHTML = '<div class="alert alert-err">' + esc(e.message) + "</div>";
+        }
+      }
+
+      function showAddTeam() {
+        showModal(
+          "New Team",
+          '<div class="field"><label>Team name</label><input id="tm-name" placeholder="Sales" /></div>',
+          null,
+          {
+            submit: "Create Team",
+            onOk: async () => {
+              const name = document.getElementById("tm-name").value.trim();
+              if (!name) {
+                toast("Name is required", "err");
+                return false;
+              }
+              await POST("/teams", { name });
+              toast("Team created", "ok");
+              loadTeams();
+            }
+          }
+        );
+      }
+
+      async function showTeamMembers(teamId, name) {
+        const [members, users] = await Promise.all([
+          GET("/teams/" + teamId + "/members").catch(() => ({ items: [] })),
+          GET("/users").catch(() => ({ items: [] }))
+        ]);
+        const rows = (members.items || [])
+          .map(
+            (u) =>
+              '<div style="display:flex;justify-content:space-between;align-items:center;border:1px solid var(--border);border-radius:7px;padding:6px 9px;margin-bottom:5px"><span>' +
+              esc(u.displayName || u.email) +
+              '</span><button class="btn btn-danger btn-sm" onclick="removeTeamMember(\'' +
+              teamId +
+              "','" +
+              u.id +
+              "')\">Remove</button></div>"
+          )
+          .join("");
+        showModal(
+          "Members · " + esc(name),
+          '<div id="tm-members">' +
+            (rows || '<span style="color:var(--muted);font-size:12px">No members yet</span>') +
+            "</div>" +
+            '<div class="field" style="margin-top:10px"><label>Add member</label><select id="tm-uid">' +
+            (users.items || []).map((u) => '<option value="' + u.id + '">' + esc(u.displayName || u.email) + "</option>").join("") +
+            '</select></div><button class="btn btn-secondary btn-sm" onclick="addTeamMember(\'' +
+            teamId +
+            "','" +
+            jsStr(name) +
+            "')\">+ Add</button>",
+          null,
+          { submit: "Close", onOk: async () => {} }
+        );
+      }
+
+      async function addTeamMember(teamId, name) {
+        const userId = document.getElementById("tm-uid").value;
+        if (!userId) return;
+        try {
+          await POST("/teams/" + teamId + "/members", { userId });
+          showTeamMembers(teamId, name);
+        } catch (e) {
+          toast(e.message, "err");
+        }
+      }
+
+      async function removeTeamMember(teamId, userId) {
+        try {
+          await api("DELETE", "/teams/" + teamId + "/members", { userId });
+          const name = (document.querySelector("#modal h3")?.textContent || "").replace("Members · ", "");
+          showTeamMembers(teamId, name);
+        } catch (e) {
+          toast(e.message, "err");
+        }
+      }
+
       // ═══════════════════ ANALYTICS ═══════════════════
       async function renderAnalytics() {
         const el = document.getElementById("v-analytics");
@@ -2451,6 +3109,236 @@
       function closeModal() {
         const m = document.getElementById("modal-ov");
         if (m) m.remove();
+      }
+
+      // ═══════════════════ REPORTS ═══════════════════
+      async function renderReports() {
+        const el = document.getElementById("v-reports");
+        el.style.flexDirection = "column";
+        el.style.overflow = "auto";
+        el.innerHTML =
+          '<div class="pv"><div class="pv-head"><div><h2>Reports</h2><div class="sub">Cross-entity overview for your workspace</div></div></div>' +
+          '<div id="rpt-body">' + loading() + '</div></div>';
+        try {
+          const d = await GET("/reports/overview");
+          const t = d.totals || {};
+          const kpiKeys = [
+            ["conversations", "💬", "Conversations"],
+            ["contacts", "👥", "Contacts"],
+            ["templates", "📝", "Templates"],
+            ["campaigns", "📢", "Campaigns"],
+            ["messagesInbound", "📥", "Inbound Msgs"],
+            ["messagesOutbound", "📤", "Outbound Msgs"],
+            ["messagesFailed", "⚠️", "Failed Msgs"]
+          ];
+          const kpiHtml = '<div class="kpis">' +
+            kpiKeys.map(([k, icon, label]) =>
+              '<div class="kpi"><b>' + (t[k] || 0) + '</b><span>' + icon + ' ' + label + '</span></div>'
+            ).join("") +
+            '</div>';
+          const daily = d.last14Days || [];
+          const tableHtml = daily.length
+            ? '<div class="card" style="margin-top:16px"><div class="card-head"><h3>Messages — Last 14 Days</h3></div>' +
+              '<table class="tbl"><thead><tr><th>Date</th><th>Count</th></tr></thead><tbody>' +
+              daily.map(r =>
+                '<tr><td>' + esc(r.date) + '</td><td>' + r.count + '</td></tr>'
+              ).join("") +
+              '</tbody></table></div>'
+            : '<div class="card" style="margin-top:16px">' + empty("📭", "No message data yet") + '</div>';
+          document.getElementById("rpt-body").innerHTML = kpiHtml + tableHtml;
+        } catch (e) {
+          document.getElementById("rpt-body").innerHTML =
+            '<div class="alert alert-err">' + esc(e.message) + '</div>';
+        }
+      }
+
+      // ═══════════════════ USAGE ═══════════════════
+      let _usageDays = 7;
+      async function renderUsage(days) {
+        if (days !== undefined) _usageDays = days;
+        const el = document.getElementById("v-usage");
+        el.style.flexDirection = "column";
+        el.style.overflow = "auto";
+        el.innerHTML =
+          '<div class="pv"><div class="pv-head"><div><h2>Usage</h2><div class="sub">Message volume breakdown</div></div>' +
+          '<div style="display:flex;gap:8px;align-items:center">' +
+          '<label style="font-size:12px;color:var(--muted)">Period</label>' +
+          '<select style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:6px;font-size:12px" onchange="renderUsage(Number(this.value))">' +
+          [7, 14, 30, 60, 90].map(n =>
+            '<option value="' + n + '"' + (n === _usageDays ? ' selected' : '') + '>' + n + ' days</option>'
+          ).join("") +
+          '</select></div></div>' +
+          '<div id="usg-body">' + loading() + '</div></div>';
+        try {
+          const d = await GET("/usage?days=" + _usageDays);
+          const items = d.items || [];
+          if (!items.length) {
+            document.getElementById("usg-body").innerHTML = empty("📊", "No usage data for this period");
+            return;
+          }
+          document.getElementById("usg-body").innerHTML =
+            '<div class="card"><div class="card-head"><h3>Daily Breakdown</h3></div>' +
+            '<table class="tbl"><thead><tr><th>Date</th><th>Direction</th><th>Category</th><th style="text-align:right">Count</th></tr></thead><tbody>' +
+            items.map(r =>
+              '<tr><td style="white-space:nowrap">' + esc(r.date) + '</td>' +
+              '<td>' + bdg(r.direction, r.direction === 'inbound' ? 'green' : 'blue') + '</td>' +
+              '<td>' + esc(r.category) + '</td>' +
+              '<td style="text-align:right;font-weight:600">' + r.count + '</td></tr>'
+            ).join("") +
+            '</tbody></table></div>';
+        } catch (e) {
+          document.getElementById("usg-body").innerHTML =
+            '<div class="alert alert-err">' + esc(e.message) + '</div>';
+        }
+      }
+
+      // ═══════════════════ AI TOOLS ═══════════════════
+      async function renderAI() {
+        const el = document.getElementById("v-ai");
+        el.style.flexDirection = "column";
+        el.style.overflow = "auto";
+        el.innerHTML =
+          '<div class="pv"><div class="pv-head"><div><h2>AI Tools</h2><div class="sub">Campaign drafting, segment summaries, and lead scoring</div></div></div>' +
+          '<div style="display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(320px,1fr))">' +
+          // Campaign draft panel
+          '<div class="card"><div class="card-head"><h3>🎯 Campaign Draft</h3></div>' +
+          '<div class="field"><label>Goal</label><input id="ai-goal" placeholder="e.g. Re-engage lapsed customers" /></div>' +
+          '<div class="field"><label>Tone</label>' +
+          '<select id="ai-tone"><option value="professional">Professional</option><option value="friendly">Friendly</option><option value="urgent">Urgent</option></select>' +
+          '</div>' +
+          '<div class="field"><label>Audience Size</label><input id="ai-audience" type="number" placeholder="e.g. 500" /></div>' +
+          '<button class="btn btn-primary" onclick="runCampaignDraft()">Generate Draft</button>' +
+          '<div id="ai-draft-result" style="margin-top:12px"></div></div>' +
+          // Segment summary panel
+          '<div class="card"><div class="card-head"><h3>📊 Segment Summary</h3></div>' +
+          '<div class="field"><label>Segment Name</label><input id="ai-seg-name" placeholder="e.g. High-value leads" /></div>' +
+          '<div class="field"><label>Contact Count</label><input id="ai-seg-count" type="number" placeholder="e.g. 200" /></div>' +
+          '<div class="field"><label>Avg Engagement (0-1)</label><input id="ai-seg-eng" type="number" step="0.01" placeholder="e.g. 0.65" /></div>' +
+          '<button class="btn btn-primary" onclick="runSegmentSummary()">Summarise</button>' +
+          '<div id="ai-seg-result" style="margin-top:12px"></div></div>' +
+          // Lead score panel
+          '<div class="card"><div class="card-head"><h3>⭐ Lead Score</h3></div>' +
+          '<div class="field"><label>Contact ID</label><input id="ai-lead-id" placeholder="UUID or identifier" /></div>' +
+          '<div class="field"><label>Messages Sent</label><input id="ai-lead-msgs" type="number" placeholder="e.g. 12" /></div>' +
+          '<div class="field"><label>Replies</label><input id="ai-lead-replies" type="number" placeholder="e.g. 5" /></div>' +
+          '<div class="field"><label>Days Since Last Activity</label><input id="ai-lead-days" type="number" placeholder="e.g. 3" /></div>' +
+          '<button class="btn btn-primary" onclick="runLeadScore()">Score Lead</button>' +
+          '<div id="ai-lead-result" style="margin-top:12px"></div></div>' +
+          '</div></div>';
+      }
+
+      async function runCampaignDraft() {
+        const goal = document.getElementById("ai-goal")?.value?.trim();
+        const tone = document.getElementById("ai-tone")?.value;
+        const audienceSize = Number(document.getElementById("ai-audience")?.value);
+        const resultEl = document.getElementById("ai-draft-result");
+        if (!goal) { toast("Enter a campaign goal", "err"); return; }
+        resultEl.innerHTML = loading();
+        try {
+          const d = await POST("/ai/campaign-draft", { goal, tone, audienceSize: audienceSize || undefined });
+          resultEl.innerHTML =
+            '<div class="info-box" style="white-space:pre-wrap;font-size:13px">' + esc(d.draft || JSON.stringify(d, null, 2)) + '</div>';
+        } catch (e) {
+          resultEl.innerHTML = '<div class="alert alert-err">' + esc(e.message) + '</div>';
+        }
+      }
+
+      async function runSegmentSummary() {
+        const segmentName = document.getElementById("ai-seg-name")?.value?.trim();
+        const contactCount = Number(document.getElementById("ai-seg-count")?.value);
+        const avgEngagement = Number(document.getElementById("ai-seg-eng")?.value);
+        const resultEl = document.getElementById("ai-seg-result");
+        if (!segmentName) { toast("Enter a segment name", "err"); return; }
+        resultEl.innerHTML = loading();
+        try {
+          const d = await POST("/ai/segment-summary", { segmentName, contactCount: contactCount || undefined, avgEngagement: avgEngagement || undefined });
+          resultEl.innerHTML =
+            '<div class="info-box" style="white-space:pre-wrap;font-size:13px">' + esc(d.summary || JSON.stringify(d, null, 2)) + '</div>';
+        } catch (e) {
+          resultEl.innerHTML = '<div class="alert alert-err">' + esc(e.message) + '</div>';
+        }
+      }
+
+      async function runLeadScore() {
+        const contactId = document.getElementById("ai-lead-id")?.value?.trim();
+        const messagesSent = Number(document.getElementById("ai-lead-msgs")?.value);
+        const replies = Number(document.getElementById("ai-lead-replies")?.value);
+        const daysSinceLastActivity = Number(document.getElementById("ai-lead-days")?.value);
+        const resultEl = document.getElementById("ai-lead-result");
+        if (!contactId) { toast("Enter a contact ID", "err"); return; }
+        resultEl.innerHTML = loading();
+        try {
+          const d = await POST("/ai/lead-score", { contactId, messagesSent: messagesSent || undefined, replies: replies || undefined, daysSinceLastActivity: daysSinceLastActivity || undefined });
+          const score = d.score ?? d.leadScore;
+          resultEl.innerHTML = score !== undefined
+            ? '<div class="kpis"><div class="kpi"><b style="font-size:28px">' + score + '</b><span>Lead Score</span></div></div>' +
+              (d.reasoning ? '<div class="info-box" style="margin-top:8px;font-size:13px">' + esc(d.reasoning) + '</div>' : '')
+            : '<div class="info-box" style="white-space:pre-wrap;font-size:13px">' + esc(JSON.stringify(d, null, 2)) + '</div>';
+        } catch (e) {
+          resultEl.innerHTML = '<div class="alert alert-err">' + esc(e.message) + '</div>';
+        }
+      }
+
+      // ═══════════════════ TENANTS ═══════════════════
+      async function renderTenants() {
+        const el = document.getElementById("v-tenants");
+        el.style.flexDirection = "column";
+        el.style.overflow = "auto";
+        if (S.role !== "platform_owner") {
+          el.innerHTML =
+            '<div class="pv"><div class="pv-head"><div><h2>Tenants</h2></div></div>' +
+            empty("🔒", "Platform owner access required") + '</div>';
+          return;
+        }
+        el.innerHTML =
+          '<div class="pv"><div class="pv-head"><div><h2>Tenants</h2><div class="sub">All registered workspaces</div></div>' +
+          '<button class="btn btn-primary btn-sm" onclick="showCreateTenant()">+ New Tenant</button></div>' +
+          '<div id="ten-body">' + loading() + '</div></div>';
+        await loadTenants();
+      }
+
+      async function loadTenants() {
+        const bodyEl = document.getElementById("ten-body");
+        if (!bodyEl) return;
+        try {
+          const d = await GET("/tenants");
+          const items = d.items || d.tenants || [];
+          if (!items.length) {
+            bodyEl.innerHTML = empty("🏢", "No tenants yet — create one to get started");
+            return;
+          }
+          bodyEl.innerHTML =
+            '<div class="card"><div class="card-head"><h3>All Tenants (' + items.length + ')</h3></div>' +
+            '<table class="tbl"><thead><tr><th>Name</th><th>Status</th><th>ID</th><th>Created</th></tr></thead><tbody>' +
+            items.map(t =>
+              '<tr><td><b>' + esc(t.name) + '</b></td>' +
+              '<td>' + bdg(t.status || 'active', t.status === 'suspended' ? 'red' : 'green') + '</td>' +
+              '<td><code style="font-size:11px">' + esc((t.id || '').slice(0, 8)) + '…</code></td>' +
+              '<td style="color:var(--muted)">' + fmtTime(t.created_at || t.createdAt) + '</td></tr>'
+            ).join("") +
+            '</tbody></table></div>';
+        } catch (e) {
+          if (bodyEl) bodyEl.innerHTML = '<div class="alert alert-err">' + esc(e.message) + '</div>';
+        }
+      }
+
+      function showCreateTenant() {
+        showModal(
+          "Create Tenant",
+          null,
+          '<div class="field"><label>Company / Workspace Name</label><input id="new-tenant-name" placeholder="Acme Corp" autocomplete="off" /></div>',
+          {
+            submit: "Create",
+            onOk: async () => {
+              const name = document.getElementById("new-tenant-name")?.value?.trim();
+              if (!name) { toast("Name is required", "err"); return false; }
+              await POST("/tenants", { name });
+              toast("Tenant created", "ok");
+              await loadTenants();
+            }
+          }
+        );
+        setTimeout(() => document.getElementById("new-tenant-name")?.focus(), 50);
       }
 
       // ═══════════════════ BOOT ═══════════════════

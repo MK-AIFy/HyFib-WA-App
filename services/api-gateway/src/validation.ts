@@ -2,6 +2,85 @@ import type { WhatsAppInteractivePayload } from "@hyfib/shared-core";
 
 export type ValidationResult<T> = { ok: true; value: T } | { ok: false; error: string };
 
+export interface ContactListQuery {
+  query?: string;
+  tag?: string;
+  optedOut?: boolean;
+  limit: number;
+  offset: number;
+}
+
+const CONTACT_LIST_DEFAULT_LIMIT = 25;
+const CONTACT_LIST_MAX_LIMIT = 100;
+
+/** Parses and clamps the contact-list query params (search/filter/pagination). */
+export function parseContactListQuery(params: URLSearchParams): ContactListQuery {
+  const rawLimit = Number(params.get("limit"));
+  const limit =
+    Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.floor(rawLimit), CONTACT_LIST_MAX_LIMIT) : CONTACT_LIST_DEFAULT_LIMIT;
+  const rawOffset = Number(params.get("offset"));
+  const offset = Number.isFinite(rawOffset) && rawOffset > 0 ? Math.floor(rawOffset) : 0;
+  const query = params.get("q")?.trim() || undefined;
+  const tag = params.get("tag")?.trim() || undefined;
+  const optedOutRaw = params.get("optedOut");
+  const optedOut = optedOutRaw === null || optedOutRaw.trim() === "" ? undefined : optedOutRaw === "true";
+  return { query, tag, optedOut, limit, offset };
+}
+
+/** Trims and enforces a max length on a required text field. */
+export function boundedText(value: unknown, max: number): { ok: true; value: string } | { ok: false; error: string } {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return { ok: false, error: "value is required" };
+  }
+  const trimmed = value.trim();
+  if (trimmed.length > max) {
+    return { ok: false, error: `value must be at most ${max} characters` };
+  }
+  return { ok: true, value: trimmed };
+}
+
+/** Validates an optional ISO-8601 date string; returns normalized ISO or an error. */
+export function parseOptionalIsoDate(
+  value: unknown
+): { ok: true; value: string | undefined } | { ok: false; error: string } {
+  if (value === undefined || value === null || value === "") {
+    return { ok: true, value: undefined };
+  }
+  if (typeof value !== "string") {
+    return { ok: false, error: "date must be an ISO-8601 string" };
+  }
+  const ts = Date.parse(value);
+  if (!Number.isFinite(ts)) {
+    return { ok: false, error: "date must be a valid ISO-8601 string" };
+  }
+  return { ok: true, value: new Date(ts).toISOString() };
+}
+
+/** Clamps an optional integer into [min, max]; returns fallback when absent/invalid. */
+export function clampInt(value: unknown, min: number, max: number, fallback: number): number {
+  const n = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(n)) {
+    return fallback;
+  }
+  return Math.min(Math.max(Math.floor(n), min), max);
+}
+
+export interface ListQuery {
+  limit: number;
+  offset: number;
+}
+
+/** Parses and clamps generic limit/offset list pagination params. */
+export function parseListQuery(params: URLSearchParams, defaultLimit = 25, maxLimit = 100): ListQuery {
+  const rawLimit = Number(params.get("limit"));
+  const limit =
+    Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.floor(rawLimit), maxLimit) : defaultLimit;
+  const rawOffset = Number(params.get("offset"));
+  const offset = Number.isFinite(rawOffset) && rawOffset > 0 ? Math.floor(rawOffset) : 0;
+  return { limit, offset };
+}
+
+
 // Meta Cloud API limits for interactive messages.
 const BODY_TEXT_MAX = 1024;
 const HEADER_TEXT_MAX = 60;
@@ -29,6 +108,58 @@ function optionalString(value: unknown, max: number, field: string): { value?: s
     return { error: `${field} must be a non-empty string of at most ${max} characters` };
   }
   return { value };
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const RATE_PER_MINUTE_MAX = 10_000;
+const FREQUENCY_CAP_MAX_MESSAGES_MAX = 1_000;
+const FREQUENCY_CAP_PERIOD_HOURS_MAX = 168;
+
+export interface CampaignBodyInput {
+  segmentId?: unknown;
+  ratePerMinute?: unknown;
+  quietHours?: unknown;
+  frequencyCap?: unknown;
+}
+
+/** Validates campaign-creation optional fields that have no other validation layer. */
+export function validateCampaignBody(payload: CampaignBodyInput): { ok: true } | { ok: false; error: string } {
+  if (payload.segmentId !== undefined && !UUID_RE.test(String(payload.segmentId))) {
+    return { ok: false, error: "segmentId must be a valid UUID" };
+  }
+  if (payload.ratePerMinute !== undefined) {
+    const rate = Number(payload.ratePerMinute);
+    if (!Number.isInteger(rate) || rate < 1 || rate > RATE_PER_MINUTE_MAX) {
+      return { ok: false, error: `ratePerMinute must be an integer between 1 and ${RATE_PER_MINUTE_MAX}` };
+    }
+  }
+  if (payload.quietHours !== undefined) {
+    if (!payload.quietHours || typeof payload.quietHours !== "object" || Array.isArray(payload.quietHours)) {
+      return { ok: false, error: "quietHours must be an object with startHour and endHour" };
+    }
+    const qh = payload.quietHours as Record<string, unknown>;
+    const sh = qh.startHour;
+    const eh = qh.endHour;
+    if (!Number.isInteger(sh) || (sh as number) < 0 || (sh as number) > 23 ||
+        !Number.isInteger(eh) || (eh as number) < 0 || (eh as number) > 23) {
+      return { ok: false, error: "quietHours.startHour and endHour must be integers between 0 and 23" };
+    }
+  }
+  if (payload.frequencyCap !== undefined) {
+    if (!payload.frequencyCap || typeof payload.frequencyCap !== "object" || Array.isArray(payload.frequencyCap)) {
+      return { ok: false, error: "frequencyCap must be an object with maxMessages and periodHours" };
+    }
+    const fc = payload.frequencyCap as Record<string, unknown>;
+    const mm = fc.maxMessages;
+    const ph = fc.periodHours;
+    if (!Number.isInteger(mm) || (mm as number) < 1 || (mm as number) > FREQUENCY_CAP_MAX_MESSAGES_MAX) {
+      return { ok: false, error: `frequencyCap.maxMessages must be an integer between 1 and ${FREQUENCY_CAP_MAX_MESSAGES_MAX}` };
+    }
+    if (!Number.isInteger(ph) || (ph as number) < 1 || (ph as number) > FREQUENCY_CAP_PERIOD_HOURS_MAX) {
+      return { ok: false, error: `frequencyCap.periodHours must be an integer between 1 and ${FREQUENCY_CAP_PERIOD_HOURS_MAX}` };
+    }
+  }
+  return { ok: true };
 }
 
 /**

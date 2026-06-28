@@ -2,6 +2,16 @@ import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
 import type { PlatformConfig } from "@hyfib/config";
 import type { Role } from "@hyfib/shared-core";
 
+export type CrmRole = "owner" | "admin" | "agent" | "viewer";
+
+// Source of truth for JWT role expansion. Keep in sync with infra/postgres/init/008_seed_phase1.sql.
+const CRM_ROLE_BUNDLES: Readonly<Record<CrmRole, readonly Role[]>> = {
+  owner: ["platform_owner", "tenant_admin", "marketing_manager", "sales_agent", "support_agent"],
+  admin: ["tenant_admin", "marketing_manager"],
+  agent: ["sales_agent", "support_agent"],
+  viewer: ["analyst", "compliance_auditor"]
+};
+
 const KNOWN_ROLES: ReadonlySet<Role> = new Set<Role>([
   "platform_owner",
   "tenant_admin",
@@ -11,6 +21,8 @@ const KNOWN_ROLES: ReadonlySet<Role> = new Set<Role>([
   "analyst",
   "compliance_auditor"
 ]);
+
+const KNOWN_CRM_ROLES: ReadonlySet<CrmRole> = new Set<CrmRole>(["owner", "admin", "agent", "viewer"]);
 
 export interface AuthContext {
   subject: string;
@@ -35,8 +47,27 @@ interface KeycloakClaims extends JWTPayload {
 }
 
 function extractRoles(payload: KeycloakClaims): Role[] {
-  const raw = payload.realm_access?.roles ?? [];
-  return raw.filter((role): role is Role => KNOWN_ROLES.has(role as Role));
+  return normalizeRoles(payload.realm_access?.roles ?? []);
+}
+
+export function normalizeRoles(rawRoles: readonly string[]): Role[] {
+  const normalized = new Set<Role>();
+  for (const rawRole of rawRoles) {
+    const role = rawRole.trim().toLowerCase();
+    if (!role) {
+      continue;
+    }
+    if (KNOWN_ROLES.has(role as Role)) {
+      normalized.add(role as Role);
+      continue;
+    }
+    if (KNOWN_CRM_ROLES.has(role as CrmRole)) {
+      for (const expandedRole of CRM_ROLE_BUNDLES[role as CrmRole]) {
+        normalized.add(expandedRole);
+      }
+    }
+  }
+  return [...normalized];
 }
 
 export interface Authenticator {

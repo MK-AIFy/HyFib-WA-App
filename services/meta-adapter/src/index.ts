@@ -1,5 +1,5 @@
 import { createServer, type ServerResponse } from "node:http";
-import { setTimeout as delay } from "node:timers/promises";
+import { setTimeout as sleep } from "node:timers/promises";
 import { loadConfig } from "@hyfib/config";
 import {
   Logger,
@@ -64,10 +64,6 @@ const BASE_BACKOFF_MS = 500;
 const MEDIA_UPLOAD_MAX_BYTES = 16 * 1024 * 1024;
 let consecutiveFailures = 0;
 let breakerOpenUntil = 0;
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 function backoffDelay(attempt: number, retryAfterHeader: string | null): number {
   const retryAfter = retryAfterHeader ? Number(retryAfterHeader) : NaN;
@@ -209,6 +205,7 @@ async function dispatchSend(
 }
 
 const server = createServer(async (req, res) => {
+  try {
   const path = parseUrlPath(req.url);
   const method = req.method ?? "GET";
   const ctx = requestContext(req);
@@ -226,6 +223,17 @@ const server = createServer(async (req, res) => {
       timestamp: new Date().toISOString()
     });
     return;
+  }
+
+  if (path.startsWith("/internal/")) {
+    const providedSecret = typeof req.headers["x-internal-secret"] === "string"
+      ? req.headers["x-internal-secret"]
+      : "";
+    if (config.internalServiceSecret !== "" && providedSecret !== config.internalServiceSecret) {
+      logger.warn("internal_auth_failed", { requestId: ctx.requestId, path });
+      sendJson(res, 401, { error: "Unauthorized" });
+      return;
+    }
   }
 
   if (path === "/internal/v1/whatsapp/send-template") {
@@ -536,7 +544,6 @@ const server = createServer(async (req, res) => {
 
     try {
       const response = await graphRequest(`/${wabaId}/phone_numbers`, "GET");
-      const body = (await response.json()) as Record<string, unknown>;
 
       if (!response.ok) {
         const graphError = await parseGraphError(response);
@@ -547,6 +554,7 @@ const server = createServer(async (req, res) => {
         return;
       }
 
+      const body = (await response.json()) as Record<string, unknown>;
       sendJson(res, 200, body);
     } catch (error) {
       sendJson(res, 503, {
@@ -564,7 +572,11 @@ const server = createServer(async (req, res) => {
     }
     const query = parseQuery(req.url);
     const wabaId = query.get("wabaId") ?? config.whatsappWabaId;
-    const accessToken = query.get("accessToken") ?? config.whatsappAccessToken ?? undefined;
+    const tokenHeader = req.headers["x-access-token"];
+    const accessToken =
+      (typeof tokenHeader === "string" && tokenHeader.length > 0 ? tokenHeader : undefined) ??
+      config.whatsappAccessToken ??
+      undefined;
     if (!wabaId) {
       sendJson(res, 400, { error: "wabaId is required" });
       return;
@@ -699,7 +711,7 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    await delay(100);
+    await sleep(100);
     sendJson(res, 200, {
       status: "ok",
       message: "Probe completed"
@@ -708,6 +720,12 @@ const server = createServer(async (req, res) => {
   }
 
   notFound(res);
+  } catch (error) {
+    logger.error("request_handler_error", { error: error instanceof Error ? error.message : String(error) });
+    if (!res.headersSent) {
+      sendJson(res, 500, { error: "internal_server_error" });
+    }
+  }
 });
 
 server.listen(port, () => {

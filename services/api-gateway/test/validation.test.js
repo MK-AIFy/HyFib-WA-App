@@ -1,6 +1,119 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { validateInteractivePayload } from "../dist/validation.js";
+import {
+  boundedText,
+  clampInt,
+  parseContactListQuery,
+  parseListQuery,
+  parseOptionalIsoDate,
+  validateCampaignBody,
+  validateInteractivePayload
+} from "../dist/validation.js";
+
+test("parseListQuery clamps limit and defaults offset", () => {
+  const a = parseListQuery(new URLSearchParams("limit=500&offset=40"));
+  assert.equal(a.limit, 100);
+  assert.equal(a.offset, 40);
+  const b = parseListQuery(new URLSearchParams(""));
+  assert.equal(b.limit, 25);
+  assert.equal(b.offset, 0);
+  const c = parseListQuery(new URLSearchParams("limit=-3&offset=-1"));
+  assert.equal(c.limit, 25);
+  assert.equal(c.offset, 0);
+});
+
+test("boundedText trims, requires content, and enforces max length", () => {
+  assert.deepEqual(boundedText("  hi  ", 10), { ok: true, value: "hi" });
+  assert.equal(boundedText("", 10).ok, false);
+  assert.equal(boundedText("   ", 10).ok, false);
+  assert.equal(boundedText(123, 10).ok, false);
+  assert.equal(boundedText("abcdef", 3).ok, false);
+});
+
+test("parseOptionalIsoDate accepts ISO, rejects garbage, allows absent", () => {
+  assert.deepEqual(parseOptionalIsoDate(undefined), { ok: true, value: undefined });
+  assert.deepEqual(parseOptionalIsoDate(""), { ok: true, value: undefined });
+  const ok = parseOptionalIsoDate("2026-06-28T10:00:00Z");
+  assert.equal(ok.ok, true);
+  assert.equal(ok.value, "2026-06-28T10:00:00.000Z");
+  assert.equal(parseOptionalIsoDate("not-a-date").ok, false);
+  assert.equal(parseOptionalIsoDate(42).ok, false);
+});
+
+test("clampInt clamps into range and falls back on invalid", () => {
+  assert.equal(clampInt(5, 1, 10, 3), 5);
+  assert.equal(clampInt(99, 1, 10, 3), 10);
+  assert.equal(clampInt(-4, 1, 10, 3), 1);
+  assert.equal(clampInt("abc", 1, 10, 3), 3);
+});
+
+test("parseContactListQuery clamps limit, parses filters, defaults offset", () => {
+  const a = parseContactListQuery(new URLSearchParams("q= vip &tag=lead&optedOut=true&limit=500&offset=40"));
+  assert.equal(a.query, "vip");
+  assert.equal(a.tag, "lead");
+  assert.equal(a.optedOut, true);
+  assert.equal(a.limit, 100);
+  assert.equal(a.offset, 40);
+
+  const b = parseContactListQuery(new URLSearchParams(""));
+  assert.equal(b.query, undefined);
+  assert.equal(b.tag, undefined);
+  assert.equal(b.optedOut, undefined);
+  assert.equal(b.limit, 25);
+  assert.equal(b.offset, 0);
+
+  const c = parseContactListQuery(new URLSearchParams("optedOut=false&limit=-3&offset=-1"));
+  assert.equal(c.optedOut, false);
+  assert.equal(c.limit, 25);
+  assert.equal(c.offset, 0);
+});
+
+test("validateCampaignBody accepts a minimal payload with no optional fields", () => {
+  assert.deepEqual(validateCampaignBody({}), { ok: true });
+});
+
+test("validateCampaignBody accepts a fully-populated valid payload", () => {
+  assert.deepEqual(
+    validateCampaignBody({
+      segmentId: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      ratePerMinute: 60,
+      quietHours: { startHour: 22, endHour: 8 },
+      frequencyCap: { maxMessages: 3, periodHours: 24 }
+    }),
+    { ok: true }
+  );
+});
+
+test("validateCampaignBody rejects a non-UUID segmentId", () => {
+  const r = validateCampaignBody({ segmentId: "not-a-uuid" });
+  assert.equal(r.ok, false);
+  assert.match(r.error, /segmentId/);
+});
+
+test("validateCampaignBody rejects ratePerMinute out of range", () => {
+  assert.equal(validateCampaignBody({ ratePerMinute: 0 }).ok, false);
+  assert.equal(validateCampaignBody({ ratePerMinute: 10_001 }).ok, false);
+  assert.equal(validateCampaignBody({ ratePerMinute: 1.5 }).ok, false);
+  assert.equal(validateCampaignBody({ ratePerMinute: "fast" }).ok, false);
+  assert.equal(validateCampaignBody({ ratePerMinute: 1 }).ok, true);
+  assert.equal(validateCampaignBody({ ratePerMinute: 10_000 }).ok, true);
+});
+
+test("validateCampaignBody rejects malformed quietHours", () => {
+  assert.equal(validateCampaignBody({ quietHours: "22-8" }).ok, false);
+  assert.equal(validateCampaignBody({ quietHours: { startHour: -1, endHour: 8 } }).ok, false);
+  assert.equal(validateCampaignBody({ quietHours: { startHour: 24, endHour: 8 } }).ok, false);
+  assert.equal(validateCampaignBody({ quietHours: { startHour: 22, endHour: 8.5 } }).ok, false);
+  assert.equal(validateCampaignBody({ quietHours: { startHour: 0, endHour: 23 } }).ok, true);
+});
+
+test("validateCampaignBody rejects malformed frequencyCap", () => {
+  assert.equal(validateCampaignBody({ frequencyCap: { maxMessages: 0, periodHours: 24 } }).ok, false);
+  assert.equal(validateCampaignBody({ frequencyCap: { maxMessages: 1001, periodHours: 24 } }).ok, false);
+  assert.equal(validateCampaignBody({ frequencyCap: { maxMessages: 5, periodHours: 0 } }).ok, false);
+  assert.equal(validateCampaignBody({ frequencyCap: { maxMessages: 5, periodHours: 169 } }).ok, false);
+  assert.equal(validateCampaignBody({ frequencyCap: { maxMessages: 1, periodHours: 168 } }).ok, true);
+});
 
 test("accepts a valid button payload and strips unknown fields", () => {
   const result = validateInteractivePayload({

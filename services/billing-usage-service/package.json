@@ -1,0 +1,19 @@
+{
+  "name": "@hyfib/billing-usage-service",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "node --watch dist/index.js",
+    "test": "node --test",
+    "lint": "eslint src"
+  },
+  "dependencies": {
+    "@hyfib/config": "workspace:*",
+    "@hyfib/db": "workspace:*",
+    "@hyfib/shared-core": "workspace:*"
+  }
+}

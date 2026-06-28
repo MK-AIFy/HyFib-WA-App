@@ -8,7 +8,14 @@ import { Logger, parseUrlPath, sendMetrics } from "@hyfib/shared-core";
 
 const config = loadConfig();
 const logger = new Logger("web-portal", config.logLevel as "debug" | "info" | "warn" | "error");
-const port = 3000;
+const port = Number(process.env.WEB_PORTAL_PORT ?? 3000);
+
+const SECURITY_HEADERS: Record<string, string> = {
+  "x-content-type-options": "nosniff",
+  "x-frame-options": "DENY",
+  "content-security-policy":
+    "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'"
+};
 
 // Gateway is on the same Docker network; falls back to localhost for local dev outside Docker.
 const GATEWAY_HOST = process.env.API_GATEWAY_HOST ?? "api-gateway";
@@ -16,6 +23,7 @@ const GATEWAY_PORT = config.apiGatewayPort ?? 8080;
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const html = readFileSync(join(__dirname, "../public/index.html"), "utf8");
+const libMjs = readFileSync(join(__dirname, "../public/lib.mjs"), "utf8");
 
 function proxyToGateway(req: IncomingMessage, res: ServerResponse): void {
   const options = {
@@ -68,12 +76,23 @@ const server = createServer((req, res) => {
   if (path === "/" || path === "/index.html") {
     res.statusCode = 200;
     res.setHeader("content-type", "text/html; charset=utf-8");
+    for (const [k, v] of Object.entries(SECURITY_HEADERS)) res.setHeader(k, v);
     res.end(html);
+    return;
+  }
+
+  if (path === "/lib.mjs") {
+    res.statusCode = 200;
+    res.setHeader("content-type", "text/javascript; charset=utf-8");
+    res.setHeader("cache-control", "no-cache");
+    for (const [k, v] of Object.entries(SECURITY_HEADERS)) res.setHeader(k, v);
+    res.end(libMjs);
     return;
   }
 
   res.statusCode = 404;
   res.setHeader("content-type", "application/json");
+  for (const [k, v] of Object.entries(SECURITY_HEADERS)) res.setHeader(k, v);
   res.end(JSON.stringify({ error: "Not found" }));
 });
 

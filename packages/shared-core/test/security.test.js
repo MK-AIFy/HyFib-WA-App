@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import { verifyMetaSignature, redactPII } from "../dist/index.js";
+import { verifyMetaSignature, verifyWebhookToken, redactPII } from "../dist/index.js";
 
 const secret = "app-secret";
 const body = JSON.stringify({ entry: [{ id: "waba-1" }] });
@@ -25,6 +25,14 @@ test("rejects a signature made with the wrong secret", () => {
 test("rejects a missing or malformed signature header", () => {
   assert.equal(verifyMetaSignature(body, undefined, secret), false);
   assert.equal(verifyMetaSignature(body, "deadbeef", secret), false);
+});
+
+test("verifyWebhookToken accepts a matching token and rejects mismatches", () => {
+  assert.equal(verifyWebhookToken("verify-123", "verify-123"), true);
+  assert.equal(verifyWebhookToken("verify-123", "verify-124"), false);
+  assert.equal(verifyWebhookToken("short", "longer-token"), false);
+  assert.equal(verifyWebhookToken(null, "verify-123"), false);
+  assert.equal(verifyWebhookToken("", ""), false);
 });
 
 test("redactPII masks phone numbers and emails", () => {

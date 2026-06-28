@@ -26,20 +26,30 @@ export async function readRawBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const decoder = new StringDecoder("utf8");
     let payload = "";
+    let settled = false;
+
+    const fail = (err: Error): void => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    };
 
     req.on("data", (chunk) => {
       payload += decoder.write(chunk);
       if (payload.length > 2_000_000) {
-        reject(new Error("Request body too large"));
+        fail(new Error("Request body too large"));
+        req.destroy();
       }
     });
 
     req.on("end", () => {
+      if (settled) return;
+      settled = true;
       payload += decoder.end();
       resolve(payload);
     });
 
-    req.on("error", reject);
+    req.on("error", fail);
   });
 }
 
@@ -52,11 +62,18 @@ export async function readBinaryBody(req: IncomingMessage, maxBytes: number): Pr
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let total = 0;
+    let settled = false;
+
+    const fail = (err: Error): void => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    };
 
     req.on("data", (chunk: Buffer) => {
       total += chunk.length;
       if (total > maxBytes) {
-        reject(new Error("Request body too large"));
+        fail(new Error("Request body too large"));
         req.destroy();
         return;
       }
@@ -64,10 +81,12 @@ export async function readBinaryBody(req: IncomingMessage, maxBytes: number): Pr
     });
 
     req.on("end", () => {
+      if (settled) return;
+      settled = true;
       resolve(Buffer.concat(chunks));
     });
 
-    req.on("error", reject);
+    req.on("error", fail);
   });
 }
 

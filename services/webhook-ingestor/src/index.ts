@@ -107,6 +107,7 @@ async function ingest(
 }
 
 const server = createServer(async (req, res) => {
+  try {
   const path = parseUrlPath(req.url);
   const method = req.method ?? "GET";
   const ctx = requestContext(req);
@@ -180,9 +181,26 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    const providedSecret = typeof req.headers["x-internal-secret"] === "string"
+      ? req.headers["x-internal-secret"]
+      : "";
+    if (config.internalServiceSecret !== "" && providedSecret !== config.internalServiceSecret) {
+      logger.warn("replay_unauthorized", { requestId: ctx.requestId });
+      sendJson(res, 401, { error: "Unauthorized" });
+      return;
+    }
+
     const raw = await readRawBody(req);
     const payload = safeJsonParse(raw);
     const summary = await ingest(payload, ctx.tenantId);
+
+    logger.info("webhook_replayed", {
+      requestId: ctx.requestId,
+      tenantId: ctx.tenantId,
+      inbound: summary.inbound,
+      statuses: summary.statuses,
+      duplicates: summary.duplicates
+    });
 
     sendJson(res, 200, {
       status: "replayed",
@@ -193,6 +211,12 @@ const server = createServer(async (req, res) => {
   }
 
   notFound(res);
+  } catch (error) {
+    logger.error("webhook_handler_error", { error: error instanceof Error ? error.message : String(error) });
+    if (!res.headersSent) {
+      sendJson(res, 500, { error: "internal_server_error" });
+    }
+  }
 });
 
 server.listen(config.webhookIngestorPort, () => {

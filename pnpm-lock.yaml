@@ -44,6 +44,22 @@ importers:
 
   packages/config: {}
 
+  packages/db:
+    dependencies:
+      '@hyfib/config':
+        specifier: workspace:*
+        version: link:../config
+      '@hyfib/shared-core':
+        specifier: workspace:*
+        version: link:../shared-core
+      pg:
+        specifier: 8.13.1
+        version: 8.13.1
+    devDependencies:
+      '@types/pg':
+        specifier: 8.11.10
+        version: 8.11.10
+
   packages/event-bus:
     dependencies:
       '@hyfib/config':
@@ -81,6 +97,22 @@ importers:
       '@hyfib/shared-core':
         specifier: workspace:*
         version: link:../shared-core
+
+  packages/queue:
+    dependencies:
+      '@hyfib/config':
+        specifier: workspace:*
+        version: link:../config
+      '@hyfib/shared-core':
+        specifier: workspace:*
+        version: link:../shared-core
+      amqplib:
+        specifier: 0.10.4
+        version: 0.10.4
+    devDependencies:
+      '@types/amqplib':
+        specifier: 0.10.5
+        version: 0.10.5
 
   packages/ratelimit:
     dependencies:
@@ -127,6 +159,42 @@ importers:
         specifier: workspace:*
         version: link:../../packages/shared-core
 
+  services/audit-service:
+    dependencies:
+      '@hyfib/config':
+        specifier: workspace:*
+        version: link:../../packages/config
+      '@hyfib/db':
+        specifier: workspace:*
+        version: link:../../packages/db
+      '@hyfib/queue':
+        specifier: workspace:*
+        version: link:../../packages/queue
+      '@hyfib/shared-core':
+        specifier: workspace:*
+        version: link:../../packages/shared-core
+
+  services/auth-service:
+    dependencies:
+      '@hyfib/config':
+        specifier: workspace:*
+        version: link:../../packages/config
+      '@hyfib/shared-core':
+        specifier: workspace:*
+        version: link:../../packages/shared-core
+
+  services/billing-usage-service:
+    dependencies:
+      '@hyfib/config':
+        specifier: workspace:*
+        version: link:../../packages/config
+      '@hyfib/db':
+        specifier: workspace:*
+        version: link:../../packages/db
+      '@hyfib/shared-core':
+        specifier: workspace:*
+        version: link:../../packages/shared-core
+
   services/meta-adapter:
     dependencies:
       '@hyfib/config':
@@ -153,6 +221,30 @@ importers:
       '@hyfib/ratelimit':
         specifier: workspace:*
         version: link:../../packages/ratelimit
+      '@hyfib/shared-core':
+        specifier: workspace:*
+        version: link:../../packages/shared-core
+
+  services/reporting-service:
+    dependencies:
+      '@hyfib/config':
+        specifier: workspace:*
+        version: link:../../packages/config
+      '@hyfib/db':
+        specifier: workspace:*
+        version: link:../../packages/db
+      '@hyfib/shared-core':
+        specifier: workspace:*
+        version: link:../../packages/shared-core
+
+  services/tenant-service:
+    dependencies:
+      '@hyfib/config':
+        specifier: workspace:*
+        version: link:../../packages/config
+      '@hyfib/db':
+        specifier: workspace:*
+        version: link:../../packages/db
       '@hyfib/shared-core':
         specifier: workspace:*
         version: link:../../packages/shared-core

@@ -59,7 +59,8 @@ async function callClaude(system: string, user: string): Promise<string> {
           content: user
         }
       ]
-    })
+    }),
+    signal: AbortSignal.timeout(60_000)
   });
 
   if (!response.ok) {
@@ -127,6 +128,7 @@ async function runWithFallback(
 }
 
 const server = createServer(async (req, res) => {
+  try {
   const path = parseUrlPath(req.url);
   const method = req.method ?? "GET";
   const ctx = requestContext(req);
@@ -134,6 +136,17 @@ const server = createServer(async (req, res) => {
   if (path === "/metrics") {
     sendMetrics(res);
     return;
+  }
+
+  if (path.startsWith("/internal/")) {
+    const providedSecret = typeof req.headers["x-internal-secret"] === "string"
+      ? req.headers["x-internal-secret"]
+      : "";
+    if (config.internalServiceSecret !== "" && providedSecret !== config.internalServiceSecret) {
+      logger.warn("internal_auth_failed", { requestId: ctx.requestId, path });
+      sendJson(res, 401, { error: "Unauthorized" });
+      return;
+    }
   }
 
   if (path === "/health") {
@@ -154,8 +167,22 @@ const server = createServer(async (req, res) => {
     }
 
     const payload = await readJsonBody<DraftCampaignRequest>(req);
+    const VALID_TONES = ["professional", "friendly", "urgent"] as const;
     if (!payload.objective || !payload.audienceDescription || !payload.offer || !payload.tone || !payload.language) {
       sendJson(res, 400, { error: "objective, audienceDescription, offer, tone and language are required" });
+      return;
+    }
+    if (!VALID_TONES.includes(payload.tone as (typeof VALID_TONES)[number])) {
+      sendJson(res, 400, { error: `tone must be one of: ${VALID_TONES.join(", ")}` });
+      return;
+    }
+    if (
+      String(payload.objective).length > 500 ||
+      String(payload.audienceDescription).length > 500 ||
+      String(payload.offer).length > 500 ||
+      String(payload.language).length > 50
+    ) {
+      sendJson(res, 400, { error: "objective, audienceDescription, offer must be ≤500 chars; language ≤50 chars" });
       return;
     }
 
@@ -180,8 +207,18 @@ const server = createServer(async (req, res) => {
     }
 
     const payload = await readJsonBody<SegmentSummaryRequest>(req);
-    if (!payload.segmentName || payload.contacts <= 0) {
+    if (!payload.segmentName || typeof payload.contacts !== "number" || payload.contacts <= 0) {
       sendJson(res, 400, { error: "segmentName and contacts (>0) are required" });
+      return;
+    }
+    if (String(payload.segmentName).length > 200) {
+      sendJson(res, 400, { error: "segmentName must be ≤200 chars" });
+      return;
+    }
+    const cr = Number(payload.conversionRate);
+    const oor = Number(payload.optOutRate);
+    if (!Number.isFinite(cr) || cr < 0 || cr > 100 || !Number.isFinite(oor) || oor < 0 || oor > 1) {
+      sendJson(res, 400, { error: "conversionRate must be 0-100; optOutRate must be 0-1" });
       return;
     }
 
@@ -205,6 +242,19 @@ const server = createServer(async (req, res) => {
     }
 
     const payload = await readJsonBody<LeadScoreRequest>(req);
+    const rd = Number(payload.recencyDays);
+    const es = Number(payload.engagementScore);
+    const pc = Number(payload.purchaseCount);
+    const aov = Number(payload.averageOrderValue);
+    if (
+      !Number.isFinite(rd) || rd < 0 || rd > 3650 ||
+      !Number.isFinite(es) || es < 0 || es > 100 ||
+      !Number.isFinite(pc) || pc < 0 ||
+      !Number.isFinite(aov) || aov < 0
+    ) {
+      sendJson(res, 400, { error: "recencyDays 0-3650, engagementScore 0-100, purchaseCount ≥0, averageOrderValue ≥0 required" });
+      return;
+    }
     const score = fallbackLeadScore(payload);
 
     sendJson(res, 200, {
@@ -222,6 +272,12 @@ const server = createServer(async (req, res) => {
   }
 
   notFound(res);
+  } catch (error) {
+    logger.error("request_handler_error", { error: error instanceof Error ? error.message : String(error) });
+    if (!res.headersSent) {
+      sendJson(res, 500, { error: "internal_server_error" });
+    }
+  }
 });
 
 server.listen(config.aiIntelligencePort, () => {

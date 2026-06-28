@@ -16,6 +16,23 @@ export function verifyMetaSignature(rawBody: string, signatureHeader: string | u
 }
 
 /**
+ * Constant-time comparison of the Meta webhook verification token
+ * (`hub.verify_token`) against the configured value, avoiding the timing
+ * side-channel of a plain `===` on a secret.
+ */
+export function verifyWebhookToken(provided: string | null | undefined, expected: string): boolean {
+  if (!provided || !expected) {
+    return false;
+  }
+  const providedBuf = Buffer.from(provided, "utf8");
+  const expectedBuf = Buffer.from(expected, "utf8");
+  if (providedBuf.length !== expectedBuf.length) {
+    return false;
+  }
+  return timingSafeEqual(providedBuf, expectedBuf);
+}
+
+/**
  * Decodes a 32-byte AES-256 key supplied as base64 or hex. Throws if the
  * decoded length is wrong so misconfiguration fails loudly at first use.
  */

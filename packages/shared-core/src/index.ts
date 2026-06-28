@@ -4,6 +4,7 @@ export * from "./idempotency.js";
 export * from "./logger.js";
 export * from "./metrics.js";
 export * from "./security.js";
+export * from "./automation.js";
 
 export type Role =
   | "platform_owner"
@@ -30,6 +31,30 @@ export interface User {
   displayName: string;
   roles: Role[];
   status: "active" | "disabled";
+}
+
+export interface Team {
+  id: string;
+  tenantId: string;
+  name: string;
+  isDefault: boolean;
+  createdAt: string;
+}
+
+export interface Tag {
+  id: string;
+  tenantId: string;
+  name: string;
+  color?: string;
+  createdAt: string;
+}
+
+export interface SavedReply {
+  id: string;
+  tenantId: string;
+  title: string;
+  body: string;
+  createdAt: string;
 }
 
 export interface WhatsAppChannel {
@@ -74,6 +99,16 @@ export interface Contact {
   country?: string;
   tags: string[];
   timezone?: string;
+  customFields: Record<string, string>;
+}
+
+export interface ContactNote {
+  id: string;
+  tenantId: string;
+  contactId: string;
+  authorUserId?: string;
+  note: string;
+  createdAt: string;
 }
 
 export interface QuietHoursConfig {
@@ -146,6 +181,52 @@ export interface AutoReplyRule {
   createdAt: string;
 }
 
+export type AutomationTriggerType = "new_message" | "tag_added" | "conversation_assigned" | "no_reply";
+export type AutomationActionType = "send_template" | "assign_agent" | "add_tag" | "create_task";
+
+export interface AutomationConditions {
+  keyword?: string;
+  tag?: string;
+  delayMinutes?: number;
+}
+
+export interface AutomationActionConfig {
+  templateName?: string;
+  templateLanguage?: string;
+  assigneeUserId?: string;
+  tag?: string;
+  taskTitle?: string;
+  dueInMinutes?: number;
+}
+
+export interface AutomationRule {
+  id: string;
+  tenantId: string;
+  name: string;
+  triggerType: AutomationTriggerType;
+  conditions: AutomationConditions;
+  actionType: AutomationActionType;
+  actionConfig: AutomationActionConfig;
+  enabled: boolean;
+  priority: number;
+  createdAt: string;
+}
+
+export interface Task {
+  id: string;
+  tenantId: string;
+  title: string;
+  status: "open" | "done" | "cancelled";
+  contactId?: string;
+  conversationId?: string;
+  assigneeUserId?: string;
+  dueAt?: string;
+  remindAt?: string;
+  source: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface Conversation {
   id: string;
   tenantId: string;
@@ -155,6 +236,27 @@ export interface Conversation {
   lastInboundAt?: string;
   assignedUserId?: string;
   state: "open" | "pending" | "closed";
+}
+
+export interface ConversationNote {
+  id: string;
+  tenantId: string;
+  conversationId: string;
+  authorUserId?: string;
+  note: string;
+  createdAt: string;
+}
+
+export interface WhatsAppSettings {
+  id: string;
+  tenantId: string;
+  statusCallbackUrl?: string;
+  graphVersion: string;
+  retryMaxAttempts: number;
+  retryBaseDelayMs: number;
+  outboundRateLimitPerMinute?: number;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface Message {
@@ -421,8 +523,20 @@ export const EventTopics = {
   CampaignDispatchRequested: "campaign.dispatch.requested",
   CampaignDispatchResult: "campaign.dispatch.result",
   CampaignRunRequested: "campaign.run.requested",
+  AutomationTemplateRequested: "automation.template.requested",
   CommerceOrderEvent: "commerce.order.event",
-  ComplianceOptOutEvent: "compliance.optout.event"
+  ComplianceOptOutEvent: "compliance.optout.event",
+  AuditEventRecorded: "audit.event.recorded"
 } as const;
 
 export type EventTopic = (typeof EventTopics)[keyof typeof EventTopics];
+
+/** Fire-and-forget template send requested by an automation rule action. */
+export interface AutomationTemplateRequest {
+  tenantId: string;
+  /** Optional sending channel; the worker falls back to the tenant's first active channel. */
+  channelId?: string;
+  contactPhoneE164: string;
+  templateName: string;
+  templateLanguage: string;
+}

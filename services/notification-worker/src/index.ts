@@ -5,6 +5,7 @@ import { loadConfig } from "@hyfib/config";
 import { evaluateOutboundPolicy } from "@hyfib/policy-engine";
 import {
   autoReplyRuleRepository,
+  automationRuleRepository,
   campaignRecipientRepository,
   campaignSendLog,
   campaignStatsRepository,
@@ -17,8 +18,11 @@ import {
   messageRepository,
   outboxRepository,
   resolveChannelByPhoneNumberId,
+  taskRepository,
+  userRepository,
   withTenant,
-  type ChannelCredentials
+  type ChannelCredentials,
+  type OutboxEnqueueInput
 } from "@hyfib/persistence";
 import { getRedisClient, acquireRateLimit } from "@hyfib/ratelimit";
 import {
@@ -30,6 +34,7 @@ import {
   incCounter,
   isOptInKeyword,
   isOptOutKeyword,
+  type AutomationTemplateRequest,
   type CampaignDispatchRequest,
   type CampaignRunRequest,
   type EventEnvelope,
@@ -40,6 +45,7 @@ import {
 import { buildOutboundAdapterCall } from "./outbound.js";
 import { resolveVariables } from "./personalize.js";
 import { matchAutoReply } from "./autoreply.js";
+import { evaluateAutomationRules } from "./automation.js";
 
 const config = loadConfig();
 const logger = new Logger("notification-worker", config.logLevel as "debug" | "info" | "warn" | "error");
@@ -85,12 +91,19 @@ const META_STATUS_TO_MESSAGE: Record<string, Message["status"]> = {
 async function callMetaAdapter(
   endpoint: string,
   tenantId: string,
-  payload: Record<string, unknown>
+  payload: Record<string, unknown>,
+  timeoutMs = 20_000
 ): Promise<{ messageId?: string; accepted: boolean }> {
   const response = await fetch(`${config.metaAdapterUrl}${endpoint}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "x-tenant-id": tenantId, "x-request-id": randomUUID() },
-    body: JSON.stringify(payload)
+    headers: {
+      "Content-Type": "application/json",
+      "x-tenant-id": tenantId,
+      "x-request-id": randomUUID(),
+      "x-internal-secret": config.internalServiceSecret
+    },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(timeoutMs)
   });
   const body = (await response.json()) as { result?: { messageId?: string; status?: string } };
   if (!response.ok) {
@@ -235,15 +248,33 @@ async function handleCampaignRun(event: EventEnvelope): Promise<void> {
   let processed = 0;
   let batches = 0;
   const MAX_BATCHES = 10_000; // Safety limit (~500K contacts per invocation)
+  // Pre-compute the frequency-cap since-date once per run (shared across all recipients).
+  const frequencyCapSince = run.frequencyCap
+    ? new Date(Date.now() - run.frequencyCap.periodHours * 60 * 60 * 1000).toISOString()
+    : null;
 
   while (batches < MAX_BATCHES) {
     const batch = await campaignRecipientRepository.claimPendingBatch(run.tenantId, run.campaignId, 50);
     if (batch.length === 0) break;
     batches++;
 
+    // Batch-load all data needed for policy evaluation in 3-4 parallel queries
+    // instead of 4 sequential per-contact queries (N+1 → O(1) per batch).
+    const contactIds = batch.map((r) => r.contactId);
+    const [contactMap, consentSet, lastInboundMap, freqCapMap] = await Promise.all([
+      contactRepository.getByIds(run.tenantId, contactIds),
+      consentRepository.hasConsentBatch(run.tenantId, contactIds),
+      conversationRepository.lastInboundAtBatch(run.tenantId, contactIds),
+      frequencyCapSince
+        ? messageRepository.countOutboundSinceBatch(run.tenantId, contactIds, frequencyCapSince)
+        : Promise.resolve(new Map<string, number>())
+    ]);
+
+    // Collect approved dispatch events; batch-enqueue after the rate-limit loop.
+    const toEnqueue: OutboxEnqueueInput[] = [];
+
     for (const recipient of batch) {
-      // Load full contact for policy + personalization.
-      const contact = await contactRepository.getById(run.tenantId, recipient.contactId).catch(() => undefined);
+      const contact = contactMap.get(recipient.contactId);
       if (!contact) {
         await campaignRecipientRepository.updateStatus(run.tenantId, recipient.id, {
           status: "failed",
@@ -252,19 +283,12 @@ async function handleCampaignRun(event: EventEnvelope): Promise<void> {
         continue;
       }
 
-      // Server-side policy evaluation.
-      const hasActiveConsent = await consentRepository.hasActiveConsent(run.tenantId, contact.id);
+      const hasActiveConsent = consentSet.has(contact.id);
       const isOptedOut = contact.optedOut;
-      const lastInboundAt = await conversationRepository.lastInboundAt(run.tenantId, contact.id);
+      const lastInboundAt = lastInboundMap.get(contact.id);
       const isInside24hWindow = lastInboundAt ? Date.now() - lastInboundAt.getTime() < 24 * 60 * 60 * 1000 : false;
-      const tz = contact.timezone ?? "UTC";
-      const currentHourLocal = getCurrentHourInTz(tz);
-
-      let sentInPeriod = 0;
-      if (run.frequencyCap) {
-        const since = new Date(Date.now() - run.frequencyCap.periodHours * 60 * 60 * 1000).toISOString();
-        sentInPeriod = await messageRepository.countOutboundSince(run.tenantId, contact.id, since);
-      }
+      const currentHourLocal = getCurrentHourInTz(contact.timezone ?? "UTC");
+      const sentInPeriod = freqCapMap.get(contact.id) ?? 0;
 
       const policy = evaluateOutboundPolicy({
         hasActiveConsent,
@@ -288,7 +312,6 @@ async function handleCampaignRun(event: EventEnvelope): Promise<void> {
         continue;
       }
 
-      // Personalise template parameters.
       const parameters = resolveVariables(run.variableMapping, {
         firstName: contact.firstName,
         lastName: contact.lastName,
@@ -301,28 +324,38 @@ async function handleCampaignRun(event: EventEnvelope): Promise<void> {
       // Rate pacing: acquire a slot from the token bucket; waits if needed.
       await acquireRateLimit(redis, rateScopeKey, ratePerMinute).catch(() => undefined);
 
-      // Enqueue per-contact dispatch (worker's existing handleDispatch picks it up).
-      await withTenant(run.tenantId, async (client) => {
-        await outboxRepository.enqueue(client, run.tenantId, {
-          topic: EventTopics.CampaignDispatchRequested,
-          payload: {
-            campaignId: run.campaignId,
-            tenantId: run.tenantId,
-            channelId: run.channelId,
-            templateName: run.templateName,
-            templateLanguage: run.templateLanguage,
-            templateCategory: run.templateCategory,
-            contactPhoneE164: recipient.phoneE164,
-            parameters,
-            recipientId: recipient.id
-          } satisfies CampaignDispatchRequest
-        });
+      toEnqueue.push({
+        topic: EventTopics.CampaignDispatchRequested,
+        payload: {
+          campaignId: run.campaignId,
+          tenantId: run.tenantId,
+          channelId: run.channelId,
+          templateName: run.templateName,
+          templateLanguage: run.templateLanguage,
+          templateCategory: run.templateCategory,
+          contactPhoneE164: recipient.phoneE164,
+          parameters,
+          recipientId: recipient.id
+        } satisfies CampaignDispatchRequest
       });
-
       processed++;
+    }
+
+    // Batch-insert all approved dispatch events in a single transaction.
+    if (toEnqueue.length > 0) {
+      await withTenant(run.tenantId, async (client) => {
+        await outboxRepository.enqueueBatch(client, run.tenantId, toEnqueue);
+      });
     }
   }
 
+  if (batches >= MAX_BATCHES) {
+    logger.warn("campaign_run_max_batches_hit", {
+      campaignId: run.campaignId,
+      processed,
+      maxBatches: MAX_BATCHES
+    });
+  }
   logger.info("campaign_run_completed", { campaignId: run.campaignId, processed });
 }
 
@@ -342,7 +375,16 @@ async function handleOutbound(event: EventEnvelope): Promise<void> {
   const channel = await resolveSendChannel(command.tenantId, command.channelId);
 
   const call = buildOutboundAdapterCall(command, channel);
-  const result = await callMetaAdapter(call.endpoint, command.tenantId, call.payload);
+  let result: { messageId?: string; accepted: boolean };
+  try {
+    result = await callMetaAdapter(call.endpoint, command.tenantId, call.payload);
+  } catch (error) {
+    logger.error("outbound_adapter_failed", {
+      conversationId: command.conversationId,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    throw error; // Re-throw so the broker can retry.
+  }
 
   await messageRepository.create(command.tenantId, {
     conversationId: command.conversationId,
@@ -366,8 +408,14 @@ async function markRead(channel: ChannelCredentials, messageId: string | undefin
   try {
     await fetch(`${config.metaAdapterUrl}/internal/v1/whatsapp/mark-read`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "x-tenant-id": tenantId, "x-request-id": randomUUID() },
-      body: JSON.stringify({ phoneNumberId: channel.phoneNumberId, messageId, accessToken: channel.accessToken })
+      headers: {
+        "Content-Type": "application/json",
+        "x-tenant-id": tenantId,
+        "x-request-id": randomUUID(),
+        "x-internal-secret": config.internalServiceSecret
+      },
+      body: JSON.stringify({ phoneNumberId: channel.phoneNumberId, messageId, accessToken: channel.accessToken }),
+      signal: AbortSignal.timeout(5_000)
     });
   } catch (error) {
     logger.warn("mark_read_failed", { error: error instanceof Error ? error.message : String(error) });
@@ -469,6 +517,70 @@ async function handleInbound(event: EventEnvelope): Promise<void> {
         ruleId: matched.id
       });
     }
+
+    // Automation rules: new_message trigger.
+    await runNewMessageAutomation(channel.tenantId, conversation.id, contact, channel.channelId, text);
+  }
+}
+
+/** Executes enabled new_message automation actions for an inbound message. */
+async function runNewMessageAutomation(
+  tenantId: string,
+  conversationId: string,
+  contact: { id: string; phoneE164: string },
+  channelId: string,
+  text: string | undefined
+): Promise<void> {
+  const rules = await automationRuleRepository.listEnabledByTrigger(tenantId, "new_message");
+  if (rules.length === 0) {
+    return;
+  }
+  const actions = evaluateAutomationRules("new_message", { messageText: text }, rules);
+  for (const action of actions) {
+    try {
+      if (action.kind === "add_tag") {
+        await contactRepository.addTag(tenantId, contact.id, action.tag);
+      } else if (action.kind === "assign_agent") {
+        // Only assign to a user that belongs to this tenant (RLS-scoped lookup).
+        if (await userRepository.getById(tenantId, action.assigneeUserId)) {
+          await conversationRepository.assign(tenantId, conversationId, action.assigneeUserId);
+        } else {
+          logger.warn("automation_assignee_not_in_tenant", { tenantId, assigneeUserId: action.assigneeUserId });
+        }
+      } else if (action.kind === "create_task") {
+        const clampedMinutes =
+          action.dueInMinutes && action.dueInMinutes > 0 ? Math.min(action.dueInMinutes, 525_600) : undefined;
+        const dueAt = clampedMinutes ? new Date(Date.now() + clampedMinutes * 60_000).toISOString() : undefined;
+        await taskRepository.create(tenantId, {
+          title: action.title,
+          contactId: contact.id,
+          conversationId,
+          dueAt,
+          remindAt: dueAt,
+          source: "automation"
+        });
+      } else if (action.kind === "send_template") {
+        await withTenant(tenantId, async (client) => {
+          await outboxRepository.enqueue(client, tenantId, {
+            topic: EventTopics.AutomationTemplateRequested,
+            payload: {
+              tenantId,
+              channelId,
+              contactPhoneE164: contact.phoneE164,
+              templateName: action.templateName,
+              templateLanguage: action.templateLanguage
+            }
+          });
+        });
+      }
+      incCounter("automation_actions_executed_total", "Automation actions executed.", { action: action.kind });
+    } catch (error) {
+      logger.error("automation_action_failed", {
+        tenantId,
+        action: action.kind,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
   }
 }
 
@@ -549,12 +661,61 @@ function getCurrentHourInTz(tz: string): number {
   }
 }
 
+/** Sends a template requested by an automation rule action and records the outbound message. */
+async function handleAutomationTemplate(event: EventEnvelope): Promise<void> {
+  incCounter("events_consumed_total", "Events consumed from the bus.", {
+    topic: EventTopics.AutomationTemplateRequested
+  });
+  const req = event.payload as AutomationTemplateRequest;
+  if (!req.tenantId || !req.contactPhoneE164 || !req.templateName) {
+    logger.warn("automation_template_invalid", { eventId: event.id });
+    return;
+  }
+
+  // At-least-once delivery guard: skip if this event was already processed.
+  const claimed = await redis.set(`atreq:${event.id}`, "1", "EX", 3600, "NX");
+  if (!claimed) {
+    logger.info("automation_template_duplicate_skipped", { eventId: event.id });
+    return;
+  }
+
+  const channelId = req.channelId ?? (await channelRepository.firstActive(req.tenantId))?.id;
+  if (!channelId) {
+    logger.warn("automation_template_no_channel", { tenantId: req.tenantId });
+    return;
+  }
+  const channel = await resolveSendChannel(req.tenantId, channelId);
+  const result = await callMetaAdapter("/internal/v1/whatsapp/send-template", req.tenantId, {
+    phoneNumberId: channel.phoneNumberId,
+    to: req.contactPhoneE164,
+    templateName: req.templateName,
+    templateLanguage: req.templateLanguage,
+    parameters: [],
+    accessToken: channel.accessToken
+  });
+  const contact = await contactRepository.findOrCreateByPhone(req.tenantId, req.contactPhoneE164);
+  const conversation = await conversationRepository.findOrCreate(req.tenantId, contact.id, channelId);
+  await messageRepository.create(req.tenantId, {
+    conversationId: conversation.id,
+    direction: "outbound",
+    status: result.accepted ? "sent" : "queued",
+    category: "marketing" as MessageCategory,
+    externalMessageId: result.messageId,
+    payload: { source: "automation", templateName: req.templateName }
+  });
+  logger.info("automation_template_sent", { tenantId: req.tenantId, contactPhoneE164: req.contactPhoneE164, externalMessageId: result.messageId });
+  incCounter("automation_template_sends_total", "Automation template sends.", {
+    result: result.accepted ? "accepted" : "queued"
+  });
+}
+
 eventBus.subscribe(EventTopics.CampaignDispatchRequested, "campaign-dispatch", handleDispatch);
 eventBus.subscribe(EventTopics.CampaignDispatchResult, "campaign-results", handleDispatchResult);
 eventBus.subscribe(EventTopics.CampaignRunRequested, "campaign-run", handleCampaignRun);
 eventBus.subscribe(EventTopics.WhatsAppInboundReceived, "inbound-messages", handleInbound);
 eventBus.subscribe(EventTopics.WhatsAppStatusUpdated, "status-updates", handleStatus);
 eventBus.subscribe(EventTopics.WhatsAppOutboundRequested, "outbound-messages", handleOutbound);
+eventBus.subscribe(EventTopics.AutomationTemplateRequested, "automation-templates", handleAutomationTemplate);
 
 const server = createServer(async (req, res) => {
   const path = parseUrlPath(req.url);

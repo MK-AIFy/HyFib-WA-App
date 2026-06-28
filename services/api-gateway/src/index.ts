@@ -2,11 +2,12 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { randomUUID } from "node:crypto";
 import { evaluateOutboundPolicy } from "@hyfib/policy-engine";
 import { loadConfig } from "@hyfib/config";
-import { createAuthenticator, hasAnyRole, AuthError, type AuthContext } from "@hyfib/auth";
+import { createAuthenticator, hasAnyRole, normalizeRoles, AuthError, type AuthContext } from "@hyfib/auth";
 import { createEventBus } from "@hyfib/event-bus";
 import {
   auditRepository,
   autoReplyRuleRepository,
+  automationRuleRepository,
   campaignRecipientRepository,
   campaignRepository,
   channelRepository,
@@ -20,12 +21,20 @@ import {
   messageRepository,
   orderRepository,
   outboxRepository,
+  query as dbQuery,
   resolveChannelByPhoneNumberId,
+  savedReplyRepository,
   segmentRepository,
+  contactNoteRepository,
+  conversationNoteRepository,
+  tagRepository,
+  taskRepository,
+  teamRepository,
   templateRepository,
   tenantAnalytics,
   tenantRepository,
   userRepository,
+  whatsappSettingsRepository,
   withTenant,
   type CampaignWithTemplate
 } from "@hyfib/persistence";
@@ -42,7 +51,13 @@ import {
   sendMetrics,
   incCounter,
   verifyMetaSignature,
+  verifyWebhookToken,
   EventTopics,
+  evaluateAutomationRules,
+  type AutomationActionConfig,
+  type AutomationActionType,
+  type AutomationConditions,
+  type AutomationTriggerType,
   type EventEnvelope,
   type FrequencyCapConfig,
   type MessageCategory,
@@ -54,10 +69,11 @@ import {
   type WhatsAppInteractivePayload,
   type WhatsAppMediaKind
 } from "@hyfib/shared-core";
-import { validateInteractivePayload } from "./validation.js";
+import { parseContactListQuery, parseListQuery, boundedText, parseOptionalIsoDate, clampInt, validateInteractivePayload, validateCampaignBody } from "./validation.js";
+import { filterSendableContacts } from "./campaign.js";
 import { canCreateContact, canCreateOrder } from "./authorization.js";
 import { SseHub } from "./sse-hub.js";
-import { parseCsv } from "./csv.js";
+import { parseCsv, serializeContactsCsv } from "./csv.js";
 
 // ─── Request body interfaces ───────────────────────────────────────────────────
 
@@ -76,6 +92,14 @@ interface CreateChannelRequest {
   phoneNumberId: string;
   displayPhoneNumber: string;
   accessToken?: string;
+}
+
+interface UpdateWhatsAppSettingsRequest {
+  statusCallbackUrl?: string;
+  graphVersion?: string;
+  retryMaxAttempts?: number;
+  retryBaseDelayMs?: number;
+  outboundRateLimitPerMinute?: number;
 }
 
 interface SendMessageRequest {
@@ -159,6 +183,37 @@ interface CreateAutoReplyRuleRequest {
   priority?: number;
 }
 
+interface CreateAutomationRuleRequest {
+  name?: string;
+  triggerType?: AutomationTriggerType;
+  conditions?: AutomationConditions;
+  actionType?: AutomationActionType;
+  actionConfig?: AutomationActionConfig;
+  enabled?: boolean;
+  priority?: number;
+}
+
+interface CreateTaskRequest {
+  title?: string;
+  contactId?: string;
+  conversationId?: string;
+  assigneeUserId?: string;
+  dueAt?: string;
+  remindAt?: string;
+}
+
+const AUTOMATION_TRIGGERS = new Set<AutomationTriggerType>([
+  "new_message",
+  "tag_added",
+  "conversation_assigned",
+  "no_reply"
+]);
+const AUTOMATION_ACTIONS = new Set<AutomationActionType>([
+  "send_template",
+  "assign_agent",
+  "add_tag",
+  "create_task"
+]);
 // ─── Bootstrap ────────────────────────────────────────────────────────────────
 
 const config = loadConfig();
@@ -169,7 +224,25 @@ const webhookIdempotency = new IdempotencyStore(24 * 60 * 60 * 1000);
 
 const E164 = /^\+[1-9]\d{7,14}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MEDIA_UPLOAD_MAX_BYTES = 16 * 1024 * 1024;
+const CONTACTS_EXPORT_LIMIT = 50_000;
+
+const VALID_ROLE_NAMES: ReadonlyArray<string> = [
+  "platform_owner",
+  "tenant_admin",
+  "marketing_manager",
+  "sales_agent",
+  "support_agent",
+  "analyst",
+  "compliance_auditor"
+];
+
+/** Returns the first path segment after `prefix`, or null when absent or empty. */
+function extractPathSegment(path: string, prefix: string): string | null {
+  if (!path.startsWith(prefix)) return null;
+  return path.slice(prefix.length).split("/")[0] || null;
+}
 const CSV_UPLOAD_MAX_BYTES = 10 * 1024 * 1024; // 10 MB
 
 if (!config.authEnabled) {
@@ -192,9 +265,7 @@ async function resolveAuth(req: IncomingMessage): Promise<AuthContext> {
     return authenticator.authenticate(req.headers["authorization"]);
   }
   const roleHeader = req.headers["x-role"];
-  const roles = (typeof roleHeader === "string" ? roleHeader.split(",") : [])
-    .map((value) => value.trim())
-    .filter((value): value is Role => value.length > 0) as Role[];
+  const roles = normalizeRoles(typeof roleHeader === "string" ? roleHeader.split(",") : []);
   const tenantId = typeof req.headers["x-tenant-id"] === "string" ? (req.headers["x-tenant-id"] as string) : undefined;
   const actorId = typeof req.headers["x-actor-id"] === "string" ? (req.headers["x-actor-id"] as string) : undefined;
   return { subject: actorId ?? "dev-subject", tenantId, roles };
@@ -216,6 +287,75 @@ async function audit(
       action: event.action,
       error: error instanceof Error ? error.message : String(error)
     });
+  }
+}
+
+/**
+ * Evaluates and executes enabled automation rules for a synchronous trigger
+ * (tag_added / conversation_assigned) using the shared engine. Best-effort:
+ * action failures are logged, never surfaced to the caller. send_template is
+ * deferred (logged) until the template-dispatch path is wired.
+ */
+async function runAutomation(
+  tenantId: string,
+  trigger: AutomationTriggerType,
+  ctx: { messageText?: string; addedTag?: string },
+  target: { contactId?: string; conversationId?: string }
+): Promise<void> {
+  const rules = await automationRuleRepository.listEnabledByTrigger(tenantId, trigger);
+  if (rules.length === 0) {
+    return;
+  }
+  for (const action of evaluateAutomationRules(trigger, ctx, rules)) {
+    try {
+      if (action.kind === "add_tag" && target.contactId) {
+        await tagRepository.ensure(tenantId, action.tag);
+        await contactRepository.addTag(tenantId, target.contactId, action.tag);
+      } else if (action.kind === "assign_agent" && target.conversationId) {
+        if (await userRepository.getById(tenantId, action.assigneeUserId)) {
+          await conversationRepository.assign(tenantId, target.conversationId, action.assigneeUserId);
+        }
+      } else if (action.kind === "create_task") {
+        const minutes =
+          action.dueInMinutes && action.dueInMinutes > 0 ? Math.min(action.dueInMinutes, 525_600) : undefined;
+        const dueAt = minutes ? new Date(Date.now() + minutes * 60_000).toISOString() : undefined;
+        await taskRepository.create(tenantId, {
+          title: action.title,
+          contactId: target.contactId,
+          conversationId: target.conversationId,
+          dueAt,
+          remindAt: dueAt,
+          source: "automation"
+        });
+      } else if (action.kind === "send_template") {
+        const contact = target.contactId ? await contactRepository.getById(tenantId, target.contactId) : undefined;
+        if (contact) {
+          const channelId = target.conversationId
+            ? (await conversationRepository.getById(tenantId, target.conversationId))?.channelId
+            : undefined;
+          await withTenant(tenantId, async (client) => {
+            await outboxRepository.enqueue(client, tenantId, {
+              topic: EventTopics.AutomationTemplateRequested,
+              payload: {
+                tenantId,
+                channelId,
+                contactPhoneE164: contact.phoneE164,
+                templateName: action.templateName,
+                templateLanguage: action.templateLanguage
+              }
+            });
+          });
+        }
+      }
+      incCounter("automation_actions_executed_total", "Automation actions executed.", { action: action.kind });
+    } catch (error) {
+      logger.error("automation_action_failed", {
+        tenantId,
+        trigger,
+        action: action.kind,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
   }
 }
 
@@ -327,6 +467,12 @@ async function runCampaign(
     return { status: 422, body: { error: "Segment resolved to 0 contacts" } };
   }
 
+  // Final safeguard: never queue opted-out contacts, even if resolution changed.
+  const { eligible, suppressed } = filterSendableContacts(contacts);
+  if (eligible.length === 0) {
+    return { status: 422, body: { error: "All resolved contacts are opted out", suppressed } };
+  }
+
   const channel = await channelRepository.firstActive(tenantId);
   if (!channel) {
     return { status: 409, body: { error: "No active WhatsApp channel configured for tenant" } };
@@ -335,30 +481,46 @@ async function runCampaign(
   await campaignRecipientRepository.insertBatch(
     tenantId,
     campaign.id,
-    contacts.map((c) => ({ id: c.id, phoneE164: c.phoneE164 }))
+    eligible.map((c) => ({ id: c.id, phoneE164: c.phoneE164 }))
   );
 
+  // Atomically claim the campaign: concurrent callers both reading 'draft' would both
+  // pass the guard above, so the status update must be conditional at the DB level.
+  let claimed = false;
   await withTenant(tenantId, async (client) => {
-    await client.query("UPDATE campaigns SET status = 'running' WHERE id = $1", [campaign.id]);
-    await outboxRepository.enqueue(client, tenantId, {
-      topic: EventTopics.CampaignRunRequested,
-      payload: {
-        campaignId: campaign.id,
-        tenantId,
-        channelId: channel.id,
-        templateName: campaign.templateName,
-        templateLanguage: campaign.templateLanguage,
-        templateCategory: campaign.templateCategory,
-        templateStatus: campaign.templateStatus ?? "approved",
-        variableMapping: campaign.variableMapping,
-        quietHours: campaign.quietHours,
-        frequencyCap: campaign.frequencyCap,
-        ratePerMinute: campaign.ratePerMinute
-      }
-    });
+    const result = await client.query<{ id: string }>(
+      "UPDATE campaigns SET status = 'running' WHERE id = $1 AND status IN ('draft', 'paused') RETURNING id",
+      [campaign.id]
+    );
+    claimed = result.rows.length > 0;
+    if (claimed) {
+      await outboxRepository.enqueue(client, tenantId, {
+        topic: EventTopics.CampaignRunRequested,
+        payload: {
+          campaignId: campaign.id,
+          tenantId,
+          channelId: channel.id,
+          templateName: campaign.templateName,
+          templateLanguage: campaign.templateLanguage,
+          templateCategory: campaign.templateCategory,
+          templateStatus: campaign.templateStatus ?? "approved",
+          variableMapping: campaign.variableMapping,
+          quietHours: campaign.quietHours,
+          frequencyCap: campaign.frequencyCap,
+          ratePerMinute: campaign.ratePerMinute
+        }
+      });
+    }
   });
 
-  return { status: 202, body: { status: "run_started", campaignId: campaign.id, recipientCount: contacts.length } };
+  if (!claimed) {
+    return { status: 409, body: { error: "Campaign was already started by a concurrent request" } };
+  }
+
+  return {
+    status: 202,
+    body: { status: "run_started", campaignId: campaign.id, recipientCount: eligible.length, suppressed }
+  };
 }
 
 function getCurrentHourInTz(tz: string): number {
@@ -394,12 +556,17 @@ async function syncTemplates(
   }
   const url = new URL(`${config.metaAdapterUrl}/internal/v1/whatsapp/templates`);
   url.searchParams.set("wabaId", channel.wabaId);
-  if (channel.accessToken) {
-    url.searchParams.set("accessToken", channel.accessToken);
-  }
   let items: MetaTemplateItem[];
   try {
-    const response = await fetch(url, { headers: { "x-tenant-id": tenantId, "x-request-id": randomUUID() } });
+    const response = await fetch(url, {
+      headers: {
+        "x-tenant-id": tenantId,
+        "x-request-id": randomUUID(),
+        "x-internal-secret": config.internalServiceSecret,
+        ...(channel.accessToken ? { "x-access-token": channel.accessToken } : {})
+      },
+      signal: AbortSignal.timeout(15_000)
+    });
     const body = (await response.json()) as { items?: MetaTemplateItem[]; error?: string; warning?: string };
     if (!response.ok) {
       return { status: 502, body: { error: "template_sync_failed", detail: body.error ?? "meta error" } };
@@ -467,10 +634,19 @@ async function sendConversationMessage(
     return { status: 422, body: { error: "contact_opted_out" } };
   }
 
+  const VALID_MESSAGE_KINDS = ["text", "media", "interactive", "product", "catalog", "flow"] as const;
   const kind = body.kind ?? "text";
+  if (!VALID_MESSAGE_KINDS.includes(kind as (typeof VALID_MESSAGE_KINDS)[number])) {
+    return { status: 400, body: { error: `kind must be one of: ${VALID_MESSAGE_KINDS.join(", ")}` } };
+  }
 
-  if (kind === "text" && !body.text?.trim()) {
-    return { status: 400, body: { error: "text is required" } };
+  if (kind === "text") {
+    if (!body.text?.trim()) {
+      return { status: 400, body: { error: "text is required" } };
+    }
+    if (body.text.length > 4096) {
+      return { status: 400, body: { error: "text must be at most 4096 characters" } };
+    }
   }
   if (kind === "media" && !body.media?.mediaType) {
     return { status: 400, body: { error: "media.mediaType is required" } };
@@ -548,10 +724,12 @@ function startOutboxRelay(): NodeJS.Timeout {
 // ─── Campaign scheduler ────────────────────────────────────────────────────────
 
 function startCampaignScheduler(): NodeJS.Timeout {
+  let running = false;
   return setInterval(() => {
+    if (running) return;
+    running = true;
     void (async () => {
       try {
-        const { query: dbQuery } = await import("@hyfib/persistence");
         const result = await dbQuery<{
           id: string;
           tenant_id: string;
@@ -564,31 +742,28 @@ function startCampaignScheduler(): NodeJS.Timeout {
           frequency_cap: Record<string, unknown> | null;
           rate_per_minute: number | null;
           segment_id: string | null;
-        }>(
-          `SELECT c.id, c.tenant_id, c.variable_mapping, c.quiet_hours, c.frequency_cap,
-                  c.rate_per_minute, c.segment_id,
-                  t.name AS template_name, t.language AS template_language, t.category AS template_category, t.status AS template_status
-           FROM campaigns c
-           JOIN templates t ON t.id = c.template_id
-           WHERE c.status = 'scheduled' AND c.scheduled_at <= now()
-           LIMIT 20`
-        );
+        }>(`SELECT * FROM due_scheduled_campaigns($1)`, [20]);
         for (const row of result.rows) {
           await withTenant(row.tenant_id, async (client) => {
             if (row.segment_id) {
               const seg = await segmentRepository.getById(row.tenant_id, row.segment_id);
               if (seg) {
                 const contacts = await segmentRepository.resolveContacts(row.tenant_id, seg.definition);
+                const { eligible } = filterSendableContacts(contacts);
                 await campaignRecipientRepository.insertBatch(
                   row.tenant_id,
                   row.id,
-                  contacts.map((c) => ({ id: c.id, phoneE164: c.phoneE164 }))
+                  eligible.map((c) => ({ id: c.id, phoneE164: c.phoneE164 }))
                 );
               }
             }
             const channel = await channelRepository.firstActive(row.tenant_id);
             if (!channel) return;
-            await client.query("UPDATE campaigns SET status = 'running', scheduled_at = NULL WHERE id = $1", [row.id]);
+            const claimed = await client.query<{ id: string }>(
+              "UPDATE campaigns SET status = 'running', scheduled_at = NULL WHERE id = $1 AND status = 'scheduled' RETURNING id",
+              [row.id]
+            );
+            if (claimed.rows.length === 0) return; // Another scheduler instance already claimed it.
             await outboxRepository.enqueue(client, row.tenant_id, {
               topic: EventTopics.CampaignRunRequested,
               payload: {
@@ -609,15 +784,98 @@ function startCampaignScheduler(): NodeJS.Timeout {
         }
       } catch (error) {
         logger.error("scheduler_error", { error: error instanceof Error ? error.message : String(error) });
+      } finally {
+        running = false;
       }
     })();
   }, 30_000);
 }
 
+/**
+ * Fires `no_reply` automation rules for open conversations whose last activity
+ * was an inbound message older than the rule's delay, with no agent reply since.
+ * `no_reply_fired_at` de-dupes until a new inbound arrives.
+ */
+function startNoReplyScheduler(): NodeJS.Timeout {
+  let running = false;
+  return setInterval(() => {
+    if (running) return;
+    running = true;
+    void (async () => {
+      try {
+        const due = await dbQuery<{
+          id: string;
+          tenant_id: string;
+          contact_id: string;
+          last_inbound_at: Date | null;
+        }>(`SELECT * FROM due_no_reply_conversations($1)`, [50]);
+        for (const row of due.rows) {
+          const rules = await automationRuleRepository.listEnabledByTrigger(row.tenant_id, "no_reply");
+          const idleMs = row.last_inbound_at ? Date.now() - row.last_inbound_at.getTime() : 0;
+          const anyDue = rules.some((r) => idleMs >= (r.conditions.delayMinutes ?? 60) * 60_000);
+          if (!anyDue) {
+            continue;
+          }
+          await runAutomation(row.tenant_id, "no_reply", {}, { conversationId: row.id, contactId: row.contact_id });
+          await withTenant(row.tenant_id, async (client) => {
+            await client.query("UPDATE conversations SET no_reply_fired_at = now() WHERE id = $1", [row.id]);
+          });
+        }
+      } catch (error) {
+        logger.error("no_reply_scheduler_error", { error: error instanceof Error ? error.message : String(error) });
+      } finally {
+        running = false;
+      }
+    })();
+  }, 60_000);
+}
+
+/** Dispatches due task reminders (status open, remind_at passed) once via SSE. */
+function startReminderScheduler(): NodeJS.Timeout {
+  let running = false;
+  return setInterval(() => {
+    if (running) return;
+    running = true;
+    void (async () => {
+      try {
+        const due = await dbQuery<{ id: string; tenant_id: string; title: string }>(
+          `SELECT * FROM due_task_reminders($1)`,
+          [50]
+        );
+        for (const row of due.rows) {
+          await withTenant(row.tenant_id, async (client) => {
+            await client.query("UPDATE tasks SET reminded_at = now() WHERE id = $1", [row.id]);
+          });
+          sseHub.broadcast(row.tenant_id, "task.reminder", randomUUID(), { taskId: row.id, title: row.title });
+        }
+      } catch (error) {
+        logger.error("reminder_scheduler_error", { error: error instanceof Error ? error.message : String(error) });
+      } finally {
+        running = false;
+      }
+    })();
+  }, 60_000);
+}
+
 // ─── SSE hub ──────────────────────────────────────────────────────────────────
 
+/** Minimal LRU cache backed by Map insertion-order. Evicts the oldest entry (not the LRU access order, which is fine for this near-static phoneNumberId→tenantId mapping). */
+class LruCache<K, V> {
+  private readonly map = new Map<K, V>();
+  constructor(private readonly maxSize: number) {}
+  get(key: K): V | undefined {
+    return this.map.get(key);
+  }
+  set(key: K, value: V): void {
+    if (this.map.size >= this.maxSize && !this.map.has(key)) {
+      this.map.delete(this.map.keys().next().value as K);
+    }
+    this.map.set(key, value);
+  }
+}
+
 const sseHub = new SseHub();
-const sseTenantByPhoneNumberId = new Map<string, string>();
+const sseTenantByPhoneNumberId = new LruCache<string, string>(1_000);
 
 async function forwardEventToSse(event: EventEnvelope): Promise<void> {
   if (!sseHub.hasClients()) return;
@@ -630,7 +888,6 @@ async function forwardEventToSse(event: EventEnvelope): Promise<void> {
       const channel = await resolveChannelByPhoneNumberId(phoneNumberId);
       if (!channel) return;
       resolvedTenantId = channel.tenantId;
-      if (sseTenantByPhoneNumberId.size >= 1_000) sseTenantByPhoneNumberId.clear();
       sseTenantByPhoneNumberId.set(phoneNumberId, resolvedTenantId);
     }
     sseHub.broadcast(resolvedTenantId, event.topic, event.id, {
@@ -703,7 +960,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     const query = parseQuery(req.url);
     if (
       query.get("hub.mode") === "subscribe" &&
-      query.get("hub.verify_token") === config.webhookVerifyToken &&
+      verifyWebhookToken(query.get("hub.verify_token"), config.webhookVerifyToken) &&
       query.get("hub.challenge")
     ) {
       res.statusCode = 200;
@@ -735,7 +992,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     const proxyResponse = await fetch(`${config.webhookIngestorUrl}/internal/v1/webhooks/meta/whatsapp`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-request-id": randomUUID() },
-      body: JSON.stringify({ rawBody, signature: normalizedSignature })
+      body: JSON.stringify({ rawBody, signature: normalizedSignature }),
+      signal: AbortSignal.timeout(10_000)
     });
     const proxyBody = (await proxyResponse.json()) as Record<string, unknown>;
     sendJson(res, proxyResponse.ok ? 200 : 502, { requestId: ctx.requestId, upstream: proxyBody });
@@ -825,7 +1083,12 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   // ─── Users ────────────────────────────────────────────────────────────────
   if (path === "/api/v1/users") {
     if (method === "GET") {
-      sendJson(res, 200, { items: await userRepository.list(tenantId) });
+      const users = await userRepository.list(tenantId);
+      const isAdmin = hasAnyRole(auth, ["platform_owner", "tenant_admin"]);
+      const items = isAdmin
+        ? users
+        : users.map(({ id, displayName }) => ({ id, displayName }));
+      sendJson(res, 200, { items });
       return;
     }
     if (method === "POST") {
@@ -838,8 +1101,22 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         sendJson(res, 400, { error: "email, displayName, and roles are required" });
         return;
       }
+      const emailTrimmed = payload.email.trim();
+      if (!EMAIL.test(emailTrimmed)) {
+        sendJson(res, 400, { error: "email must be a valid email address" });
+        return;
+      }
+      if (!Array.isArray(payload.roles)) {
+        sendJson(res, 400, { error: "roles must be an array" });
+        return;
+      }
+      const invalidRoles = payload.roles.filter((r: unknown) => !VALID_ROLE_NAMES.includes(r as string));
+      if (invalidRoles.length > 0) {
+        sendJson(res, 400, { error: `Invalid roles: ${invalidRoles.join(", ")}` });
+        return;
+      }
       const user = await userRepository.create(tenantId, {
-        email: payload.email.trim(),
+        email: emailTrimmed,
         displayName: payload.displayName.trim(),
         roles: payload.roles
       });
@@ -850,6 +1127,78 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         payload: { email: user.email, roles: user.roles }
       });
       sendJson(res, 201, { ...user });
+      return;
+    }
+    sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+
+  // ─── Teams ────────────────────────────────────────────────────────────────
+  if (path === "/api/v1/teams") {
+    if (method === "GET") {
+      sendJson(res, 200, { items: await teamRepository.list(tenantId) });
+      return;
+    }
+    if (method === "POST") {
+      if (!hasAnyRole(auth, ["platform_owner", "tenant_admin"])) {
+        sendJson(res, 403, { error: "Only platform_owner/tenant_admin can create teams" });
+        return;
+      }
+      const body = await readJsonBody<{ name?: string; isDefault?: boolean }>(req);
+      const nameCheck = boundedText(body.name, 120);
+      if (!nameCheck.ok) {
+        sendJson(res, 400, { error: `name ${nameCheck.error}` });
+        return;
+      }
+      const team = await teamRepository.create(tenantId, { name: nameCheck.value, isDefault: body.isDefault });
+      await audit(tenantId, auth, {
+        action: "team.created",
+        resourceType: "Team",
+        resourceId: team.id,
+        payload: { name: team.name }
+      });
+      sendJson(res, 201, { ...team });
+      return;
+    }
+    sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+
+  if (path.startsWith("/api/v1/teams/") && path.endsWith("/members")) {
+    const teamId = extractPathSegment(path, "/api/v1/teams/");
+    if (!teamId || !UUID.test(teamId)) {
+      sendJson(res, 400, { error: "Invalid team id" });
+      return;
+    }
+    if (!(await teamRepository.getById(tenantId, teamId))) {
+      sendJson(res, 404, { error: "Team not found" });
+      return;
+    }
+    if (method === "GET") {
+      sendJson(res, 200, { items: await teamRepository.listMembers(tenantId, teamId) });
+      return;
+    }
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin"])) {
+      sendJson(res, 403, { error: "Only platform_owner/tenant_admin can manage members" });
+      return;
+    }
+    const body = await readJsonBody<{ userId?: string }>(req);
+    if (!body.userId || !UUID.test(body.userId)) {
+      sendJson(res, 400, { error: "userId must be a valid id" });
+      return;
+    }
+    if (!(await userRepository.getById(tenantId, body.userId))) {
+      sendJson(res, 422, { error: "userId does not belong to this tenant" });
+      return;
+    }
+    if (method === "POST") {
+      await teamRepository.addMember(tenantId, teamId, body.userId);
+      sendJson(res, 200, { status: "member_added", teamId, userId: body.userId });
+      return;
+    }
+    if (method === "DELETE") {
+      await teamRepository.removeMember(tenantId, teamId, body.userId);
+      sendJson(res, 200, { status: "member_removed", teamId, userId: body.userId });
       return;
     }
     sendJson(res, 405, { error: "Method not allowed" });
@@ -868,16 +1217,33 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         return;
       }
       const payload = await readJsonBody<CreateChannelRequest>(req);
-      if (!payload.wabaId || !payload.phoneNumberId || !payload.displayPhoneNumber) {
-        sendJson(res, 400, { error: "wabaId, phoneNumberId, displayPhoneNumber are required" });
+      const wabaIdCheck = boundedText(payload.wabaId, 64);
+      if (!wabaIdCheck.ok) {
+        sendJson(res, 400, { error: `wabaId ${wabaIdCheck.error}` });
         return;
+      }
+      const phoneNumberIdCheck = boundedText(payload.phoneNumberId, 64);
+      if (!phoneNumberIdCheck.ok) {
+        sendJson(res, 400, { error: `phoneNumberId ${phoneNumberIdCheck.error}` });
+        return;
+      }
+      const displayPhoneCheck = boundedText(payload.displayPhoneNumber, 32);
+      if (!displayPhoneCheck.ok) {
+        sendJson(res, 400, { error: `displayPhoneNumber ${displayPhoneCheck.error}` });
+        return;
+      }
+      if (payload.accessToken !== undefined) {
+        if (typeof payload.accessToken !== "string" || payload.accessToken.length > 4096) {
+          sendJson(res, 400, { error: "accessToken must be a string of at most 4096 characters" });
+          return;
+        }
       }
       let channel;
       try {
         channel = await channelRepository.create(tenantId, {
-          wabaId: payload.wabaId,
-          phoneNumberId: payload.phoneNumberId,
-          displayPhoneNumber: payload.displayPhoneNumber,
+          wabaId: wabaIdCheck.value,
+          phoneNumberId: phoneNumberIdCheck.value,
+          displayPhoneNumber: displayPhoneCheck.value,
           accessToken: payload.accessToken
         });
       } catch (error) {
@@ -900,13 +1266,55 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
 
+  // ─── WhatsApp settings (retry/rate-limit config; secrets never returned) ──
+  if (path === "/api/v1/channels/whatsapp/settings") {
+    if (method === "GET") {
+      const stored = await whatsappSettingsRepository.getByTenant(tenantId);
+      sendJson(res, 200, {
+        settings: stored ?? {
+          graphVersion: config.whatsappGraphVersion,
+          retryMaxAttempts: config.whatsappDefaultRetryMaxAttempts,
+          retryBaseDelayMs: config.whatsappDefaultRetryBaseDelayMs
+        }
+      });
+      return;
+    }
+    if (method === "PUT") {
+      if (!hasAnyRole(auth, ["platform_owner", "tenant_admin"])) {
+        sendJson(res, 403, { error: "Only platform_owner/tenant_admin can update WhatsApp settings" });
+        return;
+      }
+      const payload = await readJsonBody<UpdateWhatsAppSettingsRequest>(req);
+      const settings = await whatsappSettingsRepository.upsert(tenantId, {
+        statusCallbackUrl: payload.statusCallbackUrl?.trim() || undefined,
+        graphVersion: payload.graphVersion?.trim() || config.whatsappGraphVersion,
+        retryMaxAttempts: clampInt(payload.retryMaxAttempts, 1, 10, config.whatsappDefaultRetryMaxAttempts),
+        retryBaseDelayMs: clampInt(payload.retryBaseDelayMs, 50, 60_000, config.whatsappDefaultRetryBaseDelayMs),
+        outboundRateLimitPerMinute:
+          payload.outboundRateLimitPerMinute === undefined
+            ? undefined
+            : clampInt(payload.outboundRateLimitPerMinute, 1, 6_000, 60)
+      });
+      await audit(tenantId, auth, {
+        action: "channel.whatsapp.settings.updated",
+        resourceType: "WhatsAppSettings",
+        resourceId: settings.id,
+        payload: { graphVersion: settings.graphVersion, retryMaxAttempts: settings.retryMaxAttempts }
+      });
+      sendJson(res, 200, { settings });
+      return;
+    }
+    sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+
   if (path.startsWith("/api/v1/channels/whatsapp/") && path.endsWith("/sync-templates") && method === "POST") {
     if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager"])) {
       sendJson(res, 403, { error: "Insufficient role to sync templates" });
       return;
     }
-    const channelId = path.replace("/api/v1/channels/whatsapp/", "").replace("/sync-templates", "").trim();
-    if (!UUID.test(channelId)) {
+    const channelId = extractPathSegment(path, "/api/v1/channels/whatsapp/");
+    if (!channelId || !UUID.test(channelId)) {
       sendJson(res, 400, { error: "Invalid channel id" });
       return;
     }
@@ -928,8 +1336,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 403, { error: "Insufficient role to upload media" });
       return;
     }
-    const channelId = path.replace("/api/v1/channels/whatsapp/", "").replace("/media", "").trim();
-    if (!UUID.test(channelId)) {
+    const channelId = extractPathSegment(path, "/api/v1/channels/whatsapp/");
+    if (!channelId || !UUID.test(channelId)) {
       sendJson(res, 400, { error: "Invalid channel id" });
       return;
     }
@@ -965,9 +1373,11 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
           "Content-Type": mimeType,
           "x-tenant-id": tenantId,
           "x-request-id": randomUUID(),
+          "x-internal-secret": config.internalServiceSecret,
           ...(channel.accessToken ? { "x-access-token": channel.accessToken } : {})
         },
-        body: new Uint8Array(buffer)
+        body: new Uint8Array(buffer),
+        signal: AbortSignal.timeout(30_000)
       });
       const body = (await response.json()) as { mediaId?: string; error?: string };
       if (!response.ok || !body.mediaId) {
@@ -1002,15 +1412,31 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         return;
       }
       const payload = await readJsonBody<CreateTemplateRequest>(req);
-      if (!payload.name || !payload.category || !payload.language || !payload.body) {
-        sendJson(res, 400, { error: "name, category, language, body are required" });
+      const templateNameCheck = boundedText(payload.name, 512);
+      if (!templateNameCheck.ok) {
+        sendJson(res, 400, { error: `name ${templateNameCheck.error}` });
+        return;
+      }
+      const TEMPLATE_CATEGORIES = ["marketing", "utility", "authentication", "service"] as const;
+      if (!TEMPLATE_CATEGORIES.includes(payload.category as (typeof TEMPLATE_CATEGORIES)[number])) {
+        sendJson(res, 400, { error: `category must be one of: ${TEMPLATE_CATEGORIES.join(", ")}` });
+        return;
+      }
+      const templateLangCheck = boundedText(payload.language, 10);
+      if (!templateLangCheck.ok) {
+        sendJson(res, 400, { error: `language ${templateLangCheck.error}` });
+        return;
+      }
+      const templateBodyCheck = boundedText(payload.body, 1024);
+      if (!templateBodyCheck.ok) {
+        sendJson(res, 400, { error: `body ${templateBodyCheck.error}` });
         return;
       }
       const template = await templateRepository.create(tenantId, {
-        name: payload.name,
+        name: templateNameCheck.value,
         category: payload.category,
-        language: payload.language,
-        body: payload.body,
+        language: templateLangCheck.value,
+        body: templateBodyCheck.value,
         status: "pending"
       });
       await audit(tenantId, auth, {
@@ -1060,8 +1486,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   }
 
   if (path.startsWith("/api/v1/segments/") && path.endsWith("/preview") && method === "GET") {
-    const segmentId = path.replace("/api/v1/segments/", "").replace("/preview", "").trim();
-    if (!UUID.test(segmentId)) {
+    const segmentId = extractPathSegment(path, "/api/v1/segments/");
+    if (!segmentId || !UUID.test(segmentId)) {
       sendJson(res, 400, { error: "Invalid segment id" });
       return;
     }
@@ -1070,15 +1496,20 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 404, { error: "Segment not found" });
       return;
     }
-    const contacts = await segmentRepository.resolveContacts(tenantId, segment.definition);
-    sendJson(res, 200, { count: contacts.length, sample: contacts.slice(0, 5) });
+    const [count, sample] = await Promise.all([
+      segmentRepository.previewCount(tenantId, segment.definition),
+      segmentRepository.resolveContactsSample(tenantId, segment.definition, 5)
+    ]);
+    sendJson(res, 200, { count, sample });
     return;
   }
 
   // ─── Contacts ─────────────────────────────────────────────────────────────
   if (path === "/api/v1/contacts") {
     if (method === "GET") {
-      sendJson(res, 200, { items: await contactRepository.list(tenantId) });
+      const q = parseContactListQuery(parseQuery(req.url));
+      const { items, total } = await contactRepository.search(tenantId, q);
+      sendJson(res, 200, { items, total, limit: q.limit, offset: q.offset });
       return;
     }
     if (method === "POST") {
@@ -1091,6 +1522,32 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         sendJson(res, 400, { error: "phoneE164 must be E.164 formatted" });
         return;
       }
+      if (payload.firstName !== undefined && (typeof payload.firstName !== "string" || payload.firstName.length > 100)) {
+        sendJson(res, 400, { error: "firstName must be a string of at most 100 characters" });
+        return;
+      }
+      if (payload.lastName !== undefined && (typeof payload.lastName !== "string" || payload.lastName.length > 100)) {
+        sendJson(res, 400, { error: "lastName must be a string of at most 100 characters" });
+        return;
+      }
+      if (payload.country !== undefined && (typeof payload.country !== "string" || payload.country.length > 100)) {
+        sendJson(res, 400, { error: "country must be a string of at most 100 characters" });
+        return;
+      }
+      if (payload.timezone !== undefined && (typeof payload.timezone !== "string" || payload.timezone.length > 64)) {
+        sendJson(res, 400, { error: "timezone must be a string of at most 64 characters" });
+        return;
+      }
+      if (payload.tags !== undefined) {
+        if (!Array.isArray(payload.tags) || payload.tags.length > 50) {
+          sendJson(res, 400, { error: "tags must be an array of at most 50 items" });
+          return;
+        }
+        if (payload.tags.some((t: unknown) => typeof t !== "string" || t.length > 100)) {
+          sendJson(res, 400, { error: "each tag must be a string of at most 100 characters" });
+          return;
+        }
+      }
       const contact = await contactRepository.create(tenantId, payload);
       await audit(tenantId, auth, {
         action: "contact.created",
@@ -1102,6 +1559,31 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return;
     }
     sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+
+  // ─── Contact CSV export ───────────────────────────────────────────────────
+  if (path === "/api/v1/contacts/export" && method === "GET") {
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager"])) {
+      sendJson(res, 403, { error: "Insufficient role to export contacts" });
+      return;
+    }
+    const q = parseContactListQuery(parseQuery(req.url));
+    const { items } = await contactRepository.search(tenantId, { ...q, limit: CONTACTS_EXPORT_LIMIT, offset: 0 });
+    const truncated = items.length === CONTACTS_EXPORT_LIMIT;
+    const csv = serializeContactsCsv(items);
+    await audit(tenantId, auth, {
+      action: "contacts.exported",
+      resourceType: "Contact",
+      payload: { count: items.length, truncated }
+    });
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", 'attachment; filename="contacts.csv"');
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("X-Export-Count", String(items.length));
+    if (truncated) res.setHeader("X-Export-Truncated", "true");
+    res.end(csv);
     return;
   }
 
@@ -1162,8 +1644,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 403, { error: "Insufficient role to record consent" });
       return;
     }
-    const contactId = path.replace("/api/v1/contacts/", "").replace("/consent", "").trim();
-    if (!UUID.test(contactId)) {
+    const contactId = extractPathSegment(path, "/api/v1/contacts/");
+    if (!contactId || !UUID.test(contactId)) {
       sendJson(res, 400, { error: "Invalid contact id" });
       return;
     }
@@ -1173,6 +1655,14 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return;
     }
     const body = await readJsonBody<{ source?: string; policyVersion?: string }>(req);
+    if (body.source !== undefined && (typeof body.source !== "string" || body.source.length > 64)) {
+      sendJson(res, 400, { error: "source must be a string of at most 64 characters" });
+      return;
+    }
+    if (body.policyVersion !== undefined && (typeof body.policyVersion !== "string" || body.policyVersion.length > 32)) {
+      sendJson(res, 400, { error: "policyVersion must be a string of at most 32 characters" });
+      return;
+    }
     await consentRepository.grant(tenantId, contactId, {
       source: body.source ?? "manual",
       policyVersion: body.policyVersion ?? "v1"
@@ -1195,8 +1685,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 403, { error: "Insufficient role to opt out a contact" });
       return;
     }
-    const contactId = path.replace("/api/v1/contacts/", "").replace("/opt-out", "").trim();
-    if (!UUID.test(contactId)) {
+    const contactId = extractPathSegment(path, "/api/v1/contacts/");
+    if (!contactId || !UUID.test(contactId)) {
       sendJson(res, 400, { error: "Invalid contact id" });
       return;
     }
@@ -1206,6 +1696,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return;
     }
     const body = await readJsonBody<{ reason?: string }>(req);
+    if (body.reason !== undefined && (typeof body.reason !== "string" || body.reason.length > 256)) {
+      sendJson(res, 400, { error: "reason must be a string of at most 256 characters" });
+      return;
+    }
     const reason = body.reason ?? "manual_opt_out";
     await consentRepository.revoke(tenantId, contactId, reason);
     await contactRepository.setOptedOut(tenantId, contactId, true);
@@ -1225,10 +1719,166 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
 
+  // ─── Contact notes ────────────────────────────────────────────────────────
+  if (path.startsWith("/api/v1/contacts/") && path.endsWith("/notes")) {
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager", "sales_agent", "support_agent"])) {
+      sendJson(res, 403, { error: "Insufficient role to access contact notes" });
+      return;
+    }
+    const contactId = extractPathSegment(path, "/api/v1/contacts/");
+    if (!contactId || !UUID.test(contactId)) {
+      sendJson(res, 400, { error: "Invalid contact id" });
+      return;
+    }
+    if (method === "GET") {
+      sendJson(res, 200, { items: await contactNoteRepository.list(tenantId, contactId) });
+      return;
+    }
+    if (method === "POST") {
+      const body = await readJsonBody<{ note?: string }>(req);
+      const noteCheck = boundedText(body.note, 4096);
+      if (!noteCheck.ok) {
+        sendJson(res, 400, { error: `note ${noteCheck.error}` });
+        return;
+      }
+      const note = await contactNoteRepository.add(tenantId, {
+        contactId,
+        authorUserId: asActorUuid(auth.subject),
+        note: noteCheck.value
+      });
+      await audit(tenantId, auth, {
+        action: "contact.note.added",
+        resourceType: "Contact",
+        resourceId: contactId,
+        payload: { noteId: note.id }
+      });
+      sendJson(res, 201, { ...note });
+      return;
+    }
+    sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+
+  // ─── Contact tags ─────────────────────────────────────────────────────────
+  if (path.startsWith("/api/v1/contacts/") && path.endsWith("/tags")) {
+    if (!canCreateContact(auth)) {
+      sendJson(res, 403, { error: "Insufficient role to modify tags" });
+      return;
+    }
+    const contactId = extractPathSegment(path, "/api/v1/contacts/");
+    if (!contactId || !UUID.test(contactId)) {
+      sendJson(res, 400, { error: "Invalid contact id" });
+      return;
+    }
+    const body = await readJsonBody<{ tag?: string }>(req);
+    const tagCheck = boundedText(body.tag, 64);
+    if (!tagCheck.ok) {
+      sendJson(res, 400, { error: `tag ${tagCheck.error}` });
+      return;
+    }
+    const tag = tagCheck.value;
+    if (method === "POST") {
+      const existing = await contactRepository.getById(tenantId, contactId);
+      if (!existing) {
+        sendJson(res, 404, { error: "Contact not found" });
+        return;
+      }
+      if (existing.tags.length >= 50 && !existing.tags.includes(tag)) {
+        sendJson(res, 422, { error: "contact has reached the maximum of 50 tags" });
+        return;
+      }
+      await tagRepository.ensure(tenantId, tag);
+      await contactRepository.addTag(tenantId, contactId, tag);
+      await runAutomation(tenantId, "tag_added", { addedTag: tag }, { contactId });
+      sendJson(res, 200, { status: "tagged", contactId, tag });
+      return;
+    }
+    if (method === "DELETE") {
+      await contactRepository.removeTag(tenantId, contactId, tag);
+      sendJson(res, 200, { status: "untagged", contactId, tag });
+      return;
+    }
+    sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+
+  // ─── Contact custom fields ────────────────────────────────────────────────
+  if (path.startsWith("/api/v1/contacts/") && path.endsWith("/fields") && method === "PATCH") {
+    if (!canCreateContact(auth)) {
+      sendJson(res, 403, { error: "Insufficient role to modify custom fields" });
+      return;
+    }
+    const contactId = extractPathSegment(path, "/api/v1/contacts/");
+    if (!contactId || !UUID.test(contactId)) {
+      sendJson(res, 400, { error: "Invalid contact id" });
+      return;
+    }
+    const body = await readJsonBody<{ key?: string; value?: string | null }>(req);
+    const keyCheck = boundedText(body.key, 64);
+    if (!keyCheck.ok) {
+      sendJson(res, 400, { error: `key ${keyCheck.error}` });
+      return;
+    }
+    let value: string | null = null;
+    if (body.value !== undefined && body.value !== null && body.value !== "") {
+      const valueCheck = boundedText(body.value, 512);
+      if (!valueCheck.ok) {
+        sendJson(res, 400, { error: `value ${valueCheck.error}` });
+        return;
+      }
+      value = valueCheck.value;
+    }
+    await contactRepository.setCustomField(tenantId, contactId, keyCheck.value, value);
+    sendJson(res, 200, { status: "updated", contactId, key: keyCheck.value });
+    return;
+  }
+
+  // ─── Contact profile (single) ─────────────────────────────────────────────
+  if (path.startsWith("/api/v1/contacts/") && method === "GET") {
+    const contactId = extractPathSegment(path, "/api/v1/contacts/");
+    if (!contactId || !UUID.test(contactId)) {
+      sendJson(res, 400, { error: "Invalid contact id" });
+      return;
+    }
+    const contact = await contactRepository.getById(tenantId, contactId);
+    if (!contact) {
+      sendJson(res, 404, { error: "Contact not found" });
+      return;
+    }
+    sendJson(res, 200, { ...contact });
+    return;
+  }
+
+  // ─── Tag catalog ──────────────────────────────────────────────────────────
+  if (path === "/api/v1/tags") {
+    if (method === "GET") {
+      sendJson(res, 200, { items: await tagRepository.list(tenantId) });
+      return;
+    }
+    if (method === "POST") {
+      if (!canCreateContact(auth)) {
+        sendJson(res, 403, { error: "Insufficient role to create tags" });
+        return;
+      }
+      const body = await readJsonBody<{ name?: string; color?: string }>(req);
+      if (!body.name?.trim()) {
+        sendJson(res, 400, { error: "name is required" });
+        return;
+      }
+      const tag = await tagRepository.ensure(tenantId, body.name.trim(), body.color?.trim());
+      sendJson(res, 201, { ...tag });
+      return;
+    }
+    sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+
   // ─── Campaigns ────────────────────────────────────────────────────────────
   if (path === "/api/v1/campaigns") {
     if (method === "GET") {
-      sendJson(res, 200, { items: await campaignRepository.list(tenantId) });
+      const page = parseListQuery(parseQuery(req.url));
+      const { items, total } = await campaignRepository.list(tenantId, page);
+      sendJson(res, 200, { items, total, limit: page.limit, offset: page.offset });
       return;
     }
     if (method === "POST") {
@@ -1239,6 +1889,22 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       const payload = await readJsonBody<CreateCampaignRequest>(req);
       if (!payload.name?.trim() || !payload.templateId) {
         sendJson(res, 400, { error: "name and templateId are required" });
+        return;
+      }
+      if (payload.scheduledAt !== undefined && payload.scheduledAt !== null) {
+        const scheduledTs = Date.parse(String(payload.scheduledAt));
+        if (!Number.isFinite(scheduledTs)) {
+          sendJson(res, 400, { error: "scheduledAt must be a valid ISO-8601 date string" });
+          return;
+        }
+        if (scheduledTs <= Date.now()) {
+          sendJson(res, 400, { error: "scheduledAt must be a future date" });
+          return;
+        }
+      }
+      const campaignCheck = validateCampaignBody(payload);
+      if (!campaignCheck.ok) {
+        sendJson(res, 400, { error: campaignCheck.error });
         return;
       }
       const template = await templateRepository.getById(tenantId, payload.templateId);
@@ -1279,8 +1945,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 403, { error: "Insufficient role to dispatch campaigns" });
       return;
     }
-    const campaignId = path.replace("/api/v1/campaigns/", "").replace("/dispatch", "").trim();
-    if (!UUID.test(campaignId)) {
+    const campaignId = extractPathSegment(path, "/api/v1/campaigns/");
+    if (!campaignId || !UUID.test(campaignId)) {
       sendJson(res, 400, { error: "Invalid campaign id" });
       return;
     }
@@ -1316,8 +1982,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 403, { error: "Insufficient role to run campaigns" });
       return;
     }
-    const campaignId = path.replace("/api/v1/campaigns/", "").replace("/run", "").trim();
-    if (!UUID.test(campaignId)) {
+    const campaignId = extractPathSegment(path, "/api/v1/campaigns/");
+    if (!campaignId || !UUID.test(campaignId)) {
       sendJson(res, 400, { error: "Invalid campaign id" });
       return;
     }
@@ -1346,8 +2012,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 
   // Campaign delivery funnel report.
   if (path.startsWith("/api/v1/campaigns/") && path.endsWith("/report") && method === "GET") {
-    const campaignId = path.replace("/api/v1/campaigns/", "").replace("/report", "").trim();
-    if (!UUID.test(campaignId)) {
+    const campaignId = extractPathSegment(path, "/api/v1/campaigns/");
+    if (!campaignId || !UUID.test(campaignId)) {
       sendJson(res, 400, { error: "Invalid campaign id" });
       return;
     }
@@ -1367,12 +2033,14 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   // ─── Conversations ─────────────────────────────────────────────────────────
   if (path === "/api/v1/conversations" && method === "GET") {
     const query = parseQuery(req.url);
-    sendJson(res, 200, {
-      items: await conversationRepository.list(tenantId, {
-        state: query.get("state") ?? undefined,
-        assignedUserId: query.get("assignee") ?? undefined
-      })
+    const page = parseListQuery(query);
+    const { items, total } = await conversationRepository.list(tenantId, {
+      state: query.get("state") ?? undefined,
+      assignedUserId: query.get("assignee") ?? undefined,
+      limit: page.limit,
+      offset: page.offset
     });
+    sendJson(res, 200, { items, total, limit: page.limit, offset: page.offset });
     return;
   }
 
@@ -1381,15 +2049,49 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 403, { error: "Insufficient role" });
       return;
     }
-    const conversationId = path.replace("/api/v1/conversations/", "").replace("/assign", "").trim();
-    if (!UUID.test(conversationId)) {
+    const conversationId = extractPathSegment(path, "/api/v1/conversations/");
+    if (!conversationId || !UUID.test(conversationId)) {
       sendJson(res, 400, { error: "Invalid conversation id" });
       return;
     }
     const body = await readJsonBody<{ userId: string | null }>(req);
     await conversationRepository.assign(tenantId, conversationId, body.userId ?? null);
     sseHub.broadcast(tenantId, "conversation.assigned", randomUUID(), { conversationId, userId: body.userId });
+    if (body.userId) {
+      const conv = await conversationRepository.getById(tenantId, conversationId);
+      await runAutomation(
+        tenantId,
+        "conversation_assigned",
+        {},
+        { conversationId, contactId: conv?.contactId }
+      );
+    }
     sendJson(res, 200, { status: "assigned", conversationId, userId: body.userId });
+    return;
+  }
+
+  if (path.startsWith("/api/v1/conversations/") && path.endsWith("/assign-team") && method === "POST") {
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "support_agent", "sales_agent"])) {
+      sendJson(res, 403, { error: "Insufficient role" });
+      return;
+    }
+    const conversationId = extractPathSegment(path, "/api/v1/conversations/");
+    if (!conversationId || !UUID.test(conversationId)) {
+      sendJson(res, 400, { error: "Invalid conversation id" });
+      return;
+    }
+    const body = await readJsonBody<{ teamId: string | null }>(req);
+    if (body.teamId && !UUID.test(body.teamId)) {
+      sendJson(res, 400, { error: "teamId must be a valid id" });
+      return;
+    }
+    if (body.teamId && !(await teamRepository.getById(tenantId, body.teamId))) {
+      sendJson(res, 422, { error: "teamId does not belong to this tenant" });
+      return;
+    }
+    await conversationRepository.assignTeam(tenantId, conversationId, body.teamId ?? null);
+    sseHub.broadcast(tenantId, "conversation.team_assigned", randomUUID(), { conversationId, teamId: body.teamId });
+    sendJson(res, 200, { status: "team_assigned", conversationId, teamId: body.teamId });
     return;
   }
 
@@ -1398,8 +2100,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 403, { error: "Insufficient role" });
       return;
     }
-    const conversationId = path.replace("/api/v1/conversations/", "").replace("/state", "").trim();
-    if (!UUID.test(conversationId)) {
+    const conversationId = extractPathSegment(path, "/api/v1/conversations/");
+    if (!conversationId || !UUID.test(conversationId)) {
       sendJson(res, 400, { error: "Invalid conversation id" });
       return;
     }
@@ -1414,19 +2116,56 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
 
+  // ─── Conversation internal notes ──────────────────────────────────────────
+  if (path.startsWith("/api/v1/conversations/") && path.endsWith("/notes")) {
+    const conversationId = extractPathSegment(path, "/api/v1/conversations/");
+    if (!conversationId || !UUID.test(conversationId)) {
+      sendJson(res, 400, { error: "Invalid conversation id" });
+      return;
+    }
+    if (method === "GET") {
+      sendJson(res, 200, { items: await conversationNoteRepository.list(tenantId, conversationId) });
+      return;
+    }
+    if (method === "POST") {
+      if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager", "sales_agent", "support_agent"])) {
+        sendJson(res, 403, { error: "Insufficient role to add an internal note" });
+        return;
+      }
+      const body = await readJsonBody<{ note?: string }>(req);
+      if (!body.note?.trim()) {
+        sendJson(res, 400, { error: "note is required" });
+        return;
+      }
+      const note = await conversationNoteRepository.add(tenantId, {
+        conversationId,
+        authorUserId: asActorUuid(auth.subject),
+        note: body.note.trim()
+      });
+      await audit(tenantId, auth, {
+        action: "conversation.note.added",
+        resourceType: "Conversation",
+        resourceId: conversationId,
+        payload: { noteId: note.id }
+      });
+      sendJson(res, 201, { ...note });
+      return;
+    }
+    sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+
   if (path.startsWith("/api/v1/conversations/") && path.endsWith("/messages")) {
-    const conversationId = path.replace("/api/v1/conversations/", "").replace("/messages", "").trim();
-    if (!UUID.test(conversationId)) {
+    const conversationId = extractPathSegment(path, "/api/v1/conversations/");
+    if (!conversationId || !UUID.test(conversationId)) {
       sendJson(res, 400, { error: "Invalid conversation id" });
       return;
     }
     if (method === "GET") {
       const query = parseQuery(req.url);
-      const limit = Number(query.get("limit") ?? "50");
-      const before = query.get("before") ?? undefined;
       const items = await messageRepository.listByConversation(tenantId, conversationId, {
-        limit: Number.isFinite(limit) ? limit : 50,
-        before
+        limit: clampInt(query.get("limit"), 1, 200, 50),
+        before: query.get("before") ?? undefined
       });
       sendJson(res, 200, { items });
       return;
@@ -1469,7 +2208,44 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         return;
       }
       const payload = await readJsonBody<CreateAutoReplyRuleRequest>(req);
-      const rule = await autoReplyRuleRepository.create(tenantId, payload);
+      const matchType = payload.matchType ?? "keyword";
+      if (!["keyword", "contains", "regex", "any"].includes(matchType)) {
+        sendJson(res, 400, { error: "matchType must be keyword, contains, regex, or any" });
+        return;
+      }
+      if (matchType !== "any") {
+        const keywordCheck = boundedText(payload.keyword, 256);
+        if (!keywordCheck.ok) {
+          sendJson(res, 400, { error: `keyword ${keywordCheck.error} (required for matchType "${matchType}")` });
+          return;
+        }
+        if (matchType === "regex") {
+          try {
+            new RegExp(keywordCheck.value);
+          } catch {
+            sendJson(res, 400, { error: "keyword is not a valid regular expression" });
+            return;
+          }
+        }
+      }
+      const replyTextCheck = boundedText(payload.replyText, 4096);
+      if (!replyTextCheck.ok) {
+        sendJson(res, 400, { error: `replyText ${replyTextCheck.error}` });
+        return;
+      }
+      const enabledRaw = payload.enabled;
+      if (enabledRaw !== undefined && typeof enabledRaw !== "boolean") {
+        sendJson(res, 400, { error: "enabled must be a boolean" });
+        return;
+      }
+      const rule = await autoReplyRuleRepository.create(tenantId, {
+        matchType,
+        keyword: matchType !== "any" ? payload.keyword : undefined,
+        replyKind: "text",
+        replyText: replyTextCheck.value,
+        enabled: enabledRaw ?? true,
+        priority: clampInt(payload.priority, 0, 1000, 0)
+      });
       sendJson(res, 201, { ...rule });
       return;
     }
@@ -1478,8 +2254,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   }
 
   if (path.startsWith("/api/v1/auto-reply-rules/") && method === "PATCH") {
-    const ruleId = path.replace("/api/v1/auto-reply-rules/", "").trim();
-    if (!UUID.test(ruleId)) {
+    const ruleId = extractPathSegment(path, "/api/v1/auto-reply-rules/");
+    if (!ruleId || !UUID.test(ruleId)) {
       sendJson(res, 400, { error: "Invalid rule id" });
       return;
     }
@@ -1488,8 +2264,224 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return;
     }
     const body = await readJsonBody<{ enabled: boolean }>(req);
+    if (typeof body.enabled !== "boolean") {
+      sendJson(res, 400, { error: "enabled must be a boolean" });
+      return;
+    }
     await autoReplyRuleRepository.setEnabled(tenantId, ruleId, body.enabled);
     sendJson(res, 200, { status: "updated", ruleId, enabled: body.enabled });
+    return;
+  }
+
+  // ─── Saved replies ────────────────────────────────────────────────────────
+  if (path === "/api/v1/saved-replies") {
+    if (method === "GET") {
+      sendJson(res, 200, { items: await savedReplyRepository.list(tenantId) });
+      return;
+    }
+    if (method === "POST") {
+      if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager", "sales_agent", "support_agent"])) {
+        sendJson(res, 403, { error: "Insufficient role" });
+        return;
+      }
+      const body = await readJsonBody<{ title?: string; body?: string }>(req);
+      const titleCheck = boundedText(body.title, 120);
+      const bodyCheck = boundedText(body.body, 4096);
+      if (!titleCheck.ok || !bodyCheck.ok) {
+        sendJson(res, 400, { error: "title and body are required" });
+        return;
+      }
+      const reply = await savedReplyRepository.create(tenantId, { title: titleCheck.value, body: bodyCheck.value });
+      sendJson(res, 201, { ...reply });
+      return;
+    }
+    sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+
+  if (path.startsWith("/api/v1/saved-replies/") && method === "DELETE") {
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager"])) {
+      sendJson(res, 403, { error: "Insufficient role" });
+      return;
+    }
+    const replyId = extractPathSegment(path, "/api/v1/saved-replies/");
+    if (!replyId || !UUID.test(replyId)) {
+      sendJson(res, 400, { error: "Invalid saved reply id" });
+      return;
+    }
+    await savedReplyRepository.delete(tenantId, replyId);
+    sendJson(res, 200, { status: "deleted", replyId });
+    return;
+  }
+
+  // ─── Automation rules ─────────────────────────────────────────────────────
+  if (path === "/api/v1/automation-rules") {
+    if (method === "GET") {
+      const page = parseListQuery(parseQuery(req.url));
+      const { items, total } = await automationRuleRepository.list(tenantId, page);
+      sendJson(res, 200, { items, total, limit: page.limit, offset: page.offset });
+      return;
+    }
+    if (method === "POST") {
+      if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager"])) {
+        sendJson(res, 403, { error: "Insufficient role" });
+        return;
+      }
+      const payload = await readJsonBody<CreateAutomationRuleRequest>(req);
+      if (!payload.name?.trim() || !payload.triggerType || !payload.actionType) {
+        sendJson(res, 400, { error: "name, triggerType and actionType are required" });
+        return;
+      }
+      const nameCheck = boundedText(payload.name, 256);
+      if (!nameCheck.ok) {
+        sendJson(res, 400, { error: `name ${nameCheck.error}` });
+        return;
+      }
+      if (!AUTOMATION_TRIGGERS.has(payload.triggerType) || !AUTOMATION_ACTIONS.has(payload.actionType)) {
+        sendJson(res, 400, { error: "Unknown triggerType or actionType" });
+        return;
+      }
+      const assignee = payload.actionConfig?.assigneeUserId;
+      if (payload.actionType === "assign_agent") {
+        if (!assignee || !UUID.test(assignee)) {
+          sendJson(res, 400, { error: "actionConfig.assigneeUserId must be a valid user id for assign_agent" });
+          return;
+        }
+        if (!(await userRepository.getById(tenantId, assignee))) {
+          sendJson(res, 422, { error: "actionConfig.assigneeUserId does not belong to this tenant" });
+          return;
+        }
+      }
+      const enabledRaw = payload.enabled;
+      if (enabledRaw !== undefined && typeof enabledRaw !== "boolean") {
+        sendJson(res, 400, { error: "enabled must be a boolean" });
+        return;
+      }
+      const rule = await automationRuleRepository.create(tenantId, {
+        name: nameCheck.value,
+        triggerType: payload.triggerType,
+        conditions: payload.conditions,
+        actionType: payload.actionType,
+        actionConfig: payload.actionConfig,
+        enabled: enabledRaw ?? true,
+        priority: clampInt(payload.priority, 0, 1000, 0)
+      });
+      await audit(tenantId, auth, {
+        action: "automation.rule.created",
+        resourceType: "AutomationRule",
+        resourceId: rule.id,
+        payload: { triggerType: rule.triggerType, actionType: rule.actionType }
+      });
+      sendJson(res, 201, { ...rule });
+      return;
+    }
+    sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+
+  if (path.startsWith("/api/v1/automation-rules/") && method === "PATCH") {
+    const ruleId = extractPathSegment(path, "/api/v1/automation-rules/");
+    if (!ruleId || !UUID.test(ruleId)) {
+      sendJson(res, 400, { error: "Invalid rule id" });
+      return;
+    }
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager"])) {
+      sendJson(res, 403, { error: "Insufficient role" });
+      return;
+    }
+    const body = await readJsonBody<{ enabled: boolean }>(req);
+    if (typeof body.enabled !== "boolean") {
+      sendJson(res, 400, { error: "enabled must be a boolean" });
+      return;
+    }
+    await automationRuleRepository.setEnabled(tenantId, ruleId, body.enabled);
+    sendJson(res, 200, { status: "updated", ruleId, enabled: body.enabled });
+    return;
+  }
+
+  // ─── Tasks / reminders ────────────────────────────────────────────────────
+  if (path === "/api/v1/tasks") {
+    if (method === "GET") {
+      const q = parseQuery(req.url);
+      const page = parseListQuery(q);
+      const { items, total } = await taskRepository.list(tenantId, {
+        status: q.get("status") ?? undefined,
+        assigneeUserId: q.get("assignee") ?? undefined,
+        limit: page.limit,
+        offset: page.offset
+      });
+      sendJson(res, 200, { items, total, limit: page.limit, offset: page.offset });
+      return;
+    }
+    if (method === "POST") {
+      if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager", "sales_agent", "support_agent"])) {
+        sendJson(res, 403, { error: "Insufficient role to create tasks" });
+        return;
+      }
+      const payload = await readJsonBody<CreateTaskRequest>(req);
+      const titleCheck = boundedText(payload.title, 256);
+      if (!titleCheck.ok) {
+        sendJson(res, 400, { error: `title ${titleCheck.error}` });
+        return;
+      }
+      for (const [field, value] of [
+        ["contactId", payload.contactId],
+        ["conversationId", payload.conversationId],
+        ["assigneeUserId", payload.assigneeUserId]
+      ] as const) {
+        if (value !== undefined && !UUID.test(value)) {
+          sendJson(res, 400, { error: `${field} must be a valid id` });
+          return;
+        }
+      }
+      if (payload.assigneeUserId && !(await userRepository.getById(tenantId, payload.assigneeUserId))) {
+        sendJson(res, 422, { error: "assigneeUserId does not belong to this tenant" });
+        return;
+      }
+      const dueCheck = parseOptionalIsoDate(payload.dueAt);
+      const remindCheck = parseOptionalIsoDate(payload.remindAt);
+      if (!dueCheck.ok || !remindCheck.ok) {
+        sendJson(res, 400, { error: "dueAt/remindAt must be valid ISO-8601 dates" });
+        return;
+      }
+      const task = await taskRepository.create(tenantId, {
+        title: titleCheck.value,
+        contactId: payload.contactId,
+        conversationId: payload.conversationId,
+        assigneeUserId: payload.assigneeUserId,
+        dueAt: dueCheck.value,
+        remindAt: remindCheck.value ?? dueCheck.value
+      });
+      await audit(tenantId, auth, {
+        action: "task.created",
+        resourceType: "Task",
+        resourceId: task.id,
+        payload: { title: task.title }
+      });
+      sendJson(res, 201, { ...task });
+      return;
+    }
+    sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+
+  if (path.startsWith("/api/v1/tasks/") && method === "PATCH") {
+    const taskId = extractPathSegment(path, "/api/v1/tasks/");
+    if (!taskId || !UUID.test(taskId)) {
+      sendJson(res, 400, { error: "Invalid task id" });
+      return;
+    }
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager", "sales_agent", "support_agent"])) {
+      sendJson(res, 403, { error: "Insufficient role" });
+      return;
+    }
+    const body = await readJsonBody<{ status: "open" | "done" | "cancelled" }>(req);
+    if (!["open", "done", "cancelled"].includes(body.status)) {
+      sendJson(res, 400, { error: "status must be open, done, or cancelled" });
+      return;
+    }
+    await taskRepository.updateStatus(tenantId, taskId, body.status);
+    sendJson(res, 200, { status: "updated", taskId, taskStatus: body.status });
     return;
   }
 
@@ -1509,7 +2501,24 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         sendJson(res, 400, { error: "contactId, externalOrderId, amountMinor and currency are required" });
         return;
       }
-      const order = await orderRepository.create(tenantId, payload);
+      if (!UUID.test(payload.contactId)) {
+        sendJson(res, 400, { error: "contactId must be a valid id" });
+        return;
+      }
+      if (typeof payload.amountMinor !== "number" || !Number.isInteger(payload.amountMinor) || payload.amountMinor <= 0) {
+        sendJson(res, 400, { error: "amountMinor must be a positive integer (amount in minor currency units)" });
+        return;
+      }
+      if (typeof payload.currency !== "string" || !/^[A-Z]{3}$/.test(payload.currency)) {
+        sendJson(res, 400, { error: "currency must be a 3-letter ISO 4217 currency code" });
+        return;
+      }
+      const externalOrderIdCheck = boundedText(payload.externalOrderId, 256);
+      if (!externalOrderIdCheck.ok) {
+        sendJson(res, 400, { error: `externalOrderId ${externalOrderIdCheck.error}` });
+        return;
+      }
+      const order = await orderRepository.create(tenantId, { ...payload, externalOrderId: externalOrderIdCheck.value });
       await audit(tenantId, auth, {
         action: "order.created",
         resourceType: "Order",
@@ -1535,7 +2544,105 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 403, { error: "Insufficient role to read audit log" });
       return;
     }
-    sendJson(res, 200, { items: await auditRepository.list(tenantId) });
+    const auditQuery = parseQuery(req.url);
+    const auditPage = parseListQuery(auditQuery, 50, 200);
+    const items = await auditRepository.list(tenantId, auditPage);
+    sendJson(res, 200, { items, limit: auditPage.limit, offset: auditPage.offset });
+    return;
+  }
+
+  // ─── Reporting service proxy ──────────────────────────────────────────────
+  if (path === "/api/v1/reports/overview" && method === "GET") {
+    const upstream = await fetch(`${config.reportingServiceUrl}/internal/v1/reports/overview`, {
+      headers: {
+        "x-tenant-id": tenantId,
+        "x-request-id": ctx.requestId,
+        "x-internal-secret": config.internalServiceSecret
+      },
+      signal: AbortSignal.timeout(10_000)
+    });
+    const body = (await upstream.json()) as Record<string, unknown>;
+    sendJson(res, upstream.ok ? 200 : upstream.status, body);
+    return;
+  }
+
+  // ─── Billing / usage proxy ────────────────────────────────────────────────
+  if (path === "/api/v1/usage" && method === "GET") {
+    const days = parseQuery(req.url).get("days") ?? "7";
+    const upstream = await fetch(
+      `${config.billingUsageServiceUrl}/internal/v1/usage?days=${encodeURIComponent(days)}`,
+      {
+        headers: {
+          "x-tenant-id": tenantId,
+          "x-request-id": ctx.requestId,
+          "x-internal-secret": config.internalServiceSecret
+        },
+        signal: AbortSignal.timeout(10_000)
+      }
+    );
+    const body = (await upstream.json()) as Record<string, unknown>;
+    sendJson(res, upstream.ok ? 200 : upstream.status, body);
+    return;
+  }
+
+  // ─── Tenant management (platform_owner only) ──────────────────────────────
+  if (path === "/api/v1/tenants") {
+    if (!hasAnyRole(auth, ["platform_owner"])) {
+      sendJson(res, 403, { error: "Insufficient role" });
+      return;
+    }
+    const internalHeaders: Record<string, string> = {
+      "x-tenant-id": tenantId,
+      "x-request-id": ctx.requestId,
+      "x-internal-secret": config.internalServiceSecret
+    };
+    if (method === "GET") {
+      const upstream = await fetch(`${config.tenantServiceUrl}/internal/v1/tenants`, {
+        headers: internalHeaders,
+        signal: AbortSignal.timeout(10_000)
+      });
+      const body = (await upstream.json()) as Record<string, unknown>;
+      sendJson(res, upstream.ok ? 200 : upstream.status, body);
+      return;
+    }
+    if (method === "POST") {
+      const raw = await readRawBody(req);
+      const upstream = await fetch(`${config.tenantServiceUrl}/internal/v1/tenants`, {
+        method: "POST",
+        headers: { ...internalHeaders, "Content-Type": "application/json" },
+        body: raw,
+        signal: AbortSignal.timeout(10_000)
+      });
+      const body = (await upstream.json()) as Record<string, unknown>;
+      sendJson(res, upstream.ok ? 201 : upstream.status, body);
+      return;
+    }
+    sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+
+  // ─── AI intelligence proxy ────────────────────────────────────────────────
+  if (path.startsWith("/api/v1/ai/") && (method === "POST" || method === "GET")) {
+    const aiPath = path.slice("/api/v1/ai/".length);
+    const ALLOWED_AI_PATHS = ["campaign-draft", "segment-summary", "lead-score"] as const;
+    if (!ALLOWED_AI_PATHS.includes(aiPath as (typeof ALLOWED_AI_PATHS)[number])) {
+      sendJson(res, 404, { error: "route_not_found" });
+      return;
+    }
+    const raw = method === "POST" ? await readRawBody(req) : undefined;
+    const upstream = await fetch(`${config.aiIntelligenceUrl}/internal/v1/ai/${aiPath}`, {
+      method,
+      headers: {
+        "Content-Type": "application/json",
+        "x-tenant-id": tenantId,
+        "x-request-id": ctx.requestId,
+        "x-internal-secret": config.internalServiceSecret
+      },
+      ...(raw !== undefined ? { body: raw } : {}),
+      signal: AbortSignal.timeout(90_000)
+    });
+    const body = (await upstream.json()) as Record<string, unknown>;
+    sendJson(res, upstream.ok ? 200 : upstream.status, body);
     return;
   }
 
@@ -1562,6 +2669,8 @@ const server = createServer((req, res) => {
 
 const relayTimer = startOutboxRelay();
 const schedulerTimer = startCampaignScheduler();
+const noReplyTimer = startNoReplyScheduler();
+const reminderTimer = startReminderScheduler();
 
 server.listen(config.apiGatewayPort, () => {
   logger.info("service_started", {
@@ -1579,6 +2688,8 @@ async function shutdown(signal: string): Promise<void> {
   logger.info("shutdown_started", { signal });
   clearInterval(relayTimer);
   clearInterval(schedulerTimer);
+  clearInterval(noReplyTimer);
+  clearInterval(reminderTimer);
   sseHub.close();
   server.close(async () => {
     await eventBus.close().catch(() => undefined);
