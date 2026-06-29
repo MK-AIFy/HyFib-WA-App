@@ -1449,7 +1449,9 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   // ─── Templates ────────────────────────────────────────────────────────────
   if (path === "/api/v1/templates") {
     if (method === "GET") {
-      sendJson(res, 200, { items: await templateRepository.list(tenantId) });
+      const statusFilter = parseQuery(req.url).get("status") ?? undefined;
+      const templates = await templateRepository.list(tenantId, { status: statusFilter });
+      sendJson(res, 200, { items: templates });
       return;
     }
     if (method === "POST") {
@@ -2084,6 +2086,26 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
 
+  // Campaign recipients (paginated).
+  if (/^\/api\/v1\/campaigns\/[^/]+\/recipients$/.test(path) && method === "GET") {
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager", "analyst"])) {
+      sendJson(res, 403, { error: "Insufficient role" });
+      return;
+    }
+    const campaignId = path.split("/")[4];
+    if (!campaignId || !UUID.test(campaignId)) {
+      sendJson(res, 400, { error: "Invalid campaign id" });
+      return;
+    }
+    const recipientsQuery = parseQuery(req.url);
+    const offset = Number(recipientsQuery.get("offset") ?? "0");
+    const limit = Math.min(Number(recipientsQuery.get("limit") ?? "100"), 500);
+    const statusFilter = recipientsQuery.get("status") ?? undefined;
+    const items = await campaignRecipientRepository.listByCampaign(tenantId, campaignId, { limit, status: statusFilter });
+    sendJson(res, 200, { items, offset, limit });
+    return;
+  }
+
   // ─── Conversations ─────────────────────────────────────────────────────────
   if (path === "/api/v1/conversations" && method === "GET") {
     const query = parseQuery(req.url);
@@ -2587,8 +2609,23 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   }
 
   // ─── Analytics & Audit ────────────────────────────────────────────────────
+  if (path === "/api/v1/analytics/link-clicks" && method === "GET") {
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager", "analyst"])) {
+      sendJson(res, 403, { error: "Insufficient role" });
+      return;
+    }
+    const lcQuery = parseQuery(req.url);
+    const lcCampaignId = lcQuery.get("campaignId") ?? undefined;
+    const lcOffset = Number(lcQuery.get("offset") ?? "0");
+    const lcLimit = Math.min(Number(lcQuery.get("limit") ?? "100"), 500);
+    const result = await linkClickRepository.list(tenantId, { campaignId: lcCampaignId, offset: lcOffset, limit: lcLimit });
+    sendJson(res, 200, result);
+    return;
+  }
+
   if (path === "/api/v1/analytics" && method === "GET") {
-    const totals = await tenantAnalytics(tenantId);
+    const analyticsCampaignId = parseQuery(req.url).get("campaignId") ?? undefined;
+    const totals = await tenantAnalytics(tenantId, { campaignId: analyticsCampaignId });
     sendJson(res, 200, { tenantId, totals });
     return;
   }

@@ -443,6 +443,12 @@ function mapTemplate(row: TemplateRow): Template {
   };
 }
 
+export interface TemplateListOptions {
+  status?: string;
+  offset?: number;
+  limit?: number;
+}
+
 export const templateRepository = {
   async create(
     tenantId: string,
@@ -458,10 +464,20 @@ export const templateRepository = {
       return mapTemplate(result.rows[0]!);
     });
   },
-  async list(tenantId: string): Promise<Template[]> {
+  async list(tenantId: string, opts?: TemplateListOptions): Promise<Template[]> {
     return withTenant(tenantId, async (client) => {
+      const params: unknown[] = [];
+      const conditions: string[] = [];
+      if (opts?.status) {
+        params.push(opts.status);
+        conditions.push(`status = $${params.length}`);
+      }
+      const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+      const limitClause = opts?.limit != null ? ` LIMIT $${params.push(opts.limit)}` : "";
+      const offsetClause = opts?.offset != null ? ` OFFSET $${params.push(opts.offset)}` : "";
       const result = await client.query<TemplateRow>(
-        "SELECT id, tenant_id, name, category, language, status, body FROM templates ORDER BY created_at DESC"
+        `SELECT id, tenant_id, name, category, language, status, body FROM templates ${where} ORDER BY created_at DESC${limitClause}${offsetClause}`,
+        params
       );
       return result.rows.map(mapTemplate);
     });
@@ -1651,9 +1667,19 @@ export interface TenantAnalytics {
   contacts: number;
   conversations: number;
   optOutRate: number;
+  campaignStats?: {
+    sent: number;
+    delivered: number;
+    read: number;
+    failed: number;
+    policySkipped: number;
+  };
 }
 
-export async function tenantAnalytics(tenantId: string): Promise<TenantAnalytics> {
+export async function tenantAnalytics(
+  tenantId: string,
+  opts: { campaignId?: string } = {}
+): Promise<TenantAnalytics> {
   return withTenant(tenantId, async (client) => {
     const [templates, campaigns, contacts, conversations] = await Promise.all([
       client.query<{ count: string }>("SELECT COUNT(*)::text AS count FROM templates"),
@@ -1667,12 +1693,39 @@ export async function tenantAnalytics(tenantId: string): Promise<TenantAnalytics
     ]);
     const total = Number(contacts.rows[0]?.total ?? "0");
     const optedOut = Number(contacts.rows[0]?.opted_out ?? "0");
+
+    const campaignStatsResult = opts.campaignId
+      ? await client.query<{ status: string; count: string }>(
+          `SELECT status, COUNT(*)::text AS count
+           FROM campaign_recipients
+           WHERE campaign_id = $1
+           GROUP BY status`,
+          [opts.campaignId]
+        )
+      : null;
+
+    let campaignStats: TenantAnalytics["campaignStats"];
+    if (campaignStatsResult) {
+      const byStatus = new Map<string, number>();
+      for (const row of campaignStatsResult.rows) {
+        byStatus.set(row.status, Number(row.count));
+      }
+      campaignStats = {
+        sent: byStatus.get("sent") ?? 0,
+        delivered: byStatus.get("delivered") ?? 0,
+        read: byStatus.get("read") ?? 0,
+        failed: byStatus.get("failed") ?? 0,
+        policySkipped: byStatus.get("policy_skipped") ?? 0
+      };
+    }
+
     return {
       templates: Number(templates.rows[0]?.count ?? "0"),
       campaigns: Number(campaigns.rows[0]?.count ?? "0"),
       contacts: total,
       conversations: Number(conversations.rows[0]?.count ?? "0"),
-      optOutRate: total ? Number((optedOut / total).toFixed(4)) : 0
+      optOutRate: total ? Number((optedOut / total).toFixed(4)) : 0,
+      ...(campaignStats !== undefined ? { campaignStats } : {})
     };
   });
 }
@@ -1986,6 +2039,35 @@ export const campaignRecipientRepository = {
         params
       );
       return result.rows.map(mapRecipient);
+    });
+  },
+  async listRecipients(
+    tenantId: string,
+    campaignId: string,
+    opts: { offset?: number; limit?: number } = {}
+  ): Promise<{ items: CampaignRecipient[]; total: number }> {
+    return withTenant(tenantId, async (client) => {
+      const limit = opts.limit ?? 100;
+      const offset = opts.offset ?? 0;
+      const [rows, countRow] = await Promise.all([
+        client.query<CampaignRecipientRow>(
+          `SELECT id, tenant_id, campaign_id, contact_id, phone_e164, status,
+                  external_message_id, error, skip_reason, sent_at, delivered_at, read_at, created_at
+           FROM campaign_recipients
+           WHERE campaign_id = $1
+           ORDER BY created_at DESC
+           LIMIT $2 OFFSET $3`,
+          [campaignId, limit, offset]
+        ),
+        client.query<{ total: string }>(
+          `SELECT COUNT(*)::text AS total FROM campaign_recipients WHERE campaign_id = $1`,
+          [campaignId]
+        )
+      ]);
+      return {
+        items: rows.rows.map(mapRecipient),
+        total: Number(countRow.rows[0]?.total ?? "0")
+      };
     });
   },
   async funnelCounts(tenantId: string, campaignId: string): Promise<Record<string, number>> {
@@ -2400,5 +2482,50 @@ export const linkClickRepository = {
     );
     const row = result.rows[0];
     return row ? { destination: row.destination, tenantId: row.tenant_id } : undefined;
+  },
+  async list(
+    tenantId: string,
+    opts: { campaignId?: string; offset?: number; limit?: number } = {}
+  ): Promise<{ items: Array<{ id: string; linkToken: string; campaignId?: string; contactId?: string; clickedAt?: string }>; total: number }> {
+    return withTenant(tenantId, async (client) => {
+      const conditions: string[] = ["tenant_id = current_setting('app.tenant_id', true)::uuid"];
+      const params: unknown[] = [];
+      if (opts.campaignId) {
+        params.push(opts.campaignId);
+        conditions.push(`campaign_id = $${params.length}`);
+      }
+      const limitVal = opts.limit ?? 100;
+      const offsetVal = opts.offset ?? 0;
+      params.push(limitVal);
+      const limitIdx = params.length;
+      params.push(offsetVal);
+      const offsetIdx = params.length;
+      const where = conditions.join(" AND ");
+      // Use params without LIMIT/OFFSET for the count query
+      const countParams = params.slice(0, params.length - 2);
+      const [rows, countRow] = await Promise.all([
+        client.query<{ id: string; token: string; campaign_id: string | null; contact_id: string | null; last_clicked_at: Date | null }>(
+          `SELECT id, token, campaign_id, contact_id, last_clicked_at
+           FROM link_clicks WHERE ${where}
+           ORDER BY last_clicked_at DESC NULLS LAST
+           LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
+          params
+        ),
+        client.query<{ total: string }>(
+          `SELECT COUNT(*)::text AS total FROM link_clicks WHERE ${where}`,
+          countParams
+        )
+      ]);
+      return {
+        items: rows.rows.map((r) => ({
+          id: r.id,
+          linkToken: r.token,
+          campaignId: r.campaign_id ?? undefined,
+          contactId: r.contact_id ?? undefined,
+          clickedAt: r.last_clicked_at?.toISOString()
+        })),
+        total: Number(countRow.rows[0]?.total ?? "0")
+      };
+    });
   }
 };
