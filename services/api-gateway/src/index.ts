@@ -2279,7 +2279,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return;
     }
     if (method === "POST") {
-      if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager"])) {
+      if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager", "support_agent"])) {
         sendJson(res, 403, { error: "Insufficient role" });
         return;
       }
@@ -2335,7 +2335,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 400, { error: "Invalid rule id" });
       return;
     }
-    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager"])) {
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager", "support_agent"])) {
       sendJson(res, 403, { error: "Insufficient role" });
       return;
     }
