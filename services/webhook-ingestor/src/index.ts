@@ -3,7 +3,7 @@ import { createEventBus } from "@hyfib/event-bus";
 import { loadConfig } from "@hyfib/config";
 import {
   EventTopics,
-  IdempotencyStore,
+  RedisIdempotencyStore,
   Logger,
   methodNotAllowed,
   notFound,
@@ -15,6 +15,7 @@ import {
   incCounter,
   verifyMetaSignature
 } from "@hyfib/shared-core";
+import { getRedisClient } from "@hyfib/ratelimit";
 import { normalizeInbound, normalizeStatus, type RawValue } from "./normalize.js";
 
 interface WebhookPayload {
@@ -36,7 +37,7 @@ interface ForwardedWebhookRequest {
 const config = loadConfig();
 const logger = new Logger("webhook-ingestor", config.logLevel as "debug" | "info" | "warn" | "error");
 const eventBus = createEventBus(config);
-const idempotency = new IdempotencyStore(24 * 60 * 60 * 1000);
+const idempotency = new RedisIdempotencyStore(getRedisClient(config), 24 * 60 * 60);
 
 function safeJsonParse(value: string): WebhookPayload {
   try {
@@ -67,7 +68,7 @@ async function ingest(
 
       for (const message of value.messages ?? []) {
         const key = `inbound:${message.id ?? "unknown"}`;
-        if (idempotency.isDuplicate(key)) {
+        if (await idempotency.isDuplicate(key)) {
           duplicates += 1;
           continue;
         }
@@ -85,7 +86,7 @@ async function ingest(
 
       for (const status of value.statuses ?? []) {
         const key = `status:${status.id ?? "unknown"}:${status.status ?? "unknown"}`;
-        if (idempotency.isDuplicate(key)) {
+        if (await idempotency.isDuplicate(key)) {
           duplicates += 1;
           continue;
         }

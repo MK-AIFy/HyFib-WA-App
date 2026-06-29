@@ -15,6 +15,7 @@
   "dependencies": {
     "@hyfib/config": "workspace:*",
     "@hyfib/event-bus": "workspace:*",
+    "@hyfib/ratelimit": "workspace:*",
     "@hyfib/shared-core": "workspace:*"
   }
 }

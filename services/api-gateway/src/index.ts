@@ -39,7 +39,7 @@ import {
   type CampaignWithTemplate
 } from "@hyfib/persistence";
 import {
-  IdempotencyStore,
+  RedisIdempotencyStore,
   Logger,
   parseQuery,
   parseUrlPath,
@@ -69,6 +69,7 @@ import {
   type WhatsAppInteractivePayload,
   type WhatsAppMediaKind
 } from "@hyfib/shared-core";
+import { getRedisClient } from "@hyfib/ratelimit";
 import { parseContactListQuery, parseListQuery, boundedText, parseOptionalIsoDate, clampInt, validateInteractivePayload, validateCampaignBody } from "./validation.js";
 import { filterSendableContacts } from "./campaign.js";
 import { canCreateContact, canCreateOrder } from "./authorization.js";
@@ -220,7 +221,7 @@ const config = loadConfig();
 const logger = new Logger("api-gateway", config.logLevel as "debug" | "info" | "warn" | "error");
 const authenticator = createAuthenticator(config);
 const eventBus = createEventBus(config);
-const webhookIdempotency = new IdempotencyStore(24 * 60 * 60 * 1000);
+const webhookIdempotency = new RedisIdempotencyStore(getRedisClient(config), 24 * 60 * 60);
 
 const E164 = /^\+[1-9]\d{7,14}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -985,7 +986,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 401, { error: "Invalid webhook signature" });
       return;
     }
-    if (webhookIdempotency.isDuplicate(`webhook:${normalizedSignature}`)) {
+    if (await webhookIdempotency.isDuplicate(`webhook:${normalizedSignature}`)) {
       sendJson(res, 200, { status: "duplicate_ignored" });
       return;
     }
