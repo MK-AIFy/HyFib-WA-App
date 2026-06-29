@@ -138,7 +138,7 @@ export interface ExportableContact {
 
 /** Serializes contacts to the same column shape the importer accepts. */
 export function serializeContactsCsv(contacts: readonly ExportableContact[]): string {
-  const header = "phone_e164,first_name,last_name,country,timezone,tags,opted_out";
+  const header = "phone_e164,first_name,last_name,country,timezone,tags,consent";
   const lines = contacts.map((c) =>
     [
       csvCell(c.phoneE164),
@@ -147,9 +147,30 @@ export function serializeContactsCsv(contacts: readonly ExportableContact[]): st
       csvCell(c.country),
       csvCell(c.timezone),
       csvCell((c.tags ?? []).join("|")),
-      c.optedOut ? "true" : "false"
+      c.optedOut ? "false" : "true"
     ].join(",")
   );
   return [header, ...lines].join("\n");
 }
 
+/**
+ * Extracts the first file body from a multipart/form-data buffer.
+ * Returns the extracted bytes, or null if the buffer is not valid multipart.
+ */
+export function extractMultipartFile(buffer: Buffer, boundary: string): Buffer | null {
+  try {
+    const sep = Buffer.from(`--${boundary}`);
+    const partStart = buffer.indexOf(sep);
+    if (partStart === -1) return null;
+    const headerEnd = buffer.indexOf(Buffer.from("\r\n\r\n"), partStart);
+    if (headerEnd === -1) return null;
+    const fileStart = headerEnd + 4;
+    const closing = Buffer.from(`\r\n--${boundary}`);
+    const fileEnd = buffer.indexOf(closing, fileStart);
+    return fileEnd === -1
+      ? buffer.subarray(fileStart)
+      : buffer.subarray(fileStart, fileEnd);
+  } catch {
+    return null;
+  }
+}
