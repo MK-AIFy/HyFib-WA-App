@@ -73,7 +73,7 @@ import { parseContactListQuery, parseListQuery, boundedText, parseOptionalIsoDat
 import { filterSendableContacts } from "./campaign.js";
 import { canCreateContact, canCreateOrder } from "./authorization.js";
 import { SseHub } from "./sse-hub.js";
-import { parseCsv, serializeContactsCsv } from "./csv.js";
+import { parseCsv, serializeContactsCsv, extractMultipartFile } from "./csv.js";
 
 // ─── Request body interfaces ───────────────────────────────────────────────────
 
@@ -989,6 +989,27 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 200, { status: "duplicate_ignored" });
       return;
     }
+    // Reject unknown phone_number_id early to avoid silent drops downstream
+    let parsedWebhookBody: Record<string, unknown> | undefined;
+    try {
+      parsedWebhookBody = JSON.parse(rawBody) as Record<string, unknown>;
+    } catch {
+      // Non-JSON body — pass through and let ingestor handle it
+    }
+    if (parsedWebhookBody) {
+      const firstEntry = (parsedWebhookBody?.entry as unknown[])?.[0] as Record<string, unknown> | undefined;
+      const firstChange = (firstEntry?.changes as unknown[])?.[0] as Record<string, unknown> | undefined;
+      const phoneNumberId = (firstChange?.value as Record<string, unknown> | undefined)?.metadata as Record<string, unknown> | undefined;
+      const phoneNumberIdStr = phoneNumberId?.phone_number_id as string | undefined;
+      if (phoneNumberIdStr) {
+        const resolved = await resolveChannelByPhoneNumberId(phoneNumberIdStr);
+        if (!resolved) {
+          logger.warn("webhook_unknown_phone_number_id", { phoneNumberId: phoneNumberIdStr });
+          sendJson(res, 200, { status: "channel_not_found" }); // always 200 to Meta
+          return;
+        }
+      }
+    }
     const proxyResponse = await fetch(`${config.webhookIngestorUrl}/internal/v1/webhooks/meta/whatsapp`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-request-id": randomUUID() },
@@ -1083,6 +1104,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   // ─── Users ────────────────────────────────────────────────────────────────
   if (path === "/api/v1/users") {
     if (method === "GET") {
+      if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager", "support_agent"])) {
+        sendJson(res, 403, { error: "Insufficient role to list users" });
+        return;
+      }
       const users = await userRepository.list(tenantId);
       const isAdmin = hasAnyRole(auth, ["platform_owner", "tenant_admin"]);
       const items = isAdmin
@@ -1202,6 +1227,28 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return;
     }
     sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+
+  if (/^\/api\/v1\/teams\/[^/]+$/.test(path) && method === "PATCH") {
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin"])) {
+      sendJson(res, 403, { error: "Insufficient role to update team" });
+      return;
+    }
+    const teamId = path.split("/").at(-1)!;
+    const body = await readJsonBody<{ name?: string }>(req);
+    if (!body.name || typeof body.name !== "string" || !body.name.trim()) {
+      sendJson(res, 400, { error: "name is required" });
+      return;
+    }
+    // @ts-ignore — teamRepository.update is added by repositories agent; remove after merge
+    const updated = await teamRepository.update(tenantId, teamId, { name: body.name.trim() });
+    if (!updated) {
+      sendJson(res, 404, { error: "Team not found" });
+      return;
+    }
+    await audit(tenantId, auth, { action: "team.updated", resourceType: "Team", resourceId: teamId, payload: { name: body.name } });
+    sendJson(res, 200, updated as unknown as Record<string, unknown>);
     return;
   }
 
@@ -1604,6 +1651,14 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     if (csvBuffer.length === 0) {
       sendJson(res, 400, { error: "Empty body" });
       return;
+    }
+    // Strip multipart envelope if the UI sent FormData
+    if (contentType.startsWith("multipart/form-data")) {
+      const boundaryMatch = /boundary=([^\s;]+)/.exec(contentType);
+      if (boundaryMatch?.[1]) {
+        const extracted = extractMultipartFile(csvBuffer, boundaryMatch[1]);
+        if (extracted && extracted.length > 0) csvBuffer = extracted;
+      }
     }
     const { rows: csvRows, errors } = parseCsv(csvBuffer);
     if (csvRows.length === 0) {
@@ -2582,42 +2637,6 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     );
     const body = (await upstream.json()) as Record<string, unknown>;
     sendJson(res, upstream.ok ? 200 : upstream.status, body);
-    return;
-  }
-
-  // ─── Tenant management (platform_owner only) ──────────────────────────────
-  if (path === "/api/v1/tenants") {
-    if (!hasAnyRole(auth, ["platform_owner"])) {
-      sendJson(res, 403, { error: "Insufficient role" });
-      return;
-    }
-    const internalHeaders: Record<string, string> = {
-      "x-tenant-id": tenantId,
-      "x-request-id": ctx.requestId,
-      "x-internal-secret": config.internalServiceSecret
-    };
-    if (method === "GET") {
-      const upstream = await fetch(`${config.tenantServiceUrl}/internal/v1/tenants`, {
-        headers: internalHeaders,
-        signal: AbortSignal.timeout(10_000)
-      });
-      const body = (await upstream.json()) as Record<string, unknown>;
-      sendJson(res, upstream.ok ? 200 : upstream.status, body);
-      return;
-    }
-    if (method === "POST") {
-      const raw = await readRawBody(req);
-      const upstream = await fetch(`${config.tenantServiceUrl}/internal/v1/tenants`, {
-        method: "POST",
-        headers: { ...internalHeaders, "Content-Type": "application/json" },
-        body: raw,
-        signal: AbortSignal.timeout(10_000)
-      });
-      const body = (await upstream.json()) as Record<string, unknown>;
-      sendJson(res, upstream.ok ? 201 : upstream.status, body);
-      return;
-    }
-    sendJson(res, 405, { error: "Method not allowed" });
     return;
   }
 
