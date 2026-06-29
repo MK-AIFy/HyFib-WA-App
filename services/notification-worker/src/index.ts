@@ -20,6 +20,7 @@ import {
   resolveChannelByPhoneNumberId,
   taskRepository,
   userRepository,
+  whatsappSettingsRepository,
   withTenant,
   type ChannelCredentials,
   type OutboxEnqueueInput
@@ -494,7 +495,14 @@ async function handleInbound(event: EventEnvelope): Promise<void> {
   // Auto-reply evaluation (only text/button messages; skip reactions, read receipts).
   if (inbound.type === "text" || inbound.type === "button" || inbound.type === "interactive") {
     const rules = await autoReplyRuleRepository.listEnabled(channel.tenantId);
-    const text = typeof inbound.text === "string" ? inbound.text : undefined;
+    const interactivePayload = inbound.interactive as
+      | { button_reply?: { title?: string }; list_reply?: { title?: string } }
+      | undefined;
+    const interactiveTitle =
+      interactivePayload?.button_reply?.title ?? interactivePayload?.list_reply?.title;
+    const text = (typeof inbound.text === "string" && inbound.text)
+      ? inbound.text
+      : interactiveTitle;
     const matched = matchAutoReply(text, rules);
     if (matched && matched.replyText) {
       await withTenant(channel.tenantId, async (client) => {
@@ -679,6 +687,33 @@ async function handleAutomationTemplate(event: EventEnvelope): Promise<void> {
     return;
   }
 
+  // Resolve contact and enforce consent + policy before sending
+  const contact = await contactRepository.findOrCreateByPhone(req.tenantId, req.contactPhoneE164);
+  if (contact.optedOut) {
+    logger.warn("automation_template_opted_out", { tenantId: req.tenantId, contactId: contact.id });
+    return;
+  }
+  const hasConsent = await consentRepository.hasActiveConsent(req.tenantId, contact.id);
+  if (!hasConsent) {
+    logger.warn("automation_template_no_consent", { tenantId: req.tenantId, contactId: contact.id });
+    return;
+  }
+  const settings = await whatsappSettingsRepository.getByTenant(req.tenantId);
+  const policyCheck = evaluateOutboundPolicy({
+    hasActiveConsent: true,
+    isInside24hWindow: false,
+    template: { category: (req as any).templateCategory ?? "marketing", status: "approved" } as import("@hyfib/shared-core").Template,
+    requestedCategory: ((req as any).templateCategory ?? "marketing") as import("@hyfib/shared-core").MessageCategory,
+    isOptedOut: false,
+    currentHourLocal: getCurrentHourInTz(contact.timezone ?? "UTC"),
+    quietHours: (settings as unknown as { quietHours?: import("@hyfib/shared-core").QuietHoursConfig })?.quietHours,
+    frequencyCap: undefined
+  });
+  if (!policyCheck.allowed) {
+    logger.warn("automation_template_policy_blocked", { tenantId: req.tenantId, contactId: contact.id, reason: policyCheck.reason });
+    return;
+  }
+
   const channelId = req.channelId ?? (await channelRepository.firstActive(req.tenantId))?.id;
   if (!channelId) {
     logger.warn("automation_template_no_channel", { tenantId: req.tenantId });
@@ -693,7 +728,6 @@ async function handleAutomationTemplate(event: EventEnvelope): Promise<void> {
     parameters: [],
     accessToken: channel.accessToken
   });
-  const contact = await contactRepository.findOrCreateByPhone(req.tenantId, req.contactPhoneE164);
   const conversation = await conversationRepository.findOrCreate(req.tenantId, contact.id, channelId);
   await messageRepository.create(req.tenantId, {
     conversationId: conversation.id,
