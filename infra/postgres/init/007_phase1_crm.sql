@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS whatsapp_settings (
   retry_max_attempts INT NOT NULL DEFAULT 4,
   retry_base_delay_ms INT NOT NULL DEFAULT 500,
   outbound_rate_limit_per_minute INT,
+  monthly_message_quota INT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );

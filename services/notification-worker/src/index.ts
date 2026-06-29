@@ -6,6 +6,7 @@ import { evaluateOutboundPolicy } from "@hyfib/policy-engine";
 import {
   autoReplyRuleRepository,
   automationRuleRepository,
+  billingRepository,
   campaignRecipientRepository,
   campaignSendLog,
   campaignStatsRepository,
@@ -172,6 +173,32 @@ async function handleDispatch(event: EventEnvelope): Promise<void> {
     return;
   }
   try {
+    // Enforce monthly message quota if configured on the tenant's WhatsApp settings.
+    const waSettings = await whatsappSettingsRepository.getByTenant(command.tenantId);
+    const monthlyQuota = (waSettings as unknown as Record<string, unknown>)?.monthlyMessageQuota as number | undefined;
+    if (monthlyQuota) {
+      const used = await billingRepository.getMonthlyOutboundCount(command.tenantId);
+      if (used >= monthlyQuota) {
+        logger.warn("monthly_quota_exceeded", {
+          tenantId: command.tenantId,
+          used,
+          quota: monthlyQuota
+        });
+        if (command.recipientId) {
+          await campaignRecipientRepository
+            .updateStatus(command.tenantId, command.recipientId, {
+              status: "failed",
+              error: "monthly_quota_exceeded"
+            })
+            .catch(() => undefined);
+        }
+        await campaignSendLog
+          .release(command.tenantId, command.campaignId, command.contactPhoneE164)
+          .catch(() => undefined);
+        return;
+      }
+    }
+
     const channel = await resolveSendChannel(command.tenantId, command.channelId);
     const result = await sendTemplate(command, channel);
     await recordOutbound(command, result.messageId, result.accepted);

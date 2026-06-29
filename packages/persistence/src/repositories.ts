@@ -227,11 +227,12 @@ interface WhatsAppSettingsRow {
   retry_max_attempts: number;
   retry_base_delay_ms: number;
   outbound_rate_limit_per_minute: number | null;
+  monthly_message_quota: number | null;
   created_at: Date;
   updated_at: Date;
 }
 
-function mapWhatsAppSettings(row: WhatsAppSettingsRow): WhatsAppSettings {
+function mapWhatsAppSettings(row: WhatsAppSettingsRow): WhatsAppSettings & { monthlyMessageQuota?: number } {
   return {
     id: row.id,
     tenantId: row.tenant_id,
@@ -240,13 +241,14 @@ function mapWhatsAppSettings(row: WhatsAppSettingsRow): WhatsAppSettings {
     retryMaxAttempts: row.retry_max_attempts,
     retryBaseDelayMs: row.retry_base_delay_ms,
     outboundRateLimitPerMinute: row.outbound_rate_limit_per_minute ?? undefined,
+    monthlyMessageQuota: row.monthly_message_quota ?? undefined,
     createdAt: row.created_at.toISOString(),
     updatedAt: row.updated_at.toISOString()
   };
 }
 
 const WHATSAPP_SETTINGS_SELECT =
-  "SELECT id, tenant_id, status_callback_url, graph_version, retry_max_attempts, retry_base_delay_ms, outbound_rate_limit_per_minute, created_at, updated_at";
+  "SELECT id, tenant_id, status_callback_url, graph_version, retry_max_attempts, retry_base_delay_ms, outbound_rate_limit_per_minute, monthly_message_quota, created_at, updated_at";
 
 export const whatsappSettingsRepository = {
   async upsert(
@@ -2526,6 +2528,21 @@ export const linkClickRepository = {
         })),
         total: Number(countRow.rows[0]?.total ?? "0")
       };
+    });
+  }
+};
+
+export const billingRepository = {
+  async getMonthlyOutboundCount(tenantId: string): Promise<number> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<{ count: string }>(
+        `SELECT COUNT(*)::text AS count
+         FROM messages
+         WHERE direction = 'outbound'
+           AND created_at >= date_trunc('month', now())`,
+        []
+      );
+      return Number(result.rows[0]?.count ?? "0");
     });
   }
 };
