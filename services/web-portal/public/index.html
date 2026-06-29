@@ -830,6 +830,8 @@
         campaigns: [],
         segments: [],
         autoRules: [],
+        users: [],
+        msgBefore: null,
         convFilter: { state: "", assignee: "" }
       };
 
@@ -976,7 +978,7 @@
           loadConvList();
         }
         if (pl.conversationId && pl.conversationId === S.activeConvId) {
-          loadMessages(S.activeConvId);
+          loadMessages(S.activeConvId, true);
         }
       }
 
@@ -1185,6 +1187,7 @@
           "</div>" +
           "</div>";
         connectSSE();
+        GET("/users").then(d => { S.users = d.items || []; }).catch(() => {});
         renderView(S.view);
       }
 
@@ -1264,6 +1267,7 @@
         try {
           const qs = ["offset=" + (S.convOffset || 0)];
           if (S.convFilter.state) qs.push("state=" + encodeURIComponent(S.convFilter.state));
+          if (S.convFilter.assignee) qs.push("assignedUserId=" + encodeURIComponent(S.convFilter.assignee));
           const d = await GET("/conversations?" + qs.join("&"));
           S.conversations = d.items || [];
           S.convTotal = d.total || 0;
@@ -1358,22 +1362,33 @@
           '<textarea id="msg-input" rows="1" placeholder="Type a reply… (Enter to send, Shift+Enter newline)" onkeydown="msgKey(event)"></textarea>' +
           '<button class="btn btn-primary" onclick="sendMsg()" style="flex-shrink:0">Send</button>' +
           "</div>";
-        await loadMessages(id);
+        await loadMessages(id, true);
         const inp = document.getElementById("msg-input");
         if (inp) inp.focus();
       }
 
-      async function loadMessages(convId) {
+      async function loadMessages(convId, reset) {
         const el = document.getElementById("msgs");
         if (!el) return;
+        if (reset) S.msgBefore = null;
+        const qs = [];
+        if (S.msgBefore) qs.push("before=" + encodeURIComponent(S.msgBefore));
         try {
-          const d = await GET("/conversations/" + convId + "/messages");
-          S.messages = d.items || [];
+          const d = await GET("/conversations/" + convId + "/messages" + (qs.length ? "?" + qs.join("&") : ""));
+          const incoming = d.items || [];
+          if (reset || !S.msgBefore) {
+            S.messages = incoming;
+          } else {
+            S.messages = [...incoming, ...S.messages];
+          }
           if (!S.messages.length) {
             el.innerHTML = empty("💬", "No messages yet");
             return;
           }
-          el.innerHTML = S.messages
+          const loadMoreBtn = incoming.length >= 50
+            ? '<div style="text-align:center;padding:8px"><button class="btn btn-secondary btn-sm" onclick="loadEarlierMessages()">Load earlier messages</button></div>'
+            : '';
+          el.innerHTML = loadMoreBtn + S.messages
             .map((m) => {
               const text =
                 (m.payload && m.payload.text) ||
@@ -1382,20 +1397,22 @@
                 "[" + (m.kind || m.payload?.kind || "message") + "]";
               const dir = m.direction === "outbound" ? "out" : "in";
               return (
-                '<div class="msg ' +
-                dir +
-                '">' +
+                '<div class="msg ' + dir + '" data-mid="' + esc(m.id) + '">' +
                 esc(text) +
-                '<div class="mt">' +
-                fmtTime(m.occurredAt || m.createdAt) +
-                "</div></div>"
+                '<div class="mt">' + fmtTime(m.occurredAt || m.createdAt) + "</div></div>"
               );
             })
             .join("");
-          el.scrollTop = el.scrollHeight;
+          if (reset || !S.msgBefore) el.scrollTop = el.scrollHeight;
         } catch (e) {
-          if (el) el.innerHTML = '<div class="alert alert-err">' + esc(e.message) + "</div>";
+          if (el) el.innerHTML = '<div class="alert alert-err">' + esc(e.message) + '</div>';
         }
+      }
+
+      function loadEarlierMessages() {
+        const firstMsg = document.querySelector("#msgs .msg[data-mid]");
+        if (firstMsg) S.msgBefore = firstMsg.dataset.mid;
+        loadMessages(S.activeConvId, false);
       }
 
       async function sendMsg() {
@@ -1408,7 +1425,7 @@
         try {
           await POST("/conversations/" + S.activeConvId + "/messages", { kind: "text", text });
           toast("Sent ✓", "ok");
-          await loadMessages(S.activeConvId);
+          await loadMessages(S.activeConvId, true);
         } catch (e) {
           toast(e.message, "err");
           inp.value = text;
@@ -2624,7 +2641,11 @@
         showModal(
           "New Task",
           '<div class="field"><label>Title</label><input id="tk-title" placeholder="Follow up with customer…" /></div>' +
-            '<div class="field"><label>Due (optional)</label><input id="tk-due" type="datetime-local" /></div>',
+            '<div class="field"><label>Due (optional)</label><input id="tk-due" type="datetime-local" /></div>' +
+            '<div class="field"><label>Assignee (optional)</label><select id="task-assignee">' +
+            '<option value="">Unassigned</option>' +
+            (S.users || []).map(u => '<option value="' + esc(u.id) + '">' + esc(u.displayName || u.email || u.id) + '</option>').join('') +
+            '</select></div>',
           null,
           {
             submit: "Create Task",
@@ -2635,7 +2656,8 @@
                 return false;
               }
               const dueRaw = document.getElementById("tk-due").value;
-              await POST("/tasks", { title, dueAt: dueRaw ? new Date(dueRaw).toISOString() : undefined });
+              const assigneeUserId = document.getElementById("task-assignee")?.value || undefined;
+              await POST("/tasks", { title, dueAt: dueRaw ? new Date(dueRaw).toISOString() : undefined, assigneeUserId });
               toast("Task created", "ok");
               loadTasks();
             }
@@ -3202,40 +3224,47 @@
           '<div style="display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(320px,1fr))">' +
           // Campaign draft panel
           '<div class="card"><div class="card-head"><h3>🎯 Campaign Draft</h3></div>' +
-          '<div class="field"><label>Goal</label><input id="ai-goal" placeholder="e.g. Re-engage lapsed customers" /></div>' +
+          '<div class="field"><label>Objective</label><input id="ai-objective" placeholder="e.g. Re-engage lapsed customers" /></div>' +
+          '<div class="field"><label>Audience Description</label><input id="ai-audience-desc" placeholder="e.g. Customers who haven\'t ordered in 90 days" /></div>' +
+          '<div class="field"><label>Offer</label><input id="ai-offer" placeholder="e.g. 20% off next order" /></div>' +
           '<div class="field"><label>Tone</label>' +
           '<select id="ai-tone"><option value="professional">Professional</option><option value="friendly">Friendly</option><option value="urgent">Urgent</option></select>' +
           '</div>' +
-          '<div class="field"><label>Audience Size</label><input id="ai-audience" type="number" placeholder="e.g. 500" /></div>' +
+          '<div class="field"><label>Language</label><input id="ai-lang" value="English" /></div>' +
           '<button class="btn btn-primary" onclick="runCampaignDraft()">Generate Draft</button>' +
           '<div id="ai-draft-result" style="margin-top:12px"></div></div>' +
           // Segment summary panel
           '<div class="card"><div class="card-head"><h3>📊 Segment Summary</h3></div>' +
           '<div class="field"><label>Segment Name</label><input id="ai-seg-name" placeholder="e.g. High-value leads" /></div>' +
           '<div class="field"><label>Contact Count</label><input id="ai-seg-count" type="number" placeholder="e.g. 200" /></div>' +
-          '<div class="field"><label>Avg Engagement (0-1)</label><input id="ai-seg-eng" type="number" step="0.01" placeholder="e.g. 0.65" /></div>' +
+          '<div class="field"><label>Conversion Rate % (0-100)</label><input id="ai-seg-conv" type="number" step="0.1" placeholder="e.g. 4.5" /></div>' +
+          '<div class="field"><label>Opt-Out Rate (0-1)</label><input id="ai-seg-optout" type="number" step="0.001" placeholder="e.g. 0.02" /></div>' +
           '<button class="btn btn-primary" onclick="runSegmentSummary()">Summarise</button>' +
           '<div id="ai-seg-result" style="margin-top:12px"></div></div>' +
           // Lead score panel
           '<div class="card"><div class="card-head"><h3>⭐ Lead Score</h3></div>' +
-          '<div class="field"><label>Contact ID</label><input id="ai-lead-id" placeholder="UUID or identifier" /></div>' +
-          '<div class="field"><label>Messages Sent</label><input id="ai-lead-msgs" type="number" placeholder="e.g. 12" /></div>' +
-          '<div class="field"><label>Replies</label><input id="ai-lead-replies" type="number" placeholder="e.g. 5" /></div>' +
-          '<div class="field"><label>Days Since Last Activity</label><input id="ai-lead-days" type="number" placeholder="e.g. 3" /></div>' +
+          '<div class="field"><label>Days Since Last Activity</label><input id="ai-lead-recency" type="number" placeholder="e.g. 14" /></div>' +
+          '<div class="field"><label>Engagement Score (0-100)</label><input id="ai-lead-eng" type="number" placeholder="e.g. 65" /></div>' +
+          '<div class="field"><label>Purchase Count</label><input id="ai-lead-purchases" type="number" placeholder="e.g. 3" /></div>' +
+          '<div class="field"><label>Avg Order Value</label><input id="ai-lead-aov" type="number" placeholder="e.g. 1500" /></div>' +
           '<button class="btn btn-primary" onclick="runLeadScore()">Score Lead</button>' +
           '<div id="ai-lead-result" style="margin-top:12px"></div></div>' +
           '</div></div>';
       }
 
       async function runCampaignDraft() {
-        const goal = document.getElementById("ai-goal")?.value?.trim();
+        const objective = document.getElementById("ai-objective")?.value?.trim();
+        const audienceDescription = document.getElementById("ai-audience-desc")?.value?.trim();
+        const offer = document.getElementById("ai-offer")?.value?.trim();
         const tone = document.getElementById("ai-tone")?.value;
-        const audienceSize = Number(document.getElementById("ai-audience")?.value);
+        const language = document.getElementById("ai-lang")?.value?.trim() || "English";
         const resultEl = document.getElementById("ai-draft-result");
-        if (!goal) { toast("Enter a campaign goal", "err"); return; }
+        if (!objective) { toast("Enter an objective", "err"); return; }
+        if (!audienceDescription) { toast("Enter audience description", "err"); return; }
+        if (!offer) { toast("Enter an offer", "err"); return; }
         resultEl.innerHTML = loading();
         try {
-          const d = await POST("/ai/campaign-draft", { goal, tone, audienceSize: audienceSize || undefined });
+          const d = await POST("/ai/campaign-draft", { objective, audienceDescription, offer, tone, language });
           resultEl.innerHTML =
             '<div class="info-box" style="white-space:pre-wrap;font-size:13px">' + esc(d.draft || JSON.stringify(d, null, 2)) + '</div>';
         } catch (e) {
@@ -3245,13 +3274,15 @@
 
       async function runSegmentSummary() {
         const segmentName = document.getElementById("ai-seg-name")?.value?.trim();
-        const contactCount = Number(document.getElementById("ai-seg-count")?.value);
-        const avgEngagement = Number(document.getElementById("ai-seg-eng")?.value);
+        const contacts = Number(document.getElementById("ai-seg-count")?.value);
+        const conversionRate = Number(document.getElementById("ai-seg-conv")?.value);
+        const optOutRate = Number(document.getElementById("ai-seg-optout")?.value);
         const resultEl = document.getElementById("ai-seg-result");
         if (!segmentName) { toast("Enter a segment name", "err"); return; }
+        if (!contacts || contacts <= 0) { toast("Enter contact count > 0", "err"); return; }
         resultEl.innerHTML = loading();
         try {
-          const d = await POST("/ai/segment-summary", { segmentName, contactCount: contactCount || undefined, avgEngagement: avgEngagement || undefined });
+          const d = await POST("/ai/segment-summary", { segmentName, contacts, conversionRate: conversionRate || 0, optOutRate: optOutRate || 0 });
           resultEl.innerHTML =
             '<div class="info-box" style="white-space:pre-wrap;font-size:13px">' + esc(d.summary || JSON.stringify(d, null, 2)) + '</div>';
         } catch (e) {
@@ -3260,19 +3291,18 @@
       }
 
       async function runLeadScore() {
-        const contactId = document.getElementById("ai-lead-id")?.value?.trim();
-        const messagesSent = Number(document.getElementById("ai-lead-msgs")?.value);
-        const replies = Number(document.getElementById("ai-lead-replies")?.value);
-        const daysSinceLastActivity = Number(document.getElementById("ai-lead-days")?.value);
+        const recencyDays = Number(document.getElementById("ai-lead-recency")?.value);
+        const engagementScore = Number(document.getElementById("ai-lead-eng")?.value);
+        const purchaseCount = Number(document.getElementById("ai-lead-purchases")?.value);
+        const averageOrderValue = Number(document.getElementById("ai-lead-aov")?.value);
         const resultEl = document.getElementById("ai-lead-result");
-        if (!contactId) { toast("Enter a contact ID", "err"); return; }
         resultEl.innerHTML = loading();
         try {
-          const d = await POST("/ai/lead-score", { contactId, messagesSent: messagesSent || undefined, replies: replies || undefined, daysSinceLastActivity: daysSinceLastActivity || undefined });
+          const d = await POST("/ai/lead-score", { recencyDays: recencyDays || 0, engagementScore: engagementScore || 0, purchaseCount: purchaseCount || 0, averageOrderValue: averageOrderValue || 0 });
           const score = d.score ?? d.leadScore;
           resultEl.innerHTML = score !== undefined
             ? '<div class="kpis"><div class="kpi"><b style="font-size:28px">' + score + '</b><span>Lead Score</span></div></div>' +
-              (d.reasoning ? '<div class="info-box" style="margin-top:8px;font-size:13px">' + esc(d.reasoning) + '</div>' : '')
+              (d.recommendation ? '<div class="info-box" style="margin-top:8px;font-size:13px">' + esc(d.recommendation) + '</div>' : '')
             : '<div class="info-box" style="white-space:pre-wrap;font-size:13px">' + esc(JSON.stringify(d, null, 2)) + '</div>';
         } catch (e) {
           resultEl.innerHTML = '<div class="alert alert-err">' + esc(e.message) + '</div>';
@@ -3332,7 +3362,7 @@
             onOk: async () => {
               const name = document.getElementById("new-tenant-name")?.value?.trim();
               if (!name) { toast("Name is required", "err"); return false; }
-              await POST("/tenants", { name });
+              await api("POST", "/tenants", { name }, "", "platform_owner");
               toast("Tenant created", "ok");
               await loadTenants();
             }
