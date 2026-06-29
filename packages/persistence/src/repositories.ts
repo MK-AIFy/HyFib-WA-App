@@ -1511,8 +1511,15 @@ export const messageRepository = {
       const params: unknown[] = [conversationId];
       let where = "conversation_id = $1";
       if (options.before) {
-        params.push(options.before);
-        where += ` AND created_at < $${params.length}`;
+        // Accept either a message UUID (look up its timestamp) or a raw ISO timestamp string
+        const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(options.before);
+        if (isUuid) {
+          params.push(options.before);
+          where += ` AND created_at < (SELECT created_at FROM messages WHERE id = $${params.length} LIMIT 1)`;
+        } else {
+          params.push(options.before);
+          where += ` AND created_at < $${params.length}`;
+        }
       }
       params.push(limit);
       const result = await client.query<MessageRow>(

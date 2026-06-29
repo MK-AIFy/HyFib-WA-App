@@ -832,7 +832,8 @@
         autoRules: [],
         users: [],
         msgBefore: null,
-        convFilter: { state: "", assignee: "" }
+        convFilter: { state: "", assignee: "" },
+        waSettingsChannelId: null
       };
 
       // ═══════════════════ UTILS ═══════════════════
@@ -909,6 +910,7 @@
 
       const GET = (p, tid) => api("GET", p, undefined, tid);
       const POST = (p, b, tid) => api("POST", p, b, tid);
+      const PUT = (p, b, tid) => api("PUT", p, b, tid);
 
       // ═══════════════════ SSE ═══════════════════
       let _sseCtrl = null;
@@ -1267,7 +1269,7 @@
         try {
           const qs = ["offset=" + (S.convOffset || 0)];
           if (S.convFilter.state) qs.push("state=" + encodeURIComponent(S.convFilter.state));
-          if (S.convFilter.assignee) qs.push("assignedUserId=" + encodeURIComponent(S.convFilter.assignee));
+          if (S.convFilter.assignee) qs.push("assignee=" + encodeURIComponent(S.convFilter.assignee));
           const d = await GET("/conversations?" + qs.join("&"));
           S.conversations = d.items || [];
           S.convTotal = d.total || 0;
@@ -3014,11 +3016,17 @@
           '<p style="margin-top:6px">Verify Token: set <code>WEBHOOK_VERIFY_TOKEN</code> in your server .env</p>' +
           "</div>" +
           "</div>" +
+          '<div class="card" style="margin-top:16px">' +
+          '<div class="card-head"><h3>📱 WhatsApp Configuration</h3></div>' +
+          '<div id="wa-settings-form">' + loading() + '</div>' +
+          '</div>' +
           '<div style="display:flex;gap:10px;flex-wrap:wrap">' +
           '<button class="btn btn-secondary" onclick="showUpdateChannel()">⚙️ Update WhatsApp Credentials</button>' +
           '<button class="btn btn-danger" onclick="logout()">🚪 Clear Workspace</button>' +
           "</div>" +
           "</div>";
+
+        loadWhatsAppSettings();
 
         try {
           const d = await GET("/channels/whatsapp");
@@ -3050,6 +3058,48 @@
             "</tbody></table>";
         } catch (e) {
           document.getElementById("ch-info").innerHTML = '<div class="alert alert-err">' + esc(e.message) + "</div>";
+        }
+      }
+
+      async function loadWhatsAppSettings() {
+        const settingsEl = document.getElementById("wa-settings-form");
+        if (!settingsEl) return;
+        settingsEl.innerHTML = loading();
+        try {
+          const data = await GET("/channels/whatsapp/settings");
+          const s = data.settings || data;
+          settingsEl.innerHTML =
+            '<div class="field"><label>Status Callback URL</label>' +
+            '<input id="wa-callback-url" value="' + esc(s.statusCallbackUrl || "") + '" placeholder="https://your-domain.com/callbacks/status" /></div>' +
+            '<div class="field"><label>Graph API Version</label>' +
+            '<input id="wa-graph-version" value="' + esc(s.graphVersion || "v22.0") + '" /></div>' +
+            '<div class="field"><label>Retry Max Attempts</label>' +
+            '<input id="wa-retry-max" type="number" value="' + esc(String(s.retryMaxAttempts || 3)) + '" min="1" max="10" /></div>' +
+            '<div class="field"><label>Retry Base Delay (ms)</label>' +
+            '<input id="wa-retry-delay" type="number" value="' + esc(String(s.retryBaseDelayMs || 500)) + '" min="100" /></div>' +
+            '<div class="field"><label>Outbound Rate Limit (messages/min, 0 = unlimited)</label>' +
+            '<input id="wa-rate-limit" type="number" value="' + esc(String(s.outboundRateLimitPerMinute || 0)) + '" min="0" /></div>' +
+            '<button class="btn btn-primary" onclick="saveWhatsAppSettings()">Save Settings</button>' +
+            '<div id="wa-settings-msg" style="margin-top:8px"></div>';
+        } catch (e) {
+          settingsEl.innerHTML = '<div class="alert alert-err">' + esc(e.message) + '</div>';
+        }
+      }
+
+      async function saveWhatsAppSettings() {
+        const msgEl = document.getElementById("wa-settings-msg");
+        const payload = {
+          statusCallbackUrl: document.getElementById("wa-callback-url")?.value?.trim() || undefined,
+          graphVersion: document.getElementById("wa-graph-version")?.value?.trim() || "v22.0",
+          retryMaxAttempts: Number(document.getElementById("wa-retry-max")?.value) || 3,
+          retryBaseDelayMs: Number(document.getElementById("wa-retry-delay")?.value) || 500,
+          outboundRateLimitPerMinute: Number(document.getElementById("wa-rate-limit")?.value) || undefined
+        };
+        try {
+          await PUT("/channels/whatsapp/settings", payload);
+          msgEl.innerHTML = '<div class="alert alert-ok">Settings saved.</div>';
+        } catch (e) {
+          msgEl.innerHTML = '<div class="alert alert-err">' + esc(e.message) + '</div>';
         }
       }
 

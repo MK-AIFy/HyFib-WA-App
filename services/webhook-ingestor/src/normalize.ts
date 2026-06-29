@@ -130,7 +130,7 @@ export function normalizeInbound(value: RawValue, message: RawMessage, entryId?:
     entryId,
     phoneNumberId: value.metadata?.phone_number_id,
     messageId: message.id,
-    from: message.from,
+    from: message.from ? (message.from.startsWith("+") ? message.from : `+${message.from}`) : message.from,
     type: message.type,
     timestamp: message.timestamp,
     profileName,
