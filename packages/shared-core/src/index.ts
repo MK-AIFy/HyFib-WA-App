@@ -65,6 +65,7 @@ export interface WhatsAppChannel {
   displayPhoneNumber: string;
   qualityRating: "green" | "yellow" | "red" | "unknown";
   status: "active" | "inactive";
+  hasAccessToken?: boolean;
   createdAt: string;
 }
 
@@ -232,6 +233,9 @@ export interface Conversation {
   tenantId: string;
   contactId: string;
   channelId: string;
+  contactName?: string;
+  contactPhone?: string;
+  lastMessage?: string;
   lastMessageAt?: string;
   lastInboundAt?: string;
   assignedUserId?: string;

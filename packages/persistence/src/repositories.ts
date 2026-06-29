@@ -166,6 +166,17 @@ export const teamRepository = {
       return mapTeam(result.rows[0]!);
     });
   },
+  async update(tenantId: string, id: string, input: { name?: string }): Promise<Team | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<TeamRow>(
+        `UPDATE teams SET name = COALESCE($2, name)
+         WHERE id = $1
+         RETURNING id, tenant_id, name, is_default, created_at`,
+        [id, input.name ?? null]
+      );
+      return result.rows[0] ? mapTeam(result.rows[0]) : undefined;
+    });
+  },
   async list(tenantId: string): Promise<Team[]> {
     return withTenant(tenantId, async (client) => {
       const result = await client.query<TeamRow>(
@@ -282,7 +293,10 @@ export const whatsappSettingsRepository = {
   },
   async getByTenant(tenantId: string): Promise<WhatsAppSettings | undefined> {
     return withTenant(tenantId, async (client) => {
-      const result = await client.query<WhatsAppSettingsRow>(`${WHATSAPP_SETTINGS_SELECT} FROM whatsapp_settings LIMIT 1`);
+      const result = await client.query<WhatsAppSettingsRow>(
+        `${WHATSAPP_SETTINGS_SELECT} FROM whatsapp_settings
+         WHERE tenant_id = current_setting('app.tenant_id', true)::uuid LIMIT 1`
+      );
       return result.rows[0] ? mapWhatsAppSettings(result.rows[0]) : undefined;
     });
   }
@@ -297,6 +311,7 @@ interface ChannelRow {
   quality_rating: string | null;
   is_active: boolean;
   created_at: Date;
+  has_access_token: boolean;
 }
 
 interface ChannelCredentialRow extends ChannelRow {
@@ -304,7 +319,7 @@ interface ChannelCredentialRow extends ChannelRow {
 }
 
 const CHANNEL_COLUMNS =
-  "id, tenant_id, waba_id, phone_number_id, display_phone_number, quality_rating, is_active, created_at";
+  "id, tenant_id, waba_id, phone_number_id, display_phone_number, quality_rating, is_active, created_at, (access_token_encrypted IS NOT NULL) AS has_access_token";
 
 function mapChannel(row: ChannelRow): WhatsAppChannel {
   return {
@@ -315,6 +330,7 @@ function mapChannel(row: ChannelRow): WhatsAppChannel {
     displayPhoneNumber: row.display_phone_number,
     qualityRating: (row.quality_rating as WhatsAppChannel["qualityRating"]) ?? "unknown",
     status: row.is_active ? "active" : "inactive",
+    hasAccessToken: row.has_access_token,
     createdAt: row.created_at.toISOString()
   };
 }
@@ -891,7 +907,16 @@ export const contactRepository = {
              ON CONFLICT (tenant_id, phone_e164) DO UPDATE
                SET first_name = COALESCE(EXCLUDED.first_name, contacts.first_name),
                    last_name  = COALESCE(EXCLUDED.last_name,  contacts.last_name),
-                   timezone   = COALESCE(EXCLUDED.timezone,   contacts.timezone)
+                   timezone   = COALESCE(EXCLUDED.timezone,   contacts.timezone),
+                   metadata   = jsonb_set(
+                                  jsonb_set(
+                                    contacts.metadata,
+                                    '{tags}',
+                                    COALESCE(EXCLUDED.metadata->'tags', contacts.metadata->'tags', '[]'::jsonb)
+                                  ),
+                                  '{country}',
+                                  COALESCE(EXCLUDED.metadata->'country', contacts.metadata->'country', 'null'::jsonb)
+                                )
              RETURNING id, xmax::text`,
             [tenantId, row.phoneE164, row.firstName ?? null, row.lastName ?? null, row.timezone ?? null, metadata]
           );
@@ -1017,7 +1042,11 @@ export const consentRepository = {
     await withTenant(tenantId, async (client) => {
       await client.query(
         `INSERT INTO consent_records (tenant_id, contact_id, channel, source, policy_version, granted_at)
-         VALUES ($1, $2, 'whatsapp', $3, $4, now())`,
+         SELECT $1, $2, 'whatsapp', $3, $4, now()
+         WHERE NOT EXISTS (
+           SELECT 1 FROM consent_records
+           WHERE contact_id = $2 AND channel = 'whatsapp' AND revoked_at IS NULL
+         )`,
         [tenantId, contactId, input.source, input.policyVersion]
       );
     });
@@ -1178,6 +1207,9 @@ interface ConversationRow {
   last_inbound_at: Date | null;
   assigned_user_id: string | null;
   state: string;
+  contact_name: string | null;
+  contact_phone: string | null;
+  last_message: string | null;
 }
 
 function mapConversation(row: ConversationRow): Conversation {
@@ -1186,6 +1218,9 @@ function mapConversation(row: ConversationRow): Conversation {
     tenantId: row.tenant_id,
     contactId: row.contact_id,
     channelId: row.channel_id,
+    contactName: row.contact_name ?? undefined,
+    contactPhone: row.contact_phone ?? undefined,
+    lastMessage: row.last_message ?? undefined,
     lastMessageAt: row.last_message_at?.toISOString(),
     lastInboundAt: row.last_inbound_at?.toISOString(),
     assignedUserId: row.assigned_user_id ?? undefined,
@@ -1193,8 +1228,17 @@ function mapConversation(row: ConversationRow): Conversation {
   };
 }
 
-const CONV_SELECT =
-  "SELECT id, tenant_id, contact_id, channel_id, last_message_at, last_inbound_at, assigned_user_id, state";
+const CONV_SELECT = `
+  SELECT c.id, c.tenant_id, c.contact_id, c.channel_id,
+         c.last_message_at, c.last_inbound_at, c.assigned_user_id, c.state,
+         NULLIF(TRIM(CONCAT_WS(' ', co.first_name, co.last_name)), '') AS contact_name,
+         co.phone_e164 AS contact_phone,
+         (SELECT m.payload->>'text'
+          FROM messages m
+          WHERE m.conversation_id = c.id
+          ORDER BY m.created_at DESC LIMIT 1) AS last_message
+  FROM conversations c
+  LEFT JOIN contacts co ON co.id = c.contact_id`;
 
 export const conversationRepository = {
   async list(
@@ -1208,11 +1252,11 @@ export const conversationRepository = {
       const params: unknown[] = [];
       if (opts?.state) {
         params.push(opts.state);
-        conditions.push(`state = $${params.length}`);
+        conditions.push(`c.state = $${params.length}`);
       }
       if (opts?.assignedUserId) {
         params.push(opts.assignedUserId);
-        conditions.push(`assigned_user_id = $${params.length}`);
+        conditions.push(`c.assigned_user_id = $${params.length}`);
       }
       const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
       const totalResult = await client.query<{ total: string }>(
@@ -1220,7 +1264,7 @@ export const conversationRepository = {
         params
       );
       const result = await client.query<ConversationRow>(
-        `${CONV_SELECT} FROM conversations ${where} ORDER BY last_message_at DESC NULLS LAST LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+        `${CONV_SELECT} ${where} ORDER BY c.last_message_at DESC NULLS LAST LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
         [...params, limit, offset]
       );
       return { items: result.rows.map(mapConversation), total: Number(totalResult.rows[0]?.total ?? "0") };
@@ -1228,24 +1272,28 @@ export const conversationRepository = {
   },
   async getById(tenantId: string, id: string): Promise<Conversation | undefined> {
     return withTenant(tenantId, async (client) => {
-      const result = await client.query<ConversationRow>(`${CONV_SELECT} FROM conversations WHERE id = $1`, [id]);
+      const result = await client.query<ConversationRow>(`${CONV_SELECT} WHERE c.id = $1`, [id]);
       return result.rows[0] ? mapConversation(result.rows[0]) : undefined;
     });
   },
   async findOrCreate(tenantId: string, contactId: string, channelId: string): Promise<Conversation> {
     return withTenant(tenantId, async (client) => {
       const existing = await client.query<ConversationRow>(
-        `${CONV_SELECT} FROM conversations WHERE contact_id = $1 AND channel_id = $2 LIMIT 1`,
+        `${CONV_SELECT} WHERE c.contact_id = $1 AND c.channel_id = $2 LIMIT 1`,
         [contactId, channelId]
       );
       if (existing.rows[0]) {
         return mapConversation(existing.rows[0]);
       }
-      const inserted = await client.query<ConversationRow>(
+      const insertedId = await client.query<{ id: string }>(
         `INSERT INTO conversations (tenant_id, contact_id, channel_id, state)
          VALUES ($1, $2, $3, 'open')
-         RETURNING id, tenant_id, contact_id, channel_id, last_message_at, last_inbound_at, assigned_user_id, state`,
+         RETURNING id`,
         [tenantId, contactId, channelId]
+      );
+      const inserted = await client.query<ConversationRow>(
+        `${CONV_SELECT} WHERE c.id = $1`,
+        [insertedId.rows[0]!.id]
       );
       return mapConversation(inserted.rows[0]!);
     });
@@ -1601,19 +1649,21 @@ export interface TenantAnalytics {
   templates: number;
   campaigns: number;
   contacts: number;
+  conversations: number;
   optOutRate: number;
 }
 
 export async function tenantAnalytics(tenantId: string): Promise<TenantAnalytics> {
   return withTenant(tenantId, async (client) => {
-    const [templates, campaigns, contacts] = await Promise.all([
+    const [templates, campaigns, contacts, conversations] = await Promise.all([
       client.query<{ count: string }>("SELECT COUNT(*)::text AS count FROM templates"),
       client.query<{ count: string }>("SELECT COUNT(*)::text AS count FROM campaigns"),
       client.query<{ total: string; opted_out: string }>(
         `SELECT COUNT(*)::text AS total,
                 COUNT(*) FILTER (WHERE metadata->>'optedOut' = 'true')::text AS opted_out
          FROM contacts`
-      )
+      ),
+      client.query<{ count: string }>("SELECT COUNT(*)::text AS count FROM conversations")
     ]);
     const total = Number(contacts.rows[0]?.total ?? "0");
     const optedOut = Number(contacts.rows[0]?.opted_out ?? "0");
@@ -1621,6 +1671,7 @@ export async function tenantAnalytics(tenantId: string): Promise<TenantAnalytics
       templates: Number(templates.rows[0]?.count ?? "0"),
       campaigns: Number(campaigns.rows[0]?.count ?? "0"),
       contacts: total,
+      conversations: Number(conversations.rows[0]?.count ?? "0"),
       optOutRate: total ? Number((optedOut / total).toFixed(4)) : 0
     };
   });
@@ -2171,7 +2222,7 @@ export const automationRuleRepository = {
     const offset = opts?.offset ?? 0;
     return withTenant(tenantId, async (client) => {
       const totalResult = await client.query<{ total: string }>(
-        "SELECT COUNT(*)::text AS total FROM automation_rules"
+        "SELECT COUNT(*)::text AS total FROM automation_rules WHERE tenant_id = current_setting('app.tenant_id', true)::uuid"
       );
       const result = await client.query<AutomationRuleRow>(
         `${AUTOMATION_SELECT} ORDER BY priority DESC, created_at ASC LIMIT $1 OFFSET $2`,
@@ -2285,7 +2336,8 @@ export const taskRepository = {
         params.push(opts.assigneeUserId);
         conditions.push(`assignee_user_id = $${params.length}`);
       }
-      const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+      const tenantFilter = "tenant_id = current_setting('app.tenant_id', true)::uuid";
+      const where = conditions.length > 0 ? `WHERE ${tenantFilter} AND ${conditions.join(" AND ")}` : `WHERE ${tenantFilter}`;
       const totalResult = await client.query<{ total: string }>(
         `SELECT COUNT(*)::text AS total FROM tasks ${where}`,
         params
