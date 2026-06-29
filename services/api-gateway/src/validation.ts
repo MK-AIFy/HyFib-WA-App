@@ -58,6 +58,9 @@ export function parseOptionalIsoDate(
 
 /** Clamps an optional integer into [min, max]; returns fallback when absent/invalid. */
 export function clampInt(value: unknown, min: number, max: number, fallback: number): number {
+  if (value === null || value === undefined || value === "") {
+    return fallback;
+  }
   const n = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(n)) {
     return fallback;

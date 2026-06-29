@@ -1278,7 +1278,7 @@ export const conversationRepository = {
       }
       const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
       const totalResult = await client.query<{ total: string }>(
-        `SELECT COUNT(*)::text AS total FROM conversations ${where}`,
+        `SELECT COUNT(*)::text AS total FROM conversations c ${where}`,
         params
       );
       const result = await client.query<ConversationRow>(
@@ -1511,12 +1511,13 @@ export const messageRepository = {
       const params: unknown[] = [conversationId];
       let where = "conversation_id = $1";
       if (options.before) {
-        // Accept either a message UUID (look up its timestamp) or a raw ISO timestamp string
+        // Accept a message UUID (look up its timestamp) or an ISO timestamp string; ignore anything else
         const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(options.before);
+        const isIso = !isUuid && /^\d{4}-\d{2}-\d{2}T/.test(options.before);
         if (isUuid) {
           params.push(options.before);
           where += ` AND created_at < (SELECT created_at FROM messages WHERE id = $${params.length} LIMIT 1)`;
-        } else {
+        } else if (isIso) {
           params.push(options.before);
           where += ` AND created_at < $${params.length}`;
         }
