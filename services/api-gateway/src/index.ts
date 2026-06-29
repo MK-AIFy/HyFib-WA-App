@@ -1241,7 +1241,6 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 400, { error: "name is required" });
       return;
     }
-    // @ts-ignore — teamRepository.update is added by repositories agent; remove after merge
     const updated = await teamRepository.update(tenantId, teamId, { name: body.name.trim() });
     if (!updated) {
       sendJson(res, 404, { error: "Team not found" });
