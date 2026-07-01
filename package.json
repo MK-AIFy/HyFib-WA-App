@@ -18,7 +18,8 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "compose:up": "docker compose up --build",
-    "compose:down": "docker compose down --remove-orphans"
+    "compose:down": "docker compose down --remove-orphans",
+    "migrate": "bash scripts/migrate.sh"
   },
   "devDependencies": {
     "@eslint/js": "^9.17.0",

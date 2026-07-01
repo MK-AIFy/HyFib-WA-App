@@ -177,50 +177,62 @@ ALTER TABLE orders FORCE ROW LEVEL SECURITY;
 ALTER TABLE audit_events FORCE ROW LEVEL SECURITY;
 ALTER TABLE outbox_events FORCE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS users_tenant_isolation ON users;
 CREATE POLICY users_tenant_isolation ON users
   USING (tenant_id::text = current_setting('app.tenant_id', true))
   WITH CHECK (tenant_id::text = current_setting('app.tenant_id', true));
 
+DROP POLICY IF EXISTS role_bindings_tenant_isolation ON role_bindings;
 CREATE POLICY role_bindings_tenant_isolation ON role_bindings
   USING (tenant_id::text = current_setting('app.tenant_id', true))
   WITH CHECK (tenant_id::text = current_setting('app.tenant_id', true));
 
+DROP POLICY IF EXISTS whatsapp_channels_tenant_isolation ON whatsapp_channels;
 CREATE POLICY whatsapp_channels_tenant_isolation ON whatsapp_channels
   USING (tenant_id::text = current_setting('app.tenant_id', true))
   WITH CHECK (tenant_id::text = current_setting('app.tenant_id', true));
 
+DROP POLICY IF EXISTS templates_tenant_isolation ON templates;
 CREATE POLICY templates_tenant_isolation ON templates
   USING (tenant_id::text = current_setting('app.tenant_id', true))
   WITH CHECK (tenant_id::text = current_setting('app.tenant_id', true));
 
+DROP POLICY IF EXISTS contacts_tenant_isolation ON contacts;
 CREATE POLICY contacts_tenant_isolation ON contacts
   USING (tenant_id::text = current_setting('app.tenant_id', true))
   WITH CHECK (tenant_id::text = current_setting('app.tenant_id', true));
 
+DROP POLICY IF EXISTS consent_records_tenant_isolation ON consent_records;
 CREATE POLICY consent_records_tenant_isolation ON consent_records
   USING (tenant_id::text = current_setting('app.tenant_id', true))
   WITH CHECK (tenant_id::text = current_setting('app.tenant_id', true));
 
+DROP POLICY IF EXISTS campaigns_tenant_isolation ON campaigns;
 CREATE POLICY campaigns_tenant_isolation ON campaigns
   USING (tenant_id::text = current_setting('app.tenant_id', true))
   WITH CHECK (tenant_id::text = current_setting('app.tenant_id', true));
 
+DROP POLICY IF EXISTS conversations_tenant_isolation ON conversations;
 CREATE POLICY conversations_tenant_isolation ON conversations
   USING (tenant_id::text = current_setting('app.tenant_id', true))
   WITH CHECK (tenant_id::text = current_setting('app.tenant_id', true));
 
+DROP POLICY IF EXISTS messages_tenant_isolation ON messages;
 CREATE POLICY messages_tenant_isolation ON messages
   USING (tenant_id::text = current_setting('app.tenant_id', true))
   WITH CHECK (tenant_id::text = current_setting('app.tenant_id', true));
 
+DROP POLICY IF EXISTS orders_tenant_isolation ON orders;
 CREATE POLICY orders_tenant_isolation ON orders
   USING (tenant_id::text = current_setting('app.tenant_id', true))
   WITH CHECK (tenant_id::text = current_setting('app.tenant_id', true));
 
+DROP POLICY IF EXISTS audit_events_tenant_isolation ON audit_events;
 CREATE POLICY audit_events_tenant_isolation ON audit_events
   USING (tenant_id::text = current_setting('app.tenant_id', true))
   WITH CHECK (tenant_id::text = current_setting('app.tenant_id', true));
 
+DROP POLICY IF EXISTS outbox_events_tenant_isolation ON outbox_events;
 CREATE POLICY outbox_events_tenant_isolation ON outbox_events
   USING (tenant_id::text = current_setting('app.tenant_id', true))
   WITH CHECK (tenant_id::text = current_setting('app.tenant_id', true));

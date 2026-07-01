@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS segments (
 
 ALTER TABLE segments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE segments FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS segments_tenant_isolation ON segments;
 CREATE POLICY segments_tenant_isolation ON segments
   USING (tenant_id::text = current_setting('app.tenant_id', true))
   WITH CHECK (tenant_id::text = current_setting('app.tenant_id', true));
@@ -31,6 +32,7 @@ CREATE TABLE IF NOT EXISTS contact_imports (
 
 ALTER TABLE contact_imports ENABLE ROW LEVEL SECURITY;
 ALTER TABLE contact_imports FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS contact_imports_tenant_isolation ON contact_imports;
 CREATE POLICY contact_imports_tenant_isolation ON contact_imports
   USING (tenant_id::text = current_setting('app.tenant_id', true))
   WITH CHECK (tenant_id::text = current_setting('app.tenant_id', true));
@@ -62,6 +64,7 @@ CREATE INDEX IF NOT EXISTS idx_campaign_recipients_ext_msg
 
 ALTER TABLE campaign_recipients ENABLE ROW LEVEL SECURITY;
 ALTER TABLE campaign_recipients FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS campaign_recipients_tenant_isolation ON campaign_recipients;
 CREATE POLICY campaign_recipients_tenant_isolation ON campaign_recipients
   USING (tenant_id::text = current_setting('app.tenant_id', true))
   WITH CHECK (tenant_id::text = current_setting('app.tenant_id', true));
@@ -98,6 +101,7 @@ CREATE TABLE IF NOT EXISTS auto_reply_rules (
 
 ALTER TABLE auto_reply_rules ENABLE ROW LEVEL SECURITY;
 ALTER TABLE auto_reply_rules FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS auto_reply_rules_tenant_isolation ON auto_reply_rules;
 CREATE POLICY auto_reply_rules_tenant_isolation ON auto_reply_rules
   USING (tenant_id::text = current_setting('app.tenant_id', true))
   WITH CHECK (tenant_id::text = current_setting('app.tenant_id', true));
@@ -118,6 +122,7 @@ CREATE TABLE IF NOT EXISTS link_clicks (
 
 ALTER TABLE link_clicks ENABLE ROW LEVEL SECURITY;
 ALTER TABLE link_clicks FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS link_clicks_tenant_isolation ON link_clicks;
 CREATE POLICY link_clicks_tenant_isolation ON link_clicks
   USING (tenant_id::text = current_setting('app.tenant_id', true))
   WITH CHECK (tenant_id::text = current_setting('app.tenant_id', true));

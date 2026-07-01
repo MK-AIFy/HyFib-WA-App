@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS campaign_send_log (
 ALTER TABLE campaign_send_log ENABLE ROW LEVEL SECURITY;
 ALTER TABLE campaign_send_log FORCE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS campaign_send_log_tenant_isolation ON campaign_send_log;
 CREATE POLICY campaign_send_log_tenant_isolation ON campaign_send_log
   USING (tenant_id::text = current_setting('app.tenant_id', true))
   WITH CHECK (tenant_id::text = current_setting('app.tenant_id', true));

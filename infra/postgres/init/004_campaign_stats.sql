@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS campaign_stats (
 ALTER TABLE campaign_stats ENABLE ROW LEVEL SECURITY;
 ALTER TABLE campaign_stats FORCE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS campaign_stats_tenant_isolation ON campaign_stats;
 CREATE POLICY campaign_stats_tenant_isolation ON campaign_stats
   USING (tenant_id::text = current_setting('app.tenant_id', true))
   WITH CHECK (tenant_id::text = current_setting('app.tenant_id', true));

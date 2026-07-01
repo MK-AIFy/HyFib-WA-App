@@ -71,15 +71,15 @@ jobs:
       - run: pnpm build
       - name: Install psql client
         run: sudo apt-get update && sudo apt-get install -y postgresql-client
-      - name: Apply schema and app role
+      - name: Apply all migrations
         env:
-          PGHOST: localhost
-          PGPASSWORD: bootpw
-        run: |
-          psql -U platform -d hyfib_wa -f infra/postgres/init/001_schema.sql
-          APP_DB_USER=hyfib_app APP_DB_PASSWORD=apppw POSTGRES_USER=platform POSTGRES_DB=hyfib_wa \
-            sh infra/postgres/init/002_app_role.sh
-          psql -U platform -d hyfib_wa -f infra/postgres/init/003_functions.sql
+          POSTGRES_HOST: localhost
+          POSTGRES_USER: platform
+          POSTGRES_PASSWORD: bootpw
+          POSTGRES_DB: hyfib_wa
+          APP_DB_USER: hyfib_app
+          APP_DB_PASSWORD: apppw
+        run: pnpm migrate
       - name: Persistence integration tests
         run: pnpm --filter @hyfib/persistence test
 
