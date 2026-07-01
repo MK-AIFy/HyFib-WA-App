@@ -6,13 +6,21 @@ const buf = (s) => Buffer.from(s, "utf-8");
 
 test("serializeContactsCsv emits importer-compatible header and escapes cells", () => {
   const csv = serializeContactsCsv([
-    { phoneE164: "+15551230001", firstName: "Ann", lastName: "Lee", country: "US", timezone: "UTC", tags: ["vip", "lead"], optedOut: false },
+    {
+      phoneE164: "+15551230001",
+      firstName: "Ann",
+      lastName: "Lee",
+      country: "US",
+      timezone: "UTC",
+      tags: ["vip", "lead"],
+      optedOut: false
+    },
     { phoneE164: "+15551230002", firstName: 'A,"B', tags: [], optedOut: true }
   ]);
   const lines = csv.split("\n");
-  assert.equal(lines[0], "phone_e164,first_name,last_name,country,timezone,tags,opted_out");
-  assert.equal(lines[1], "+15551230001,Ann,Lee,US,UTC,vip|lead,false");
-  assert.equal(lines[2], '+15551230002,"A,""B",,,,,true');
+  assert.equal(lines[0], "phone_e164,first_name,last_name,country,timezone,tags,consent");
+  assert.equal(lines[1], "+15551230001,Ann,Lee,US,UTC,vip|lead,true");
+  assert.equal(lines[2], '+15551230002,"A,""B",,,,,false');
 });
 
 test("parses a minimal phone_e164 CSV", () => {
