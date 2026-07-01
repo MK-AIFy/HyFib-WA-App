@@ -1,5 +1,8 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash, scrypt, randomBytes, timingSafeEqual } from "node:crypto";
+import { promisify } from "node:util";
+
+const scryptAsync = promisify(scrypt);
 import { evaluateOutboundPolicy } from "@hyfib/policy-engine";
 import { loadConfig } from "@hyfib/config";
 import { createAuthenticator, hasAnyRole, normalizeRoles, AuthError, type AuthContext } from "@hyfib/auth";
@@ -27,6 +30,7 @@ import {
   segmentRepository,
   contactNoteRepository,
   conversationNoteRepository,
+  sessionRepository,
   tagRepository,
   taskRepository,
   teamRepository,
@@ -69,8 +73,16 @@ import {
   type WhatsAppInteractivePayload,
   type WhatsAppMediaKind
 } from "@hyfib/shared-core";
-import { getRedisClient } from "@hyfib/ratelimit";
-import { parseContactListQuery, parseListQuery, boundedText, parseOptionalIsoDate, clampInt, validateInteractivePayload, validateCampaignBody } from "./validation.js";
+import { getRedisClient, checkRateLimit } from "@hyfib/ratelimit";
+import {
+  parseContactListQuery,
+  parseListQuery,
+  boundedText,
+  parseOptionalIsoDate,
+  clampInt,
+  validateInteractivePayload,
+  validateCampaignBody
+} from "./validation.js";
 import { filterSendableContacts } from "./campaign.js";
 import { canCreateContact, canCreateOrder } from "./authorization.js";
 import { SseHub } from "./sse-hub.js";
@@ -209,12 +221,7 @@ const AUTOMATION_TRIGGERS = new Set<AutomationTriggerType>([
   "conversation_assigned",
   "no_reply"
 ]);
-const AUTOMATION_ACTIONS = new Set<AutomationActionType>([
-  "send_template",
-  "assign_agent",
-  "add_tag",
-  "create_task"
-]);
+const AUTOMATION_ACTIONS = new Set<AutomationActionType>(["send_template", "assign_agent", "add_tag", "create_task"]);
 // ─── Bootstrap ────────────────────────────────────────────────────────────────
 
 const config = loadConfig();
@@ -261,10 +268,87 @@ function applySecurityHeaders(res: ServerResponse): void {
   res.setHeader("Cache-Control", "no-store");
 }
 
-async function resolveAuth(req: IncomingMessage): Promise<AuthContext> {
-  if (config.authEnabled) {
-    return authenticator.authenticate(req.headers["authorization"]);
+// ─── Password helpers (scrypt, no external deps) ──────────────────────────────
+
+async function hashPassword(password: string): Promise<string> {
+  const salt = randomBytes(16).toString("hex");
+  const derived = (await scryptAsync(password, salt, 64)) as Buffer;
+  return `${salt}:${derived.toString("hex")}`;
+}
+
+async function verifyPassword(password: string, stored: string): Promise<boolean> {
+  const [salt, hash] = stored.split(":");
+  if (!salt || !hash) return false;
+  try {
+    const derived = (await scryptAsync(password, salt, 64)) as Buffer;
+    const storedBuf = Buffer.from(hash, "hex");
+    return derived.length === storedBuf.length && timingSafeEqual(derived, storedBuf);
+  } catch {
+    return false;
   }
+}
+
+function tokenHash(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+const PLATFORM_TENANT_ID = "00000000-0000-0000-0000-000000000001";
+
+// Creates the platform_owner account from env vars on first boot only.
+// No password hash is ever committed to source control (see 013_auth.sql).
+async function bootstrapPlatformAdmin(): Promise<void> {
+  const email = process.env.BOOTSTRAP_ADMIN_EMAIL;
+  const password = process.env.BOOTSTRAP_ADMIN_PASSWORD;
+  if (!email || !password) return;
+  if (!EMAIL.test(email) || password.length < 8) {
+    logger.warn("bootstrap_admin_invalid_credentials");
+    return;
+  }
+  const existing = await userRepository.findByEmailForAuth(email);
+  if (existing) return;
+  const passwordHash = await hashPassword(password);
+  const user = await userRepository.create(PLATFORM_TENANT_ID, {
+    email,
+    displayName: "Platform Admin",
+    roles: ["platform_owner"],
+    passwordHash
+  });
+  logger.info("platform_admin_bootstrapped", { userId: user.id, email });
+}
+
+function getClientIp(req: IncomingMessage): string {
+  const forwarded = req.headers["x-forwarded-for"];
+  const first = Array.isArray(forwarded) ? forwarded[0] : forwarded?.split(",")[0];
+  return first?.trim() || req.socket.remoteAddress || "unknown";
+}
+
+const AUTH_RATE_LIMIT_PER_MINUTE = 5;
+
+async function isAuthRateLimited(scope: string): Promise<boolean> {
+  const { allowed } = await checkRateLimit(getRedisClient(config), `auth:${scope}`, AUTH_RATE_LIMIT_PER_MINUTE);
+  return !allowed;
+}
+
+// ─── Auth resolution: Bearer token (session) → header fallback (dev) ──────────
+
+async function resolveAuth(req: IncomingMessage): Promise<AuthContext> {
+  // 1. Bearer session token (works in all modes)
+  const authHeader = req.headers["authorization"];
+  if (authHeader?.startsWith("Bearer ")) {
+    const rawToken = authHeader.slice(7);
+    const session = await sessionRepository.findByToken(tokenHash(rawToken));
+    if (session) {
+      const userRow = await dbQuery<{ roles: string[] }>("SELECT roles FROM users WHERE id = $1", [session.userId]);
+      const roles = normalizeRoles(userRow.rows[0]?.roles ?? []);
+      return { subject: session.userId, tenantId: session.tenantId, roles };
+    }
+  }
+
+  if (config.authEnabled) {
+    return authenticator.authenticate(authHeader);
+  }
+
+  // Dev-mode header fallback
   const roleHeader = req.headers["x-role"];
   const roles = normalizeRoles(typeof roleHeader === "string" ? roleHeader.split(",") : []);
   const tenantId = typeof req.headers["x-tenant-id"] === "string" ? (req.headers["x-tenant-id"] as string) : undefined;
@@ -858,6 +942,25 @@ function startReminderScheduler(): NodeJS.Timeout {
   }, 60_000);
 }
 
+function startSessionPurgeScheduler(): NodeJS.Timeout {
+  let running = false;
+  return setInterval(() => {
+    if (running) return;
+    running = true;
+    void (async () => {
+      try {
+        await sessionRepository.deleteExpired();
+      } catch (error) {
+        logger.error("session_purge_scheduler_error", {
+          error: error instanceof Error ? error.message : String(error)
+        });
+      } finally {
+        running = false;
+      }
+    })();
+  }, 60 * 60_000);
+}
+
 // ─── SSE hub ──────────────────────────────────────────────────────────────────
 
 /** Minimal LRU cache backed by Map insertion-order. Evicts the oldest entry (not the LRU access order, which is fine for this near-static phoneNumberId→tenantId mapping). */
@@ -1000,7 +1103,9 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     if (parsedWebhookBody) {
       const firstEntry = (parsedWebhookBody?.entry as unknown[])?.[0] as Record<string, unknown> | undefined;
       const firstChange = (firstEntry?.changes as unknown[])?.[0] as Record<string, unknown> | undefined;
-      const phoneNumberId = (firstChange?.value as Record<string, unknown> | undefined)?.metadata as Record<string, unknown> | undefined;
+      const phoneNumberId = (firstChange?.value as Record<string, unknown> | undefined)?.metadata as
+        | Record<string, unknown>
+        | undefined;
       const phoneNumberIdStr = phoneNumberId?.phone_number_id as string | undefined;
       if (phoneNumberIdStr) {
         const resolved = await resolveChannelByPhoneNumberId(phoneNumberIdStr);
@@ -1022,8 +1127,158 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
 
-  if (!path.startsWith("/api/v1/")) {
+  if (!path.startsWith("/api/v1/") && !path.startsWith("/auth/")) {
     sendJson(res, 404, { error: "route_not_found", method, path, requestId: ctx.requestId });
+    return;
+  }
+
+  // ─── Auth routes (unauthenticated) ────────────────────────────────────────
+  const SESSION_TTL = 30 * 24 * 60 * 60; // 30 days
+
+  if (path === "/auth/register" && method === "POST") {
+    if (await isAuthRateLimited(`register:${getClientIp(req)}`)) {
+      sendJson(res, 429, { error: "Too many registration attempts. Try again later." });
+      return;
+    }
+    const body = await readJsonBody<{ orgName: string; email: string; password: string; displayName?: string }>(req);
+    if (!body.orgName || !body.email || !body.password) {
+      sendJson(res, 400, { error: "orgName, email and password are required" });
+      return;
+    }
+    if (!EMAIL.test(body.email)) {
+      sendJson(res, 400, { error: "Invalid email address" });
+      return;
+    }
+    if (body.password.length < 8) {
+      sendJson(res, 400, { error: "Password must be at least 8 characters" });
+      return;
+    }
+    // Check email not already taken
+    const existing = await userRepository.findByEmailForAuth(body.email);
+    if (existing) {
+      sendJson(res, 409, { error: "An account with this email already exists" });
+      return;
+    }
+    const tenant = await tenantRepository.create(body.orgName);
+    const pwHash = await hashPassword(body.password);
+    const user = await userRepository.create(tenant.id, {
+      email: body.email,
+      displayName: body.displayName ?? body.email.split("@")[0]!,
+      roles: ["tenant_admin"],
+      passwordHash: pwHash
+    });
+    const rawToken = randomUUID() + randomUUID();
+    await sessionRepository.create({
+      userId: user.id,
+      tenantId: tenant.id,
+      tokenHash: tokenHash(rawToken),
+      ttlSeconds: SESSION_TTL
+    });
+    logger.info("user_registered", { tenantId: tenant.id, userId: user.id, email: body.email });
+    sendJson(res, 201, {
+      token: rawToken,
+      user: {
+        id: user.id,
+        email: user.email,
+        displayName: user.displayName,
+        roles: user.roles,
+        tenantId: tenant.id,
+        tenant
+      }
+    });
+    return;
+  }
+
+  if (path === "/auth/login" && method === "POST") {
+    if (await isAuthRateLimited(`login:${getClientIp(req)}`)) {
+      sendJson(res, 429, { error: "Too many login attempts. Try again later." });
+      return;
+    }
+    const body = await readJsonBody<{ email: string; password: string }>(req);
+    if (!body.email || !body.password) {
+      sendJson(res, 400, { error: "email and password are required" });
+      return;
+    }
+    if (await isAuthRateLimited(`login-email:${body.email.toLowerCase()}`)) {
+      sendJson(res, 429, { error: "Too many login attempts. Try again later." });
+      return;
+    }
+    const found = await userRepository.findByEmailForAuth(body.email);
+    if (!found || !found.passwordHash) {
+      sendJson(res, 401, { error: "Invalid email or password" });
+      return;
+    }
+    if (found.status === "suspended") {
+      sendJson(res, 403, { error: "Account is suspended" });
+      return;
+    }
+    const valid = await verifyPassword(body.password, found.passwordHash);
+    if (!valid) {
+      sendJson(res, 401, { error: "Invalid email or password" });
+      return;
+    }
+    const tenant = await tenantRepository.getById(found.tenantId);
+    if (tenant?.status === "suspended") {
+      sendJson(res, 403, { error: "Organization account is suspended" });
+      return;
+    }
+    const rawToken = randomUUID() + randomUUID();
+    await sessionRepository.create({
+      userId: found.id,
+      tenantId: found.tenantId,
+      tokenHash: tokenHash(rawToken),
+      ttlSeconds: SESSION_TTL
+    });
+    logger.info("user_login", { tenantId: found.tenantId, userId: found.id, email: body.email });
+    sendJson(res, 200, {
+      token: rawToken,
+      user: {
+        id: found.id,
+        email: found.email,
+        displayName: found.displayName,
+        roles: found.roles,
+        tenantId: found.tenantId,
+        tenant
+      }
+    });
+    return;
+  }
+
+  if (path === "/auth/logout" && method === "POST") {
+    const authHeader = req.headers["authorization"];
+    if (authHeader?.startsWith("Bearer ")) {
+      await sessionRepository.deleteByToken(tokenHash(authHeader.slice(7)));
+    }
+    sendJson(res, 200, { status: "logged_out" });
+    return;
+  }
+
+  if (path === "/auth/me" && method === "GET") {
+    const authHeader = req.headers["authorization"];
+    if (!authHeader?.startsWith("Bearer ")) {
+      sendJson(res, 401, { error: "Not authenticated" });
+      return;
+    }
+    const session = await sessionRepository.findByToken(tokenHash(authHeader.slice(7)));
+    if (!session) {
+      sendJson(res, 401, { error: "Session expired or invalid" });
+      return;
+    }
+    const u = await userRepository.getById(session.tenantId, session.userId);
+    if (!u) {
+      sendJson(res, 401, { error: "User not found" });
+      return;
+    }
+    const tenant = await tenantRepository.getById(session.tenantId);
+    sendJson(res, 200, {
+      id: u.id,
+      email: u.email,
+      displayName: u.displayName,
+      roles: u.roles,
+      status: u.status,
+      tenantId: session.tenantId,
+      tenant
+    });
     return;
   }
 
@@ -1076,6 +1331,43 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
 
+  // PATCH /api/v1/tenants/:id — platform_owner updates limits / status / plan
+  if (path.startsWith("/api/v1/tenants/") && method === "PATCH") {
+    if (!hasAnyRole(auth, ["platform_owner"])) {
+      sendJson(res, 403, { error: "Only platform_owner can update tenant settings" });
+      return;
+    }
+    const tid = extractPathSegment(path, "/api/v1/tenants/");
+    if (!tid || !UUID.test(tid)) {
+      sendJson(res, 400, { error: "Invalid tenant id" });
+      return;
+    }
+    const body = await readJsonBody<{ name?: string; status?: string; maxUsers?: number; plan?: string }>(req);
+    const updated = await tenantRepository.update(tid, body);
+    if (!updated) {
+      sendJson(res, 404, { error: "Tenant not found" });
+      return;
+    }
+    sendJson(res, 200, updated as unknown as Record<string, unknown>);
+    return;
+  }
+
+  // GET /api/v1/tenants/:id/users — platform_owner lists users of any tenant
+  if (path.match(/^\/api\/v1\/tenants\/[^/]+\/users$/) && method === "GET") {
+    if (!hasAnyRole(auth, ["platform_owner"])) {
+      sendJson(res, 403, { error: "Insufficient role" });
+      return;
+    }
+    const tid = extractPathSegment(path, "/api/v1/tenants/");
+    if (!tid || !UUID.test(tid)) {
+      sendJson(res, 400, { error: "Invalid tenant id" });
+      return;
+    }
+    const users = await userRepository.list(tid);
+    sendJson(res, 200, { items: users });
+    return;
+  }
+
   // ─── Tenant-scoped routes ─────────────────────────────────────────────────
   const tenantId = auth.tenantId;
   if (!tenantId) {
@@ -1111,9 +1403,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       }
       const users = await userRepository.list(tenantId);
       const isAdmin = hasAnyRole(auth, ["platform_owner", "tenant_admin"]);
-      const items = isAdmin
-        ? users
-        : users.map(({ id, displayName }) => ({ id, displayName }));
+      const items = isAdmin ? users : users.map(({ id, displayName }) => ({ id, displayName }));
       sendJson(res, 200, { items });
       return;
     }
@@ -1141,10 +1431,30 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         sendJson(res, 400, { error: `Invalid roles: ${invalidRoles.join(", ")}` });
         return;
       }
+      // Enforce per-tenant user limit
+      const tenant = await tenantRepository.getById(tenantId);
+      if (tenant) {
+        const currentCount = await tenantRepository.getUserCount(tenantId);
+        if (currentCount >= tenant.maxUsers) {
+          sendJson(res, 422, {
+            error: `User limit reached (${tenant.maxUsers}). Contact HyFib support to increase your plan.`
+          });
+          return;
+        }
+      }
+      const existingUser = await userRepository.findByEmailForAuth(emailTrimmed);
+      if (existingUser) {
+        sendJson(res, 409, { error: "A user with this email already exists" });
+        return;
+      }
+      // Generate a temp password the admin must share with the invitee
+      const tempPassword = randomBytes(8).toString("hex");
+      const pwHash = await hashPassword(tempPassword);
       const user = await userRepository.create(tenantId, {
         email: emailTrimmed,
         displayName: payload.displayName.trim(),
-        roles: payload.roles
+        roles: payload.roles,
+        passwordHash: pwHash
       });
       await audit(tenantId, auth, {
         action: "user.created",
@@ -1152,10 +1462,51 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         resourceId: user.id,
         payload: { email: user.email, roles: user.roles }
       });
-      sendJson(res, 201, { ...user });
+      sendJson(res, 201, { ...user, tempPassword });
       return;
     }
     sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+
+  // POST /api/v1/users/:id/set-password — user sets their own password
+  if (path.match(/^\/api\/v1\/users\/[^/]+\/set-password$/) && method === "POST") {
+    const userId = extractPathSegment(path, "/api/v1/users/");
+    if (!userId || !UUID.test(userId)) {
+      sendJson(res, 400, { error: "Invalid user id" });
+      return;
+    }
+    if (auth.subject !== userId && !hasAnyRole(auth, ["platform_owner", "tenant_admin"])) {
+      sendJson(res, 403, { error: "Can only change your own password" });
+      return;
+    }
+    const body = await readJsonBody<{ password: string }>(req);
+    if (!body.password || body.password.length < 8) {
+      sendJson(res, 400, { error: "Password must be at least 8 characters" });
+      return;
+    }
+    await userRepository.updatePassword(tenantId, userId, await hashPassword(body.password));
+    await sessionRepository.deleteAllForUser(userId);
+    sendJson(res, 200, { status: "password_updated" });
+    return;
+  }
+
+  // PATCH /api/v1/users/:id — tenant_admin updates user status/roles
+  if (path.match(/^\/api\/v1\/users\/[^/]+$/) && method === "PATCH") {
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin"])) {
+      sendJson(res, 403, { error: "Insufficient role" });
+      return;
+    }
+    const userId = extractPathSegment(path, "/api/v1/users/");
+    if (!userId || !UUID.test(userId)) {
+      sendJson(res, 400, { error: "Invalid user id" });
+      return;
+    }
+    const body = await readJsonBody<{ status?: string }>(req);
+    if (body.status) {
+      await userRepository.updateStatus(tenantId, userId, body.status);
+    }
+    sendJson(res, 200, { status: "updated" });
     return;
   }
 
@@ -1247,7 +1598,12 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 404, { error: "Team not found" });
       return;
     }
-    await audit(tenantId, auth, { action: "team.updated", resourceType: "Team", resourceId: teamId, payload: { name: body.name } });
+    await audit(tenantId, auth, {
+      action: "team.updated",
+      resourceType: "Team",
+      resourceId: teamId,
+      payload: { name: body.name }
+    });
     sendJson(res, 200, updated as unknown as Record<string, unknown>);
     return;
   }
@@ -1571,7 +1927,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         sendJson(res, 400, { error: "phoneE164 must be E.164 formatted" });
         return;
       }
-      if (payload.firstName !== undefined && (typeof payload.firstName !== "string" || payload.firstName.length > 100)) {
+      if (
+        payload.firstName !== undefined &&
+        (typeof payload.firstName !== "string" || payload.firstName.length > 100)
+      ) {
         sendJson(res, 400, { error: "firstName must be a string of at most 100 characters" });
         return;
       }
@@ -1716,7 +2075,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 400, { error: "source must be a string of at most 64 characters" });
       return;
     }
-    if (body.policyVersion !== undefined && (typeof body.policyVersion !== "string" || body.policyVersion.length > 32)) {
+    if (
+      body.policyVersion !== undefined &&
+      (typeof body.policyVersion !== "string" || body.policyVersion.length > 32)
+    ) {
       sendJson(res, 400, { error: "policyVersion must be a string of at most 32 characters" });
       return;
     }
@@ -2102,7 +2464,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     const offset = Number(recipientsQuery.get("offset") ?? "0");
     const limit = Math.min(Number(recipientsQuery.get("limit") ?? "100"), 500);
     const statusFilter = recipientsQuery.get("status") ?? undefined;
-    const items = await campaignRecipientRepository.listByCampaign(tenantId, campaignId, { limit, status: statusFilter });
+    const items = await campaignRecipientRepository.listByCampaign(tenantId, campaignId, {
+      limit,
+      status: statusFilter
+    });
     sendJson(res, 200, { items, offset, limit });
     return;
   }
@@ -2136,12 +2501,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     sseHub.broadcast(tenantId, "conversation.assigned", randomUUID(), { conversationId, userId: body.userId });
     if (body.userId) {
       const conv = await conversationRepository.getById(tenantId, conversationId);
-      await runAutomation(
-        tenantId,
-        "conversation_assigned",
-        {},
-        { conversationId, contactId: conv?.contactId }
-      );
+      await runAutomation(tenantId, "conversation_assigned", {}, { conversationId, contactId: conv?.contactId });
     }
     sendJson(res, 200, { status: "assigned", conversationId, userId: body.userId });
     return;
@@ -2582,7 +2942,11 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         sendJson(res, 400, { error: "contactId must be a valid id" });
         return;
       }
-      if (typeof payload.amountMinor !== "number" || !Number.isInteger(payload.amountMinor) || payload.amountMinor <= 0) {
+      if (
+        typeof payload.amountMinor !== "number" ||
+        !Number.isInteger(payload.amountMinor) ||
+        payload.amountMinor <= 0
+      ) {
         sendJson(res, 400, { error: "amountMinor must be a positive integer (amount in minor currency units)" });
         return;
       }
@@ -2619,7 +2983,11 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     const lcCampaignId = lcQuery.get("campaignId") ?? undefined;
     const lcOffset = Number(lcQuery.get("offset") ?? "0");
     const lcLimit = Math.min(Number(lcQuery.get("limit") ?? "100"), 500);
-    const result = await linkClickRepository.list(tenantId, { campaignId: lcCampaignId, offset: lcOffset, limit: lcLimit });
+    const result = await linkClickRepository.list(tenantId, {
+      campaignId: lcCampaignId,
+      offset: lcOffset,
+      limit: lcLimit
+    });
     sendJson(res, 200, result);
     return;
   }
@@ -2727,6 +3095,9 @@ const relayTimer = startOutboxRelay();
 const schedulerTimer = startCampaignScheduler();
 const noReplyTimer = startNoReplyScheduler();
 const reminderTimer = startReminderScheduler();
+const sessionPurgeTimer = startSessionPurgeScheduler();
+
+await bootstrapPlatformAdmin();
 
 server.listen(config.apiGatewayPort, () => {
   logger.info("service_started", {
@@ -2746,6 +3117,7 @@ async function shutdown(signal: string): Promise<void> {
   clearInterval(schedulerTimer);
   clearInterval(noReplyTimer);
   clearInterval(reminderTimer);
+  clearInterval(sessionPurgeTimer);
   sseHub.close();
   server.close(async () => {
     await eventBus.close().catch(() => undefined);

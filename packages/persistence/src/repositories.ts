@@ -45,7 +45,10 @@ export type CampaignWithTemplate = Campaign & {
 interface TenantRow {
   id: string;
   name: string;
+  slug: string | null;
   status: string;
+  plan: string | null;
+  max_users: number | null;
   created_at: Date;
 }
 
@@ -53,26 +56,78 @@ function mapTenant(row: TenantRow): Tenant {
   return {
     id: row.id,
     name: row.name,
+    slug: row.slug ?? undefined,
     status: row.status as Tenant["status"],
+    plan: (row.plan ?? "trial") as Tenant["plan"],
+    maxUsers: row.max_users ?? 10,
     createdAt: row.created_at.toISOString()
   };
 }
 
+const TENANT_SELECT = "SELECT id, name, slug, status, plan, max_users, created_at FROM tenants";
+
 export const tenantRepository = {
-  async create(name: string): Promise<Tenant> {
+  async create(name: string, opts?: { plan?: string; maxUsers?: number }): Promise<Tenant> {
+    const slug =
+      name
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-|-$/g, "") +
+      "-" +
+      Math.random().toString(36).slice(2, 6);
     const result = await query<TenantRow>(
-      "INSERT INTO tenants (name) VALUES ($1) RETURNING id, name, status, created_at",
-      [name]
+      `INSERT INTO tenants (name, slug, plan, max_users) VALUES ($1, $2, $3, $4)
+       RETURNING id, name, slug, status, plan, max_users, created_at`,
+      [name, slug, opts?.plan ?? "trial", opts?.maxUsers ?? 10]
     );
     return mapTenant(result.rows[0]!);
   },
   async list(): Promise<Tenant[]> {
-    const result = await query<TenantRow>("SELECT id, name, status, created_at FROM tenants ORDER BY created_at DESC");
+    const result = await query<TenantRow>(`${TENANT_SELECT} ORDER BY created_at DESC`);
     return result.rows.map(mapTenant);
   },
   async getById(id: string): Promise<Tenant | undefined> {
-    const result = await query<TenantRow>("SELECT id, name, status, created_at FROM tenants WHERE id = $1", [id]);
+    const result = await query<TenantRow>(`${TENANT_SELECT} WHERE id = $1`, [id]);
     return result.rows[0] ? mapTenant(result.rows[0]) : undefined;
+  },
+  async getBySlug(slug: string): Promise<Tenant | undefined> {
+    const result = await query<TenantRow>(`${TENANT_SELECT} WHERE slug = $1`, [slug]);
+    return result.rows[0] ? mapTenant(result.rows[0]) : undefined;
+  },
+  async update(
+    id: string,
+    patch: { name?: string; status?: string; maxUsers?: number; plan?: string }
+  ): Promise<Tenant | undefined> {
+    const sets: string[] = [];
+    const params: unknown[] = [id];
+    if (patch.name !== undefined) {
+      params.push(patch.name);
+      sets.push(`name = $${params.length}`);
+    }
+    if (patch.status !== undefined) {
+      params.push(patch.status);
+      sets.push(`status = $${params.length}`);
+    }
+    if (patch.maxUsers !== undefined) {
+      params.push(patch.maxUsers);
+      sets.push(`max_users = $${params.length}`);
+    }
+    if (patch.plan !== undefined) {
+      params.push(patch.plan);
+      sets.push(`plan = $${params.length}`);
+    }
+    if (sets.length === 0) return tenantRepository.getById(id);
+    const result = await query<TenantRow>(
+      `UPDATE tenants SET ${sets.join(", ")} WHERE id = $1 RETURNING id, name, slug, status, plan, max_users, created_at`,
+      params
+    );
+    return result.rows[0] ? mapTenant(result.rows[0]) : undefined;
+  },
+  async getUserCount(id: string): Promise<number> {
+    const result = await query<{ count: string }>("SELECT COUNT(*)::text AS count FROM users WHERE tenant_id = $1", [
+      id
+    ]);
+    return Number(result.rows[0]?.count ?? "0");
   }
 };
 
@@ -83,6 +138,7 @@ interface UserRow {
   display_name: string;
   status: string;
   roles: string[];
+  password_hash?: string | null;
 }
 
 function mapUser(row: UserRow): User {
@@ -104,11 +160,14 @@ const USER_SELECT = `
 `;
 
 export const userRepository = {
-  async create(tenantId: string, input: { email: string; displayName: string; roles: Role[] }): Promise<User> {
+  async create(
+    tenantId: string,
+    input: { email: string; displayName: string; roles: Role[]; passwordHash?: string }
+  ): Promise<User> {
     return withTenant(tenantId, async (client) => {
       const inserted = await client.query<{ id: string }>(
-        "INSERT INTO users (tenant_id, email, display_name) VALUES ($1, $2, $3) RETURNING id",
-        [tenantId, input.email, input.displayName]
+        "INSERT INTO users (tenant_id, email, display_name, password_hash) VALUES ($1, $2, $3, $4) RETURNING id",
+        [tenantId, input.email, input.displayName, input.passwordHash ?? null]
       );
       const userId = inserted.rows[0]!.id;
       for (const role of input.roles) {
@@ -117,6 +176,8 @@ export const userRepository = {
           [tenantId, userId, role]
         );
       }
+      // Also store roles in the roles column for fast lookup without JOIN
+      await client.query("UPDATE users SET roles = $1 WHERE id = $2", [input.roles, userId]);
       const result = await client.query<UserRow>(`${USER_SELECT} WHERE u.id = $1 GROUP BY u.id`, [userId]);
       return mapUser(result.rows[0]!);
     });
@@ -133,6 +194,84 @@ export const userRepository = {
       const result = await client.query<UserRow>(`${USER_SELECT} WHERE u.id = $1 GROUP BY u.id`, [id]);
       return result.rows[0] ? mapUser(result.rows[0]) : undefined;
     });
+  },
+  /** Cross-tenant lookup used by auth — calls SECURITY DEFINER fn to bypass RLS. */
+  async findByEmailForAuth(email: string): Promise<(User & { passwordHash: string | null }) | undefined> {
+    const result = await query<UserRow & { password_hash: string | null }>(
+      "SELECT * FROM find_user_by_email_for_auth($1)",
+      [email]
+    );
+    if (!result.rows[0]) return undefined;
+    return { ...mapUser(result.rows[0]), passwordHash: result.rows[0].password_hash };
+  },
+  async updatePassword(tenantId: string, id: string, passwordHash: string): Promise<void> {
+    await withTenant(tenantId, async (client) => {
+      await client.query("UPDATE users SET password_hash = $1 WHERE id = $2", [passwordHash, id]);
+    });
+  },
+  async updateStatus(tenantId: string, id: string, status: string): Promise<void> {
+    await withTenant(tenantId, async (client) => {
+      await client.query("UPDATE users SET status = $1 WHERE id = $2", [status, id]);
+    });
+  }
+};
+
+// ─── Session repository ────────────────────────────────────────────────────────
+
+interface SessionRow {
+  id: string;
+  user_id: string;
+  tenant_id: string;
+  token_hash: string;
+  expires_at: Date;
+  created_at: Date;
+}
+
+export interface Session {
+  id: string;
+  userId: string;
+  tenantId: string;
+  tokenHash: string;
+  expiresAt: string;
+  createdAt: string;
+}
+
+function mapSession(row: SessionRow): Session {
+  return {
+    id: row.id,
+    userId: row.user_id,
+    tenantId: row.tenant_id,
+    tokenHash: row.token_hash,
+    expiresAt: row.expires_at.toISOString(),
+    createdAt: row.created_at.toISOString()
+  };
+}
+
+export const sessionRepository = {
+  async create(input: { userId: string; tenantId: string; tokenHash: string; ttlSeconds: number }): Promise<Session> {
+    const result = await query<SessionRow>(
+      `INSERT INTO sessions (user_id, tenant_id, token_hash, expires_at)
+       VALUES ($1, $2, $3, now() + ($4 || ' seconds')::interval)
+       RETURNING id, user_id, tenant_id, token_hash, expires_at, created_at`,
+      [input.userId, input.tenantId, input.tokenHash, input.ttlSeconds]
+    );
+    return mapSession(result.rows[0]!);
+  },
+  async findByToken(tokenHash: string): Promise<Session | undefined> {
+    const result = await query<SessionRow>(
+      "SELECT id, user_id, tenant_id, token_hash, expires_at, created_at FROM sessions WHERE token_hash = $1 AND expires_at > now()",
+      [tokenHash]
+    );
+    return result.rows[0] ? mapSession(result.rows[0]) : undefined;
+  },
+  async deleteByToken(tokenHash: string): Promise<void> {
+    await query("DELETE FROM sessions WHERE token_hash = $1", [tokenHash]);
+  },
+  async deleteAllForUser(userId: string): Promise<void> {
+    await query("DELETE FROM sessions WHERE user_id = $1", [userId]);
+  },
+  async deleteExpired(): Promise<void> {
+    await query("DELETE FROM sessions WHERE expires_at < now()", []);
   }
 };
 
@@ -340,8 +479,14 @@ function mapChannel(row: ChannelRow): WhatsAppChannel {
 // Channel credential TTL cache: each entry expires after 5 minutes.
 // Channels change infrequently; this eliminates N DB round-trips in campaign fan-out.
 const CHANNEL_CREDS_TTL_MS = 5 * 60 * 1000;
-interface CachedCreds { value: ChannelCredentials; expiresAt: number; }
-interface CachedResolved { value: ResolvedChannel | undefined; expiresAt: number; }
+interface CachedCreds {
+  value: ChannelCredentials;
+  expiresAt: number;
+}
+interface CachedResolved {
+  value: ResolvedChannel | undefined;
+  expiresAt: number;
+}
 const credsByChannelIdCache = new Map<string, CachedCreds>();
 const resolvedByPhoneNumberIdCache = new Map<string, CachedResolved>();
 
@@ -870,10 +1015,9 @@ export const contactRepository = {
   async getByIds(tenantId: string, ids: string[]): Promise<Map<string, Contact>> {
     if (ids.length === 0) return new Map();
     return withTenant(tenantId, async (client) => {
-      const result = await client.query<ContactRow>(
-        `${CONTACT_SELECT} FROM contacts WHERE id = ANY($1::uuid[])`,
-        [ids]
-      );
+      const result = await client.query<ContactRow>(`${CONTACT_SELECT} FROM contacts WHERE id = ANY($1::uuid[])`, [
+        ids
+      ]);
       return new Map(result.rows.map((r) => [r.id, mapContact(r)]));
     });
   },
@@ -1005,7 +1149,9 @@ export const tagRepository = {
   },
   async list(tenantId: string): Promise<Tag[]> {
     return withTenant(tenantId, async (client) => {
-      const result = await client.query<TagRow>("SELECT id, tenant_id, name, color, created_at FROM tags ORDER BY name");
+      const result = await client.query<TagRow>(
+        "SELECT id, tenant_id, name, color, created_at FROM tags ORDER BY name"
+      );
       return result.rows.map(mapTag);
     });
   }
@@ -1309,10 +1455,7 @@ export const conversationRepository = {
          RETURNING id`,
         [tenantId, contactId, channelId]
       );
-      const inserted = await client.query<ConversationRow>(
-        `${CONV_SELECT} WHERE c.id = $1`,
-        [insertedId.rows[0]!.id]
-      );
+      const inserted = await client.query<ConversationRow>(`${CONV_SELECT} WHERE c.id = $1`, [insertedId.rows[0]!.id]);
       return mapConversation(inserted.rows[0]!);
     });
   },
@@ -1686,10 +1829,7 @@ export interface TenantAnalytics {
   };
 }
 
-export async function tenantAnalytics(
-  tenantId: string,
-  opts: { campaignId?: string } = {}
-): Promise<TenantAnalytics> {
+export async function tenantAnalytics(tenantId: string, opts: { campaignId?: string } = {}): Promise<TenantAnalytics> {
   return withTenant(tenantId, async (client) => {
     const [templates, campaigns, contacts, conversations] = await Promise.all([
       client.query<{ count: string }>("SELECT COUNT(*)::text AS count FROM templates"),
@@ -2323,10 +2463,7 @@ export const automationRuleRepository = {
       return { items: result.rows.map(mapAutomationRule), total: Number(totalResult.rows[0]?.total ?? "0") };
     });
   },
-  async listEnabledByTrigger(
-    tenantId: string,
-    triggerType: AutomationRule["triggerType"]
-  ): Promise<AutomationRule[]> {
+  async listEnabledByTrigger(tenantId: string, triggerType: AutomationRule["triggerType"]): Promise<AutomationRule[]> {
     return withTenant(tenantId, async (client) => {
       const result = await client.query<AutomationRuleRow>(
         `${AUTOMATION_SELECT} WHERE enabled = true AND trigger_type = $1 AND tenant_id::text = current_setting('app.tenant_id', true) ORDER BY priority DESC, created_at ASC`,
@@ -2429,7 +2566,8 @@ export const taskRepository = {
         conditions.push(`assignee_user_id = $${params.length}`);
       }
       const tenantFilter = "tenant_id = current_setting('app.tenant_id', true)::uuid";
-      const where = conditions.length > 0 ? `WHERE ${tenantFilter} AND ${conditions.join(" AND ")}` : `WHERE ${tenantFilter}`;
+      const where =
+        conditions.length > 0 ? `WHERE ${tenantFilter} AND ${conditions.join(" AND ")}` : `WHERE ${tenantFilter}`;
       const totalResult = await client.query<{ total: string }>(
         `SELECT COUNT(*)::text AS total FROM tasks ${where}`,
         params
@@ -2496,7 +2634,10 @@ export const linkClickRepository = {
   async list(
     tenantId: string,
     opts: { campaignId?: string; offset?: number; limit?: number } = {}
-  ): Promise<{ items: Array<{ id: string; linkToken: string; campaignId?: string; contactId?: string; clickedAt?: string }>; total: number }> {
+  ): Promise<{
+    items: Array<{ id: string; linkToken: string; campaignId?: string; contactId?: string; clickedAt?: string }>;
+    total: number;
+  }> {
     return withTenant(tenantId, async (client) => {
       const conditions: string[] = ["tenant_id = current_setting('app.tenant_id', true)::uuid"];
       const params: unknown[] = [];
@@ -2514,17 +2655,20 @@ export const linkClickRepository = {
       // Use params without LIMIT/OFFSET for the count query
       const countParams = params.slice(0, params.length - 2);
       const [rows, countRow] = await Promise.all([
-        client.query<{ id: string; token: string; campaign_id: string | null; contact_id: string | null; last_clicked_at: Date | null }>(
+        client.query<{
+          id: string;
+          token: string;
+          campaign_id: string | null;
+          contact_id: string | null;
+          last_clicked_at: Date | null;
+        }>(
           `SELECT id, token, campaign_id, contact_id, last_clicked_at
            FROM link_clicks WHERE ${where}
            ORDER BY last_clicked_at DESC NULLS LAST
            LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
           params
         ),
-        client.query<{ total: string }>(
-          `SELECT COUNT(*)::text AS total FROM link_clicks WHERE ${where}`,
-          countParams
-        )
+        client.query<{ total: string }>(`SELECT COUNT(*)::text AS total FROM link_clicks WHERE ${where}`, countParams)
       ]);
       return {
         items: rows.rows.map((r) => ({

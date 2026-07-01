@@ -815,6 +815,10 @@
     <script>
       // ═══════════════════ STATE ═══════════════════
       const S = {
+        // Auth
+        token: localStorage.getItem("hf_tok") || "",
+        currentUser: null,
+        // Legacy dev-mode fields (used as fallback)
         tenantId: localStorage.getItem("hf_tid") || "",
         tenantName: localStorage.getItem("hf_tname") || "",
         channelId: localStorage.getItem("hf_chid") || "",
@@ -884,13 +888,36 @@
 
       // ═══════════════════ API ═══════════════════
       async function api(method, path, body, tid, roleOverride) {
-        const tenantId = tid !== undefined ? tid : S.tenantId;
-        const effectiveRole = roleOverride || S.role;
-        const headers = { "content-type": "application/json", "x-role": effectiveRole, "x-actor-id": "portal-user" };
-        if (tenantId) headers["x-tenant-id"] = tenantId;
+        const headers = { "content-type": "application/json" };
+        if (S.token) {
+          headers["authorization"] = "Bearer " + S.token;
+        } else {
+          // Dev-mode fallback
+          const tenantId = tid !== undefined ? tid : S.tenantId;
+          const effectiveRole = roleOverride || S.role;
+          headers["x-role"] = effectiveRole;
+          headers["x-actor-id"] = "portal-user";
+          if (tenantId) headers["x-tenant-id"] = tenantId;
+        }
         const opts = { method, headers };
         if (body != null) opts.body = JSON.stringify(body);
         const res = await fetch("/api/v1" + path, opts);
+        if (res.status === 401 && S.token) {
+          // Session expired
+          doLogout(false);
+          renderLogin("Your session has expired. Please log in again.");
+          throw new Error("Session expired");
+        }
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok)
+          throw Object.assign(new Error(data.error || data.detail || "HTTP " + res.status), { status: res.status });
+        return data;
+      }
+
+      async function authFetch(method, path, body) {
+        const headers = { "content-type": "application/json" };
+        if (S.token) headers["authorization"] = "Bearer " + S.token;
+        const res = await fetch(path, { method, headers, body: body ? JSON.stringify(body) : undefined });
         const data = await res.json().catch(() => ({}));
         if (!res.ok)
           throw Object.assign(new Error(data.error || data.detail || "HTTP " + res.status), { status: res.status });
@@ -898,9 +925,15 @@
       }
 
       async function apiUpload(path, formData, tid) {
-        const tenantId = tid !== undefined ? tid : S.tenantId;
-        const headers = { "x-role": S.role, "x-actor-id": "portal-user" };
-        if (tenantId) headers["x-tenant-id"] = tenantId;
+        const headers = {};
+        if (S.token) {
+          headers["authorization"] = "Bearer " + S.token;
+        } else {
+          const tenantId = tid !== undefined ? tid : S.tenantId;
+          headers["x-role"] = S.role;
+          headers["x-actor-id"] = "portal-user";
+          if (tenantId) headers["x-tenant-id"] = tenantId;
+        }
         const res = await fetch("/api/v1" + path, { method: "POST", headers, body: formData });
         const data = await res.json().catch(() => ({}));
         if (!res.ok)
@@ -924,10 +957,10 @@
         const dot = () => document.getElementById("sse-dot");
         const lbl = () => document.getElementById("sse-lbl");
         try {
-          const res = await fetch("/api/v1/events/stream", {
-            headers: { "x-tenant-id": S.tenantId, "x-role": S.role, "x-actor-id": "portal-user" },
-            signal: _sseCtrl.signal
-          });
+          const sseHeaders = S.token
+            ? { "authorization": "Bearer " + S.token }
+            : { "x-tenant-id": S.tenantId, "x-role": S.role, "x-actor-id": "portal-user" };
+          const res = await fetch("/api/v1/events/stream", { headers: sseHeaders, signal: _sseCtrl.signal });
           if (dot()) {
             dot().className = "sse-dot on";
             lbl().textContent = "Live";
@@ -1121,6 +1154,8 @@
           "analyst",
           "compliance_auditor"
         ];
+        const isPlatformOwner = (S.currentUser?.roles || [S.role]).includes("platform_owner");
+        const isAdmin = (S.currentUser?.roles || [S.role]).some(r => ["platform_owner","tenant_admin"].includes(r));
         const nav = [
           { id: "inbox", icon: "💬", label: "Inbox" },
           { id: "contacts", icon: "👥", label: "Contacts" },
@@ -1133,7 +1168,8 @@
           { id: "reports", icon: "📈", label: "Reports" },
           { id: "usage", icon: "💰", label: "Usage" },
           { id: "ai", icon: "🤖", label: "AI Tools" },
-          { id: "tenants", icon: "🏢", label: "Tenants" },
+          ...(isAdmin ? [{ id: "users", icon: "👤", label: "Users" }] : []),
+          ...(isPlatformOwner ? [{ id: "tenants", icon: "🏢", label: "Tenants" }] : []),
           { id: "settings", icon: "⚙️", label: "Settings" }
         ];
         document.getElementById("root").innerHTML =
@@ -1147,20 +1183,11 @@
           (S.channelPhone ? '<span class="phone-pill">' + esc(S.channelPhone) + "</span>" : "") +
           '<div class="spacer"></div>' +
           '<div class="sse-pill"><div class="sse-dot" id="sse-dot"></div><span id="sse-lbl">Connecting…</span></div>' +
-          '<select title="Active role" onchange="S.role=this.value;localStorage.setItem(\'hf_role\',this.value)">' +
-          roles
-            .map(
-              (r) =>
-                '<option value="' +
-                r +
-                '"' +
-                (r === S.role ? " selected" : "") +
-                ">" +
-                r.replace(/_/g, " ") +
-                "</option>"
-            )
-            .join("") +
-          "</select>" +
+          (S.currentUser
+            ? '<span style="font-size:12px;color:var(--muted);padding:0 8px">' + esc(S.currentUser.displayName) + ' · <span style="color:var(--accent)">' + esc((S.currentUser.roles||[])[0]||'').replace(/_/g,' ') + '</span></span>'
+            : '<select title="Active role" onchange="S.role=this.value;localStorage.setItem(\'hf_role\',this.value)">' +
+              roles.map(r => '<option value="' + r + '"' + (r === S.role ? " selected" : "") + ">" + r.replace(/_/g, " ") + "</option>").join("") +
+              '</select>') +
           "</div>" +
           '<div id="sidebar">' +
           nav
@@ -1216,20 +1243,23 @@
           reports: renderReports,
           usage: renderUsage,
           ai: renderAI,
+          users: renderUsers,
           tenants: renderTenants,
           settings: renderSettings
         })[v]?.();
       }
 
+      function doLogout(confirm_) {
+        if (confirm_ && !confirm("Log out?")) return;
+        if (S.token) authFetch("POST", "/auth/logout").catch(() => {});
+        ["hf_tid", "hf_tname", "hf_chid", "hf_chphone", "hf_role", "hf_tok"].forEach((k) => localStorage.removeItem(k));
+        Object.assign(S, { tenantId: "", tenantName: "", channelId: "", channelPhone: "", setupStep: 1, token: "", currentUser: null });
+        if (_sseCtrl) { _sseCtrl.abort(); _sseCtrl = null; }
+      }
+
       function logout() {
-        if (!confirm("Clear workspace and logout?")) return;
-        ["hf_tid", "hf_tname", "hf_chid", "hf_chphone", "hf_role"].forEach((k) => localStorage.removeItem(k));
-        Object.assign(S, { tenantId: "", tenantName: "", channelId: "", channelPhone: "", setupStep: 1 });
-        if (_sseCtrl) {
-          _sseCtrl.abort();
-          _sseCtrl = null;
-        }
-        renderSetup();
+        doLogout(true);
+        renderLogin();
       }
 
       // ═══════════════════ INBOX ═══════════════════
@@ -3364,15 +3394,16 @@
         const el = document.getElementById("v-tenants");
         el.style.flexDirection = "column";
         el.style.overflow = "auto";
-        if (S.role !== "platform_owner") {
+        const isPO = (S.currentUser?.roles || [S.role]).includes("platform_owner");
+        if (!isPO) {
           el.innerHTML =
             '<div class="pv"><div class="pv-head"><div><h2>Tenants</h2></div></div>' +
             empty("🔒", "Platform owner access required") + '</div>';
           return;
         }
         el.innerHTML =
-          '<div class="pv"><div class="pv-head"><div><h2>Tenants</h2><div class="sub">All registered workspaces</div></div>' +
-          '<button class="btn btn-primary btn-sm" onclick="showCreateTenant()">+ New Tenant</button></div>' +
+          '<div class="pv"><div class="pv-head"><div><h2>Organizations</h2><div class="sub">All registered workspaces on HyFib</div></div>' +
+          '<button class="btn btn-primary btn-sm" onclick="showCreateTenant()">+ New Org</button></div>' +
           '<div id="ten-body">' + loading() + '</div></div>';
         await loadTenants();
       }
@@ -3384,17 +3415,20 @@
           const d = await GET("/tenants");
           const items = d.items || d.tenants || [];
           if (!items.length) {
-            bodyEl.innerHTML = empty("🏢", "No tenants yet — create one to get started");
+            bodyEl.innerHTML = empty("🏢", "No organizations yet — create one to get started");
             return;
           }
+          const planBadge = { trial: "gray", starter: "blue", growth: "green", enterprise: "yellow" };
           bodyEl.innerHTML =
-            '<div class="card"><div class="card-head"><h3>All Tenants (' + items.length + ')</h3></div>' +
-            '<table class="tbl"><thead><tr><th>Name</th><th>Status</th><th>ID</th><th>Created</th></tr></thead><tbody>' +
+            '<div class="card"><div class="card-head"><h3>All Organizations (' + items.length + ')</h3></div>' +
+            '<table class="tbl"><thead><tr><th>Organization</th><th>Plan</th><th>User Limit</th><th>Status</th><th>Created</th><th></th></tr></thead><tbody>' +
             items.map(t =>
-              '<tr><td><b>' + esc(t.name) + '</b></td>' +
+              '<tr><td><b>' + esc(t.name) + '</b><br><code style="font-size:10px;color:var(--muted)">' + esc(t.slug||t.id.slice(0,8)) + '</code></td>' +
+              '<td>' + bdg(t.plan||'trial', planBadge[t.plan||'trial']||'gray') + '</td>' +
+              '<td><span style="font-size:13px">' + (t.maxUsers||10) + ' users</span></td>' +
               '<td>' + bdg(t.status || 'active', t.status === 'suspended' ? 'red' : 'green') + '</td>' +
-              '<td><code style="font-size:11px">' + esc((t.id || '').slice(0, 8)) + '…</code></td>' +
-              '<td style="color:var(--muted)">' + fmtTime(t.created_at || t.createdAt) + '</td></tr>'
+              '<td style="color:var(--muted);font-size:12px">' + fmtTime(t.created_at || t.createdAt) + '</td>' +
+              '<td><button class="btn btn-secondary btn-sm" onclick="showEditTenant(' + JSON.stringify(t) + ')">Settings</button></td></tr>'
             ).join("") +
             '</tbody></table></div>';
         } catch (e) {
@@ -3402,18 +3436,60 @@
         }
       }
 
+      function showEditTenant(t) {
+        const html = '<div class="modal-overlay" onclick="if(event.target===this)this.remove()"><div class="modal">' +
+          '<div class="modal-header"><h3>Org Settings — ' + esc(t.name) + '</h3><button onclick="this.closest(\'.modal-overlay\').remove()">✕</button></div>' +
+          '<div id="et-alert"></div>' +
+          '<div class="field"><label>Name</label><input id="et-name" value="' + esc(t.name) + '" /></div>' +
+          '<div class="field"><label>Plan</label><select id="et-plan">' +
+          ['trial','starter','growth','enterprise'].map(p => '<option value="' + p + '"' + (t.plan===p?' selected':'') + '>' + p.charAt(0).toUpperCase()+p.slice(1) + '</option>').join('') +
+          '</select></div>' +
+          '<div class="field"><label>Max Users</label><input id="et-maxu" type="number" min="1" max="9999" value="' + (t.maxUsers||10) + '" /></div>' +
+          '<div class="field"><label>Status</label><select id="et-status"><option value="active"' + (t.status==='active'?' selected':'') + '>Active</option><option value="suspended"' + (t.status==='suspended'?' selected':'') + '>Suspended</option></select></div>' +
+          '<div class="modal-actions"><button class="btn btn-secondary" onclick="this.closest(\'.modal-overlay\').remove()">Cancel</button>' +
+          '<button class="btn btn-primary" onclick="doEditTenant(\'' + t.id + '\')">Save</button></div>' +
+          '</div></div>';
+        document.body.insertAdjacentHTML("beforeend", html);
+      }
+
+      async function doEditTenant(id) {
+        const al = document.getElementById("et-alert");
+        try {
+          await api("PATCH", "/tenants/" + id, {
+            name: document.getElementById("et-name").value.trim(),
+            plan: document.getElementById("et-plan").value,
+            maxUsers: parseInt(document.getElementById("et-maxu").value, 10),
+            status: document.getElementById("et-status").value
+          }, "", "platform_owner");
+          document.querySelector(".modal-overlay")?.remove();
+          toast("Organization updated");
+          await loadTenants();
+        } catch (e) {
+          al.innerHTML = '<div class="alert alert-err">' + esc(e.message) + '</div>';
+        }
+      }
+
       function showCreateTenant() {
         showModal(
-          "Create Tenant",
+          "Create Organization",
           null,
-          '<div class="field"><label>Company / Workspace Name</label><input id="new-tenant-name" placeholder="Acme Corp" autocomplete="off" /></div>',
+          '<div class="field"><label>Company / Workspace Name</label><input id="new-tenant-name" placeholder="Acme Corp" autocomplete="off" /></div>' +
+          '<div class="field"><label>Admin Email</label><input id="new-tenant-email" type="email" placeholder="admin@acme.com" /></div>' +
+          '<div class="field"><label>Temporary Password</label><input id="new-tenant-pw" type="password" placeholder="Min 8 characters" /></div>',
           {
             submit: "Create",
             onOk: async () => {
               const name = document.getElementById("new-tenant-name")?.value?.trim();
+              const email = document.getElementById("new-tenant-email")?.value?.trim();
+              const pw = document.getElementById("new-tenant-pw")?.value;
               if (!name) { toast("Name is required", "err"); return false; }
-              await api("POST", "/tenants", { name }, "", "platform_owner");
-              toast("Tenant created", "ok");
+              if (email && pw) {
+                // Create org + admin user via register endpoint
+                await authFetch("POST", "/auth/register", { orgName: name, email, password: pw, displayName: "Admin" });
+              } else {
+                await api("POST", "/tenants", { name }, "", "platform_owner");
+              }
+              toast("Organization created");
               await loadTenants();
             }
           }
@@ -3421,12 +3497,197 @@
         setTimeout(() => document.getElementById("new-tenant-name")?.focus(), 50);
       }
 
-      // ═══════════════════ BOOT ═══════════════════
-      if (S.tenantId) {
-        initApp();
-      } else {
-        renderSetup();
+      // ═══════════════════ LOGIN / REGISTER ═══════════════════
+      function renderLogin(msg) {
+        document.getElementById("root").innerHTML =
+          '<div id="setup"><div class="setup-card">' +
+          '<div class="logo"><span style="font-size:28px">📱</span><h1>HyFib</h1><p class="subtitle">WhatsApp Business Platform</p></div>' +
+          (msg ? '<div class="alert alert-err" style="margin-bottom:12px">' + esc(msg) + '</div>' : '') +
+          '<div id="auth-alert"></div>' +
+          '<div class="field"><label>Email</label><input id="login-email" type="email" placeholder="you@company.com" autocomplete="email" /></div>' +
+          '<div class="field"><label>Password</label><input id="login-pw" type="password" placeholder="••••••••" autocomplete="current-password" onkeydown="if(event.key===\'Enter\')doLogin()" /></div>' +
+          '<button class="btn btn-primary" style="width:100%;margin-top:8px" onclick="doLogin()">Sign In</button>' +
+          '<p style="text-align:center;margin-top:14px;font-size:13px;color:var(--muted)">New to HyFib? <a href="#" onclick="renderRegister();return false">Create an account</a></p>' +
+          '</div></div>';
+        setTimeout(() => document.getElementById("login-email")?.focus(), 50);
       }
+
+      async function doLogin() {
+        const email = document.getElementById("login-email").value.trim();
+        const pw = document.getElementById("login-pw").value;
+        const al = document.getElementById("auth-alert");
+        if (!email || !pw) { al.innerHTML = '<div class="alert alert-err">Email and password are required.</div>'; return; }
+        al.innerHTML = '<div class="alert alert-info">Signing in…</div>';
+        try {
+          const data = await authFetch("POST", "/auth/login", { email, password: pw });
+          S.token = data.token;
+          S.currentUser = data.user;
+          S.tenantId = data.user.tenantId;
+          S.tenantName = data.tenant?.name || data.user.tenantId;
+          S.role = (data.user.roles || [])[0] || "support_agent";
+          localStorage.setItem("hf_tok", data.token);
+          localStorage.setItem("hf_tid", S.tenantId);
+          localStorage.setItem("hf_tname", S.tenantName);
+          localStorage.setItem("hf_role", S.role);
+          // Load channel info
+          try {
+            const ch = await GET("/channels/whatsapp");
+            const first = (ch.items || [])[0];
+            if (first) { S.channelId = first.id; S.channelPhone = first.displayPhoneNumber || ""; }
+          } catch {}
+          initApp();
+        } catch (e) {
+          al.innerHTML = '<div class="alert alert-err">' + esc(e.message) + '</div>';
+        }
+      }
+
+      function renderRegister() {
+        document.getElementById("root").innerHTML =
+          '<div id="setup"><div class="setup-card">' +
+          '<div class="logo"><span style="font-size:28px">📱</span><h1>Create Account</h1><p class="subtitle">Set up your organization on HyFib</p></div>' +
+          '<div id="auth-alert"></div>' +
+          '<div class="field"><label>Organization Name</label><input id="reg-org" placeholder="Acme Corp" /></div>' +
+          '<div class="field"><label>Your Name</label><input id="reg-name" placeholder="Jane Smith" /></div>' +
+          '<div class="field"><label>Email</label><input id="reg-email" type="email" placeholder="you@company.com" autocomplete="email" /></div>' +
+          '<div class="field"><label>Password <span style="color:var(--muted);font-size:11px">(min 8 chars)</span></label><input id="reg-pw" type="password" placeholder="••••••••" autocomplete="new-password" /></div>' +
+          '<div class="field"><label>Confirm Password</label><input id="reg-pw2" type="password" placeholder="••••••••" onkeydown="if(event.key===\'Enter\')doRegister()" /></div>' +
+          '<button class="btn btn-primary" style="width:100%;margin-top:8px" onclick="doRegister()">Create Account</button>' +
+          '<p style="text-align:center;margin-top:14px;font-size:13px;color:var(--muted)">Already have an account? <a href="#" onclick="renderLogin();return false">Sign in</a></p>' +
+          '</div></div>';
+        setTimeout(() => document.getElementById("reg-org")?.focus(), 50);
+      }
+
+      async function doRegister() {
+        const org = document.getElementById("reg-org").value.trim();
+        const name = document.getElementById("reg-name").value.trim();
+        const email = document.getElementById("reg-email").value.trim();
+        const pw = document.getElementById("reg-pw").value;
+        const pw2 = document.getElementById("reg-pw2").value;
+        const al = document.getElementById("auth-alert");
+        if (!org) { al.innerHTML = '<div class="alert alert-err">Organization name is required.</div>'; return; }
+        if (!email) { al.innerHTML = '<div class="alert alert-err">Email is required.</div>'; return; }
+        if (pw.length < 8) { al.innerHTML = '<div class="alert alert-err">Password must be at least 8 characters.</div>'; return; }
+        if (pw !== pw2) { al.innerHTML = '<div class="alert alert-err">Passwords do not match.</div>'; return; }
+        al.innerHTML = '<div class="alert alert-info">Creating your account…</div>';
+        try {
+          const data = await authFetch("POST", "/auth/register", { orgName: org, email, password: pw, displayName: name || email.split("@")[0] });
+          S.token = data.token;
+          S.currentUser = data.user;
+          S.tenantId = data.user.tenantId;
+          S.tenantName = data.tenant?.name || org;
+          S.role = "tenant_admin";
+          localStorage.setItem("hf_tok", data.token);
+          localStorage.setItem("hf_tid", S.tenantId);
+          localStorage.setItem("hf_tname", S.tenantName);
+          localStorage.setItem("hf_role", S.role);
+          // Go to WhatsApp setup wizard
+          S.setupStep = 2;
+          renderSetup();
+        } catch (e) {
+          al.innerHTML = '<div class="alert alert-err">' + esc(e.message) + '</div>';
+        }
+      }
+
+      // ═══════════════════ USER MANAGEMENT ═══════════════════
+      function renderUsers() {
+        const el = document.getElementById("v-users");
+        if (!el) return;
+        el.innerHTML = '<div class="page-header"><h2>Team Members</h2><button class="btn btn-primary btn-sm" onclick="showInviteUser()">+ Invite User</button></div>' + loading();
+        GET("/users").then(d => {
+          const users = d.items || [];
+          el.innerHTML = '<div class="page-header"><h2>Team Members</h2><button class="btn btn-primary btn-sm" onclick="showInviteUser()">+ Invite User</button></div>' +
+            '<table class="data-table"><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Status</th><th></th></tr></thead><tbody>' +
+            users.map(u =>
+              '<tr><td>' + esc(u.displayName) + '</td><td>' + esc(u.email || '—') + '</td>' +
+              '<td>' + (u.roles || []).map(r => '<span class="bdg bdg-blue">' + r.replace(/_/g,' ') + '</span>').join(' ') + '</td>' +
+              '<td><span class="bdg bdg-' + (u.status === 'active' ? 'green' : 'gray') + '">' + esc(u.status) + '</span></td>' +
+              '<td>' + (u.id !== (S.currentUser?.id) ? '<button class="btn btn-secondary btn-sm" onclick="toggleUserStatus(\'' + u.id + '\',\'' + u.status + '\')">' + (u.status === 'active' ? 'Suspend' : 'Reactivate') + '</button>' : '') + '</td>' +
+              '</tr>'
+            ).join('') +
+            '</tbody></table>';
+        }).catch(e => { el.innerHTML = '<div class="alert alert-err">' + esc(e.message) + '</div>'; });
+      }
+
+      function showInviteUser() {
+        const roles = ["tenant_admin","marketing_manager","sales_agent","support_agent","analyst","compliance_auditor"];
+        const html = '<div class="modal-overlay" onclick="if(event.target===this)this.remove()"><div class="modal">' +
+          '<div class="modal-header"><h3>Invite Team Member</h3><button onclick="this.closest(\'.modal-overlay\').remove()">✕</button></div>' +
+          '<div id="inv-alert"></div>' +
+          '<div class="field"><label>Name</label><input id="inv-name" placeholder="Jane Smith" /></div>' +
+          '<div class="field"><label>Email</label><input id="inv-email" type="email" placeholder="jane@company.com" /></div>' +
+          '<div class="field"><label>Role</label><select id="inv-role">' + roles.map(r => '<option value="' + r + '">' + r.replace(/_/g,' ') + '</option>').join('') + '</select></div>' +
+          '<div class="modal-actions"><button class="btn btn-secondary" onclick="this.closest(\'.modal-overlay\').remove()">Cancel</button>' +
+          '<button class="btn btn-primary" onclick="doInviteUser()">Send Invite</button></div>' +
+          '</div></div>';
+        document.body.insertAdjacentHTML("beforeend", html);
+        setTimeout(() => document.getElementById("inv-name")?.focus(), 50);
+      }
+
+      async function doInviteUser() {
+        const name = document.getElementById("inv-name").value.trim();
+        const email = document.getElementById("inv-email").value.trim();
+        const role = document.getElementById("inv-role").value;
+        const al = document.getElementById("inv-alert");
+        if (!name || !email) { al.innerHTML = '<div class="alert alert-err">Name and email are required.</div>'; return; }
+        al.innerHTML = '<div class="alert alert-info">Creating user…</div>';
+        try {
+          const u = await POST("/users", { email, displayName: name, roles: [role] });
+          document.querySelector(".modal-overlay")?.remove();
+          toast("User created. Temporary password: " + (u.tempPassword || "(check with admin)"), 8000);
+          renderUsers();
+        } catch (e) {
+          al.innerHTML = '<div class="alert alert-err">' + esc(e.message) + '</div>';
+        }
+      }
+
+      async function toggleUserStatus(userId, currentStatus) {
+        const newStatus = currentStatus === "active" ? "suspended" : "active";
+        try {
+          await api("PATCH", "/users/" + userId, { status: newStatus });
+          renderUsers();
+        } catch (e) { toast(e.message, 4000); }
+      }
+
+      // ═══════════════════ SUPER ADMIN TENANTS VIEW ═══════════════════
+      // (existing renderTenants is enhanced below by patching after load)
+
+      // ═══════════════════ BOOT ═══════════════════
+      async function boot() {
+        if (S.token) {
+          // Verify token is still valid
+          try {
+            const me = await authFetch("GET", "/auth/me");
+            S.currentUser = me;
+            S.tenantId = me.tenantId;
+            S.tenantName = me.tenant?.name || me.tenantId;
+            S.role = (me.roles || [])[0] || "support_agent";
+            localStorage.setItem("hf_tid", S.tenantId);
+            localStorage.setItem("hf_tname", S.tenantName);
+            localStorage.setItem("hf_role", S.role);
+            if (S.tenantId) {
+              try {
+                const ch = await GET("/channels/whatsapp");
+                const first = (ch.items || [])[0];
+                if (first) { S.channelId = first.id; S.channelPhone = first.displayPhoneNumber || ""; }
+              } catch {}
+              initApp();
+            } else {
+              S.setupStep = 2;
+              renderSetup();
+            }
+          } catch {
+            // Token invalid — show login
+            doLogout(false);
+            renderLogin();
+          }
+        } else if (S.tenantId) {
+          // Dev-mode: no token but tenant set in localStorage
+          initApp();
+        } else {
+          renderLogin();
+        }
+      }
+      boot();
     </script>
   </body>
 </html>

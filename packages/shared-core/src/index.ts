@@ -20,7 +20,10 @@ export type MessageCategory = "marketing" | "utility" | "authentication" | "serv
 export interface Tenant {
   id: string;
   name: string;
+  slug?: string;
   status: "active" | "suspended";
+  plan: "trial" | "starter" | "growth" | "enterprise";
+  maxUsers: number;
   createdAt: string;
 }
 
@@ -30,7 +33,7 @@ export interface User {
   email: string;
   displayName: string;
   roles: Role[];
-  status: "active" | "disabled";
+  status: "active" | "invited" | "suspended" | "disabled";
 }
 
 export interface Team {
