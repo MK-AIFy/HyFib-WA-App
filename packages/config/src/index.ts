@@ -38,27 +38,16 @@ export interface PlatformConfig {
   webhookIngestorPort: number;
   notificationWorkerPort: number;
   aiIntelligencePort: number;
-  auditServicePort: number;
-  authServicePort: number;
   billingUsageServicePort: number;
-  campaignServicePort: number;
-  commerceServicePort: number;
-  contactServicePort: number;
-  conversationServicePort: number;
   reportingServicePort: number;
-  templateServicePort: number;
-  tenantServicePort: number;
   webhookVerifyToken: string;
   metaAppSecret: string;
   webhookIngestorUrl: string;
   metaAdapterUrl: string;
   notificationWorkerUrl: string;
   aiIntelligenceUrl: string;
-  auditServiceUrl: string;
-  authServiceUrl: string;
   billingUsageServiceUrl: string;
   reportingServiceUrl: string;
-  tenantServiceUrl: string;
   whatsappGraphVersion: string;
   whatsappWabaId: string;
   whatsappPhoneNumberId: string;
@@ -162,26 +151,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PlatformConfig
     webhookIngestorPort: parseNumber("WEBHOOK_INGESTOR_PORT", env.WEBHOOK_INGESTOR_PORT, 8093),
     notificationWorkerPort: parseNumber("NOTIFICATION_WORKER_PORT", env.NOTIFICATION_WORKER_PORT, 8094),
     aiIntelligencePort: parseNumber("AI_INTELLIGENCE_PORT", env.AI_INTELLIGENCE_PORT, 8095),
-    auditServicePort: parseNumber("AUDIT_SERVICE_PORT", env.AUDIT_SERVICE_PORT, 8096),
-    authServicePort: parseNumber("AUTH_SERVICE_PORT", env.AUTH_SERVICE_PORT, 8097),
     billingUsageServicePort: parseNumber("BILLING_USAGE_SERVICE_PORT", env.BILLING_USAGE_SERVICE_PORT, 8098),
-    campaignServicePort: parseNumber("CAMPAIGN_SERVICE_PORT", env.CAMPAIGN_SERVICE_PORT, 8099),
-    commerceServicePort: parseNumber("COMMERCE_SERVICE_PORT", env.COMMERCE_SERVICE_PORT, 8100),
-    contactServicePort: parseNumber("CONTACT_SERVICE_PORT", env.CONTACT_SERVICE_PORT, 8101),
-    conversationServicePort: parseNumber("CONVERSATION_SERVICE_PORT", env.CONVERSATION_SERVICE_PORT, 8102),
     reportingServicePort: parseNumber("REPORTING_SERVICE_PORT", env.REPORTING_SERVICE_PORT, 8103),
-    templateServicePort: parseNumber("TEMPLATE_SERVICE_PORT", env.TEMPLATE_SERVICE_PORT, 8104),
-    tenantServicePort: parseNumber("TENANT_SERVICE_PORT", env.TENANT_SERVICE_PORT, 8105),
     webhookVerifyToken: requireSecret("WEBHOOK_VERIFY_TOKEN", env.WEBHOOK_VERIFY_TOKEN, isProduction),
     metaAppSecret: requireSecret("META_APP_SECRET", env.META_APP_SECRET, isProduction),
     webhookIngestorUrl: env.WEBHOOK_INGESTOR_URL ?? "http://webhook-ingestor:8093",
     metaAdapterUrl: env.META_ADAPTER_URL ?? "http://meta-adapter:8092",
     notificationWorkerUrl: env.NOTIFICATION_WORKER_URL ?? "http://notification-worker:8094",
-    auditServiceUrl: env.AUDIT_SERVICE_URL ?? "http://audit-service:8096",
-    authServiceUrl: env.AUTH_SERVICE_URL ?? "http://auth-service:8097",
     billingUsageServiceUrl: env.BILLING_USAGE_SERVICE_URL ?? "http://billing-usage-service:8098",
     reportingServiceUrl: env.REPORTING_SERVICE_URL ?? "http://reporting-service:8103",
-    tenantServiceUrl: env.TENANT_SERVICE_URL ?? "http://tenant-service:8105",
     aiIntelligenceUrl: env.AI_INTELLIGENCE_URL ?? "http://ai-intelligence-service:8095",
     whatsappGraphVersion: env.WHATSAPP_GRAPH_VERSION ?? "v22.0",
     whatsappWabaId: env.WHATSAPP_WABA_ID ?? "",

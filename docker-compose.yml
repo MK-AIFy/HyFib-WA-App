@@ -309,11 +309,8 @@ services:
       - webhook-ingestor
       - notification-worker
       - meta-adapter
-      - audit-service
       - billing-usage-service
       - reporting-service
-      - tenant-service
-      - auth-service
       - ai-intelligence-service
     ports:
       - "18080:8080"
@@ -380,32 +377,6 @@ services:
       - data-net
     restart: unless-stopped
 
-  audit-service:
-    build:
-      context: .
-      dockerfile: services/audit-service/Dockerfile
-    container_name: audit-service
-    env_file:
-      - .env
-    depends_on:
-      - postgres-primary
-      - rabbitmq
-    networks:
-      - app-net
-      - data-net
-    restart: unless-stopped
-
-  auth-service:
-    build:
-      context: .
-      dockerfile: services/auth-service/Dockerfile
-    container_name: auth-service
-    env_file:
-      - .env
-    networks:
-      - app-net
-    restart: unless-stopped
-
   billing-usage-service:
     build:
       context: .
@@ -425,20 +396,6 @@ services:
       context: .
       dockerfile: services/reporting-service/Dockerfile
     container_name: reporting-service
-    env_file:
-      - .env
-    depends_on:
-      - postgres-primary
-    networks:
-      - app-net
-      - data-net
-    restart: unless-stopped
-
-  tenant-service:
-    build:
-      context: .
-      dockerfile: services/tenant-service/Dockerfile
-    container_name: tenant-service
     env_file:
       - .env
     depends_on:

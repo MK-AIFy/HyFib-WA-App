@@ -162,30 +162,6 @@ importers:
         specifier: workspace:*
         version: link:../../packages/shared-core
 
-  services/audit-service:
-    dependencies:
-      '@hyfib/config':
-        specifier: workspace:*
-        version: link:../../packages/config
-      '@hyfib/db':
-        specifier: workspace:*
-        version: link:../../packages/db
-      '@hyfib/queue':
-        specifier: workspace:*
-        version: link:../../packages/queue
-      '@hyfib/shared-core':
-        specifier: workspace:*
-        version: link:../../packages/shared-core
-
-  services/auth-service:
-    dependencies:
-      '@hyfib/config':
-        specifier: workspace:*
-        version: link:../../packages/config
-      '@hyfib/shared-core':
-        specifier: workspace:*
-        version: link:../../packages/shared-core
-
   services/billing-usage-service:
     dependencies:
       '@hyfib/config':
@@ -229,18 +205,6 @@ importers:
         version: link:../../packages/shared-core
 
   services/reporting-service:
-    dependencies:
-      '@hyfib/config':
-        specifier: workspace:*
-        version: link:../../packages/config
-      '@hyfib/db':
-        specifier: workspace:*
-        version: link:../../packages/db
-      '@hyfib/shared-core':
-        specifier: workspace:*
-        version: link:../../packages/shared-core
-
-  services/tenant-service:
     dependencies:
       '@hyfib/config':
         specifier: workspace:*
