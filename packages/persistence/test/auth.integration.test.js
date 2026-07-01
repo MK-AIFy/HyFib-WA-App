@@ -64,6 +64,34 @@ test("sessions round-trip through create/findByToken/deleteByToken and reject ex
   assert.equal(await sessionRepository.findByToken(expired.tokenHash), undefined, "expired sessions must not resolve");
 });
 
+test("getUserCount sees the tenant's users through RLS", { skip }, async () => {
+  const tenant = await tenantRepository.create("Count Test Tenant");
+  assert.equal(await tenantRepository.getUserCount(tenant.id), 0);
+  await userRepository.create(tenant.id, {
+    email: `count-a-${Date.now()}@example.com`,
+    displayName: "Count A",
+    roles: ["tenant_admin"]
+  });
+  await userRepository.create(tenant.id, {
+    email: `count-b-${Date.now()}@example.com`,
+    displayName: "Count B",
+    roles: ["support_agent"]
+  });
+  assert.equal(await tenantRepository.getUserCount(tenant.id), 2);
+});
+
+test("getById resolves a session user's roles within their tenant", { skip }, async () => {
+  const tenant = await tenantRepository.create("Roles Test Tenant");
+  const user = await userRepository.create(tenant.id, {
+    email: `roles-test-${Date.now()}@example.com`,
+    displayName: "Roles Test User",
+    roles: ["tenant_admin", "marketing_manager"]
+  });
+  const resolved = await userRepository.getById(tenant.id, user.id);
+  assert.ok(resolved, "expected tenant-scoped getById to find the user");
+  assert.deepEqual([...resolved.roles].sort(), ["marketing_manager", "tenant_admin"]);
+});
+
 test("deleteAllForUser revokes every session for that user", { skip }, async () => {
   const tenant = await tenantRepository.create("Revoke Test Tenant");
   const user = await userRepository.create(tenant.id, {

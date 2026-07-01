@@ -338,8 +338,10 @@ async function resolveAuth(req: IncomingMessage): Promise<AuthContext> {
     const rawToken = authHeader.slice(7);
     const session = await sessionRepository.findByToken(tokenHash(rawToken));
     if (session) {
-      const userRow = await dbQuery<{ roles: string[] }>("SELECT roles FROM users WHERE id = $1", [session.userId]);
-      const roles = normalizeRoles(userRow.rows[0]?.roles ?? []);
+      // Must resolve roles through a tenant-scoped read: users has FORCE RLS,
+      // so a bare pool query silently returns zero rows (empty roles → 403s).
+      const user = await userRepository.getById(session.tenantId, session.userId);
+      const roles = normalizeRoles(user?.roles ?? []);
       return { subject: session.userId, tenantId: session.tenantId, roles };
     }
   }

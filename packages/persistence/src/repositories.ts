@@ -124,10 +124,12 @@ export const tenantRepository = {
     return result.rows[0] ? mapTenant(result.rows[0]) : undefined;
   },
   async getUserCount(id: string): Promise<number> {
-    const result = await query<{ count: string }>("SELECT COUNT(*)::text AS count FROM users WHERE tenant_id = $1", [
-      id
-    ]);
-    return Number(result.rows[0]?.count ?? "0");
+    // users has FORCE RLS: counting requires the tenant context, otherwise the
+    // policy filters every row and the count is silently 0 (limit never enforced).
+    return withTenant(id, async (client) => {
+      const result = await client.query<{ count: string }>("SELECT COUNT(*)::text AS count FROM users", []);
+      return Number(result.rows[0]?.count ?? "0");
+    });
   }
 };
 
