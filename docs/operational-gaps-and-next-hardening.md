@@ -40,6 +40,23 @@ This implementation provides a production-grade foundation, but these items must
   server mode, OpenSearch security on) plus runbooks under `docs/runbooks/`.
 - **Meta resilience**: retry/backoff + circuit breaker around Graph API calls.
 
+## 0c) Resolved in the auth-hardening iteration
+
+- **Database migrations**: `infra/postgres/init/*.sql` only ran once, on first
+  cluster initialisation — files added after a database's volume already
+  existed (e.g. the auth tables) never reached it. `scripts/migrate.sh`
+  (`pnpm migrate`) now tracks applied files in a `schema_migrations` table and
+  applies pending ones in order against an existing database; CI's
+  integration job runs it instead of hand-picking three files. Run it against
+  any environment after pulling new migrations.
+- **Native session auth**: `/auth/register`, `/auth/login`, `/auth/logout`,
+  `/auth/me` with scrypt password hashing, rate-limited login/register
+  (5/min per IP, keyed by email too on login), expired-session purge, and
+  session revocation on password change. No password hash is committed to
+  source control — the first platform_owner account is created at startup
+  from `BOOTSTRAP_ADMIN_EMAIL`/`BOOTSTRAP_ADMIN_PASSWORD` if set and no user
+  with that email exists yet.
+
 The items below remain environment-specific and are delivered as configuration
 plus runbooks (not turnkey automation), to be completed against the client's
 hardware/network.

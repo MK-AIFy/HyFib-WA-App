@@ -153,7 +153,7 @@ curl -s -X POST "http://localhost:18080/api/v1/campaigns/${CAMPAIGN_ID}/dispatch
 docker compose ps
 curl -s http://localhost:18080/api/v1/analytics -H "x-role: analyst" -H "x-tenant-id: ${TENANT_ID}"
 curl -s http://localhost:18080/api/v1/audit -H "x-role: compliance_auditor" -H "x-tenant-id: ${TENANT_ID}"
-docker compose logs --tail 100 api-gateway webhook-ingestor notification-worker meta-adapter campaign-service
+docker compose logs --tail 100 api-gateway webhook-ingestor notification-worker meta-adapter
 ```
 
 ## Test Cases and Scenarios
