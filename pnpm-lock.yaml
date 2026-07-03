@@ -167,6 +167,9 @@ importers:
 
   services/app-server:
     dependencies:
+      '@hyfib/api-gateway':
+        specifier: workspace:*
+        version: link:../api-gateway
       '@hyfib/config':
         specifier: workspace:*
         version: link:../../packages/config

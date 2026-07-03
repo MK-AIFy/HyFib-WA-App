@@ -13,6 +13,7 @@
     "lint": "eslint src"
   },
   "dependencies": {
+    "@hyfib/api-gateway": "workspace:*",
     "@hyfib/config": "workspace:*",
     "@hyfib/db": "workspace:*",
     "@hyfib/event-bus": "workspace:*",

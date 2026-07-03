@@ -1,4 +1,4 @@
-import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
+import { createServer, type Server } from "node:http";
 import { argv } from "node:process";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7,60 +7,57 @@ import { waitForReady, closePool as closeDbPool } from "@hyfib/db";
 import { closePool as closePersistencePool } from "@hyfib/persistence";
 import { closeRedis } from "@hyfib/ratelimit";
 import { createEventBus, type EventBus } from "@hyfib/event-bus";
-import { Logger, parseUrlPath, sendJson, sendMetrics } from "@hyfib/shared-core";
+import { createGatewayHandler, type GatewayModule } from "@hyfib/api-gateway";
+import { Logger, sendJson } from "@hyfib/shared-core";
 
 export interface AppServerDeps {
   logger: Logger;
   eventBus: EventBus;
 }
 
-/**
- * Root request router for the modular monolith. Phase 1 serves only the
- * operational endpoints; feature modules (gateway `/api` + `/auth`, worker
- * schedulers, …) are wired in at the marked seam in later phases.
- */
-export function createAppRequestHandler(
-  _deps: AppServerDeps
-): (req: IncomingMessage, res: ServerResponse) => void {
-  return (req, res) => {
-    const path = parseUrlPath(req.url);
-    if (path === "/health") {
-      sendJson(res, 200, { service: "app-server", status: "ok", timestamp: new Date().toISOString() });
-      return;
-    }
-    if (path === "/metrics") {
-      sendMetrics(res);
-      return;
-    }
-    // ── Feature modules mount here (Phase 2+): gateway /api + /auth, /r/*, webhooks ──
-    sendJson(res, 404, { error: "route_not_found" });
-  };
-}
-
 export interface AppServer {
   server: Server;
+  gateway: GatewayModule;
   shutdown: (signal: string) => Promise<void>;
 }
 
 /**
- * Composes the HTTP server from injected dependencies. Kept side-effect free
- * (no `listen`, no DB connect) so tests can exercise the router directly.
+ * Composes the HTTP server for the modular monolith. The gateway module owns
+ * the entire external HTTP surface (`/api`, `/auth`, `/r`, webhooks, `/health`,
+ * `/metrics`), wired onto the shared event bus so in-process worker consumers
+ * (Phase 5+) observe gateway-published events. Kept side-effect free (no
+ * `listen`, no schedulers, no DB connect) so tests can exercise the router.
  */
 export function createAppServer(deps: AppServerDeps): AppServer {
-  const handler = createAppRequestHandler(deps);
-  const server = createServer((req, res) => handler(req, res));
+  const gateway = createGatewayHandler({ eventBus: deps.eventBus });
+
+  const server = createServer((req, res) => {
+    gateway.applySecurityHeaders(res);
+    gateway.handle(req, res).catch((error) => {
+      deps.logger.error("request_failed", {
+        method: req.method,
+        url: req.url,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      if (!res.headersSent) {
+        sendJson(res, 500, { error: "internal_error" });
+      } else {
+        res.end();
+      }
+    });
+  });
 
   const shutdown = async (signal: string): Promise<void> => {
     deps.logger.info("shutdown_started", { signal });
     await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
-    await deps.eventBus.close().catch(() => undefined);
+    await gateway.close().catch(() => undefined);
     await closePersistencePool().catch(() => undefined);
     await closeDbPool().catch(() => undefined);
     await closeRedis().catch(() => undefined);
     deps.logger.info("shutdown_complete", { signal });
   };
 
-  return { server, shutdown };
+  return { server, gateway, shutdown };
 }
 
 async function main(): Promise<void> {
@@ -70,7 +67,10 @@ async function main(): Promise<void> {
   await waitForReady();
 
   const eventBus = createEventBus(config);
-  const { server, shutdown } = createAppServer({ logger, eventBus });
+  const { server, gateway, shutdown } = createAppServer({ logger, eventBus });
+
+  const schedulerTimers = gateway.startSchedulers();
+  await gateway.bootstrapPlatformAdmin();
 
   server.listen(config.appServerPort, () => {
     logger.info("service_started", {
@@ -85,6 +85,9 @@ async function main(): Promise<void> {
   });
 
   const onSignal = (signal: string): void => {
+    for (const timer of schedulerTimers) {
+      clearInterval(timer);
+    }
     void shutdown(signal).finally(() => process.exit(0));
     setTimeout(() => process.exit(0), 10_000).unref();
   };
