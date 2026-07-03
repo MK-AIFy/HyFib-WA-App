@@ -165,6 +165,27 @@ importers:
         specifier: workspace:*
         version: link:../../packages/shared-core
 
+  services/app-server:
+    dependencies:
+      '@hyfib/config':
+        specifier: workspace:*
+        version: link:../../packages/config
+      '@hyfib/db':
+        specifier: workspace:*
+        version: link:../../packages/db
+      '@hyfib/event-bus':
+        specifier: workspace:*
+        version: link:../../packages/event-bus
+      '@hyfib/persistence':
+        specifier: workspace:*
+        version: link:../../packages/persistence
+      '@hyfib/ratelimit':
+        specifier: workspace:*
+        version: link:../../packages/ratelimit
+      '@hyfib/shared-core':
+        specifier: workspace:*
+        version: link:../../packages/shared-core
+
   services/billing-usage-service:
     dependencies:
       '@hyfib/config':
