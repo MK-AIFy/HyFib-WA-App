@@ -33,6 +33,21 @@ services:
       - api-gateway
     restart: unless-stopped
 
+  # New React SPA, built as a parallel app. Runs alongside web-portal until the
+  # nginx `location /` cutover is flipped to web_app (see infra/nginx/nginx.conf).
+  web-app:
+    build:
+      context: .
+      dockerfile: services/web-app/Dockerfile
+    container_name: web-app
+    ports:
+      - "3002:8080"
+    networks:
+      - app-net
+    depends_on:
+      - api-gateway
+    restart: unless-stopped
+
   postgres-primary:
     image: postgres:16-alpine
     container_name: postgres-primary
