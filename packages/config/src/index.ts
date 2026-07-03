@@ -34,6 +34,7 @@ export interface PlatformConfig {
   eventBus: "rabbitmq" | "memory";
   rabbitmqUrl: string;
   apiGatewayPort: number;
+  appServerPort: number;
   metaAdapterPort: number;
   webhookIngestorPort: number;
   notificationWorkerPort: number;
@@ -147,6 +148,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PlatformConfig
     eventBus: (env.EVENT_BUS ?? "rabbitmq") === "memory" ? "memory" : "rabbitmq",
     rabbitmqUrl,
     apiGatewayPort: parseNumber("API_GATEWAY_PORT", env.API_GATEWAY_PORT, 8080),
+    appServerPort: parseNumber("APP_SERVER_PORT", env.APP_SERVER_PORT, 8080),
     metaAdapterPort: parseNumber("META_ADAPTER_PORT", env.META_ADAPTER_PORT, 8092),
     webhookIngestorPort: parseNumber("WEBHOOK_INGESTOR_PORT", env.WEBHOOK_INGESTOR_PORT, 8093),
     notificationWorkerPort: parseNumber("NOTIFICATION_WORKER_PORT", env.NOTIFICATION_WORKER_PORT, 8094),
