@@ -188,6 +188,9 @@ importers:
       '@hyfib/shared-core':
         specifier: workspace:*
         version: link:../../packages/shared-core
+      '@hyfib/webhook-ingestor':
+        specifier: workspace:*
+        version: link:../webhook-ingestor
 
   services/billing-usage-service:
     dependencies:

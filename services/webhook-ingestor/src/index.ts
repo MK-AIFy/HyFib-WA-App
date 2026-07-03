@@ -1,8 +1,10 @@
 import { createServer } from "node:http";
+import { argv } from "node:process";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createEventBus } from "@hyfib/event-bus";
 import { loadConfig } from "@hyfib/config";
 import {
-  EventTopics,
   RedisIdempotencyStore,
   Logger,
   methodNotAllowed,
@@ -12,100 +14,18 @@ import {
   requestContext,
   sendJson,
   sendMetrics,
-  incCounter,
   verifyMetaSignature
 } from "@hyfib/shared-core";
 import { getRedisClient } from "@hyfib/ratelimit";
-import { normalizeInbound, normalizeStatus, type RawValue } from "./normalize.js";
+import { ingestMetaWebhook, safeJsonParse, deriveTenantId, type ForwardedWebhook } from "./ingest.js";
 
-interface WebhookPayload {
-  entry?: Array<{
-    id?: string;
-    changes?: Array<{
-      field?: string;
-      value?: RawValue;
-    }>;
-  }>;
-}
-
-interface ForwardedWebhookRequest {
-  rawBody: string;
-  signature?: string;
-  tenantId?: string;
-}
+export * from "./ingest.js";
 
 const config = loadConfig();
 const logger = new Logger("webhook-ingestor", config.logLevel as "debug" | "info" | "warn" | "error");
 const eventBus = createEventBus(config);
 const idempotency = new RedisIdempotencyStore(getRedisClient(config), 24 * 60 * 60);
-
-function safeJsonParse(value: string): WebhookPayload {
-  try {
-    return JSON.parse(value) as WebhookPayload;
-  } catch {
-    return {};
-  }
-}
-
-function deriveTenantId(payload: WebhookPayload, fallbackTenantId?: string): string | undefined {
-  return payload.entry?.[0]?.id ?? fallbackTenantId;
-}
-
-async function ingest(
-  payload: WebhookPayload,
-  tenantId?: string
-): Promise<{ inbound: number; statuses: number; duplicates: number }> {
-  let inbound = 0;
-  let statuses = 0;
-  let duplicates = 0;
-
-  for (const entry of payload.entry ?? []) {
-    for (const change of entry.changes ?? []) {
-      const value = change.value;
-      if (!value) {
-        continue;
-      }
-
-      for (const message of value.messages ?? []) {
-        const key = `inbound:${message.id ?? "unknown"}`;
-        if (await idempotency.isDuplicate(key)) {
-          duplicates += 1;
-          continue;
-        }
-
-        inbound += 1;
-        incCounter("events_published_total", "Events published to the bus.", {
-          topic: EventTopics.WhatsAppInboundReceived
-        });
-        await eventBus.publish(
-          EventTopics.WhatsAppInboundReceived,
-          { ...normalizeInbound(value, message, entry.id) },
-          tenantId
-        );
-      }
-
-      for (const status of value.statuses ?? []) {
-        const key = `status:${status.id ?? "unknown"}:${status.status ?? "unknown"}`;
-        if (await idempotency.isDuplicate(key)) {
-          duplicates += 1;
-          continue;
-        }
-
-        statuses += 1;
-        incCounter("events_published_total", "Events published to the bus.", {
-          topic: EventTopics.WhatsAppStatusUpdated
-        });
-        await eventBus.publish(
-          EventTopics.WhatsAppStatusUpdated,
-          { ...normalizeStatus(value, status, entry.id) },
-          tenantId
-        );
-      }
-    }
-  }
-
-  return { inbound, statuses, duplicates };
-}
+const ingestDeps = { eventBus, idempotency };
 
 const server = createServer(async (req, res) => {
   try {
@@ -139,7 +59,7 @@ const server = createServer(async (req, res) => {
     let tenantId: string | undefined = ctx.tenantId;
 
     if (req.headers["content-type"]?.includes("application/json")) {
-      const forwarded = safeJsonParse(raw) as ForwardedWebhookRequest;
+      const forwarded = safeJsonParse(raw) as unknown as ForwardedWebhook;
       if (typeof forwarded.rawBody === "string") {
         rawBody = forwarded.rawBody;
         signature = forwarded.signature;
@@ -157,7 +77,7 @@ const server = createServer(async (req, res) => {
 
     const payload = safeJsonParse(rawBody);
     const scopedTenant = deriveTenantId(payload, tenantId);
-    const summary = await ingest(payload, scopedTenant);
+    const summary = await ingestMetaWebhook(payload, scopedTenant, ingestDeps);
 
     logger.info("webhook_ingested", {
       requestId: ctx.requestId,
@@ -193,7 +113,7 @@ const server = createServer(async (req, res) => {
 
     const raw = await readRawBody(req);
     const payload = safeJsonParse(raw);
-    const summary = await ingest(payload, ctx.tenantId);
+    const summary = await ingestMetaWebhook(payload, ctx.tenantId, ingestDeps);
 
     logger.info("webhook_replayed", {
       requestId: ctx.requestId,
@@ -220,15 +140,20 @@ const server = createServer(async (req, res) => {
   }
 });
 
-server.listen(config.webhookIngestorPort, () => {
-  logger.info("service_started", {
-    port: config.webhookIngestorPort,
-    nodeEnv: config.nodeEnv
+// Boot the standalone HTTP service only when executed directly, never when
+// the package is imported by app-server for its exported ingest functions.
+const isMain = argv[1] !== undefined && resolve(argv[1]) === fileURLToPath(import.meta.url);
+if (isMain) {
+  server.listen(config.webhookIngestorPort, () => {
+    logger.info("service_started", {
+      port: config.webhookIngestorPort,
+      nodeEnv: config.nodeEnv
+    });
   });
-});
 
-server.on("error", (error) => {
-  logger.error("service_error", {
-    error: error instanceof Error ? error.message : String(error)
+  server.on("error", (error) => {
+    logger.error("service_error", {
+      error: error instanceof Error ? error.message : String(error)
+    });
   });
-});
+}

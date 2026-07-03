@@ -19,6 +19,7 @@
     "@hyfib/event-bus": "workspace:*",
     "@hyfib/persistence": "workspace:*",
     "@hyfib/ratelimit": "workspace:*",
-    "@hyfib/shared-core": "workspace:*"
+    "@hyfib/shared-core": "workspace:*",
+    "@hyfib/webhook-ingestor": "workspace:*"
   }
 }

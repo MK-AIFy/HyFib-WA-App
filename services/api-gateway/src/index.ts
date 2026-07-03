@@ -233,6 +233,30 @@ const authenticator = createAuthenticator(config);
 let eventBus = createEventBus(config);
 const webhookIdempotency = new RedisIdempotencyStore(getRedisClient(config), 24 * 60 * 60);
 
+// Internal proxy to the webhook-ingestor. Injectable so the modular monolith
+// swaps in a direct in-process call instead of HTTP (Phase 3).
+export type IngestWebhookProxy = (forwarded: {
+  rawBody: string;
+  signature?: string;
+  tenantId?: string;
+}) => Promise<{ ok: boolean; body: unknown }>;
+
+async function defaultIngestWebhookProxy(forwarded: {
+  rawBody: string;
+  signature?: string;
+}): Promise<{ ok: boolean; body: unknown }> {
+  const proxyResponse = await fetch(`${config.webhookIngestorUrl}/internal/v1/webhooks/meta/whatsapp`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-request-id": randomUUID() },
+    body: JSON.stringify({ rawBody: forwarded.rawBody, signature: forwarded.signature }),
+    signal: AbortSignal.timeout(10_000)
+  });
+  const body = (await proxyResponse.json()) as unknown;
+  return { ok: proxyResponse.ok, body };
+}
+
+let ingestWebhookProxy: IngestWebhookProxy = defaultIngestWebhookProxy;
+
 const E164 = /^\+[1-9]\d{7,14}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -1130,14 +1154,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         }
       }
     }
-    const proxyResponse = await fetch(`${config.webhookIngestorUrl}/internal/v1/webhooks/meta/whatsapp`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-request-id": randomUUID() },
-      body: JSON.stringify({ rawBody, signature: normalizedSignature }),
-      signal: AbortSignal.timeout(10_000)
-    });
-    const proxyBody = (await proxyResponse.json()) as Record<string, unknown>;
-    sendJson(res, proxyResponse.ok ? 200 : 502, { requestId: ctx.requestId, upstream: proxyBody });
+    const { ok, body: proxyBody } = await ingestWebhookProxy({ rawBody, signature: normalizedSignature });
+    sendJson(res, ok ? 200 : 502, { requestId: ctx.requestId, upstream: proxyBody });
     return;
   }
 
@@ -3096,6 +3114,11 @@ export interface GatewayDeps {
    * when omitted the gateway uses its own bus (standalone service).
    */
   eventBus?: EventBus;
+  /**
+   * Direct in-process webhook ingestion. When provided the gateway calls it
+   * instead of proxying to the webhook-ingestor over HTTP (Phase 3).
+   */
+  proxyWebhookToIngestor?: IngestWebhookProxy;
 }
 
 export interface GatewayModule {
@@ -3115,6 +3138,9 @@ export interface GatewayModule {
 export function createGatewayHandler(deps: GatewayDeps = {}): GatewayModule {
   if (deps.eventBus) {
     eventBus = deps.eventBus;
+  }
+  if (deps.proxyWebhookToIngestor) {
+    ingestWebhookProxy = deps.proxyWebhookToIngestor;
   }
   registerSseForwarding();
   return {

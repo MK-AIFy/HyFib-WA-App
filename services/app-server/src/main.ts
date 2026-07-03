@@ -7,12 +7,16 @@ import { waitForReady, closePool as closeDbPool } from "@hyfib/db";
 import { closePool as closePersistencePool } from "@hyfib/persistence";
 import { closeRedis } from "@hyfib/ratelimit";
 import { createEventBus, type EventBus } from "@hyfib/event-bus";
-import { createGatewayHandler, type GatewayModule } from "@hyfib/api-gateway";
-import { Logger, sendJson } from "@hyfib/shared-core";
+import { createGatewayHandler, type GatewayModule, type IngestWebhookProxy } from "@hyfib/api-gateway";
+import { processForwardedWebhook } from "@hyfib/webhook-ingestor";
+import { getRedisClient } from "@hyfib/ratelimit";
+import { Logger, RedisIdempotencyStore, sendJson } from "@hyfib/shared-core";
 
 export interface AppServerDeps {
   logger: Logger;
   eventBus: EventBus;
+  /** Direct in-process webhook ingestion; when omitted the gateway proxies over HTTP. */
+  proxyWebhookToIngestor?: IngestWebhookProxy;
 }
 
 export interface AppServer {
@@ -29,7 +33,10 @@ export interface AppServer {
  * `listen`, no schedulers, no DB connect) so tests can exercise the router.
  */
 export function createAppServer(deps: AppServerDeps): AppServer {
-  const gateway = createGatewayHandler({ eventBus: deps.eventBus });
+  const gateway = createGatewayHandler({
+    eventBus: deps.eventBus,
+    proxyWebhookToIngestor: deps.proxyWebhookToIngestor
+  });
 
   const server = createServer((req, res) => {
     gateway.applySecurityHeaders(res);
@@ -67,7 +74,20 @@ async function main(): Promise<void> {
   await waitForReady();
 
   const eventBus = createEventBus(config);
-  const { server, gateway, shutdown } = createAppServer({ logger, eventBus });
+
+  // Direct in-process webhook ingestion: the gateway calls this instead of
+  // proxying to the webhook-ingestor over HTTP. Publishes on the shared bus.
+  const webhookIdempotency = new RedisIdempotencyStore(getRedisClient(config), 24 * 60 * 60);
+  const proxyWebhookToIngestor: IngestWebhookProxy = async (forwarded) => {
+    const { verified, summary } = await processForwardedWebhook(forwarded, {
+      eventBus,
+      idempotency: webhookIdempotency,
+      metaAppSecret: config.metaAppSecret
+    });
+    return { ok: verified, body: { status: verified ? "accepted" : "invalid_signature", ...summary } };
+  };
+
+  const { server, gateway, shutdown } = createAppServer({ logger, eventBus, proxyWebhookToIngestor });
 
   const schedulerTimers = gateway.startSchedulers();
   await gateway.bootstrapPlatformAdmin();
