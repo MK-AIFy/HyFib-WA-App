@@ -1,15 +1,17 @@
 import { createServer, type Server } from "node:http";
 import { argv } from "node:process";
+import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig } from "@hyfib/config";
 import { waitForReady, closePool as closeDbPool } from "@hyfib/db";
 import { closePool as closePersistencePool } from "@hyfib/persistence";
-import { closeRedis } from "@hyfib/ratelimit";
+import { closeRedis, getRedisClient } from "@hyfib/ratelimit";
 import { createEventBus, type EventBus } from "@hyfib/event-bus";
 import { createGatewayHandler, type GatewayModule, type IngestWebhookProxy } from "@hyfib/api-gateway";
 import { processForwardedWebhook } from "@hyfib/webhook-ingestor";
-import { getRedisClient } from "@hyfib/ratelimit";
+import { metaDispatch } from "@hyfib/meta-adapter";
+import { registerWorkerConsumers, type WorkerMetaClient } from "@hyfib/notification-worker";
 import { Logger, RedisIdempotencyStore, sendJson } from "@hyfib/shared-core";
 
 export interface AppServerDeps {
@@ -88,6 +90,24 @@ async function main(): Promise<void> {
   };
 
   const { server, gateway, shutdown } = createAppServer({ logger, eventBus, proxyWebhookToIngestor });
+
+  // Register worker consumers on the shared bus with a direct in-process meta
+  // transport (no HTTP hop to the meta-adapter). Durable delivery is provided
+  // by the gateway's outbox relay (started below) + idempotent handlers.
+  const workerMetaClient: WorkerMetaClient = {
+    async send(endpoint, _tenantId, payload) {
+      const { status, body } = await metaDispatch(endpoint, payload, randomUUID());
+      if (status !== 202) {
+        throw new Error(`meta_adapter_rejected_${status}`);
+      }
+      const result = (body as { result?: { messageId?: string; status?: string } }).result;
+      return { messageId: result?.messageId, accepted: result?.status === "accepted" };
+    },
+    async markRead(phoneNumberId, messageId, _tenantId, accessToken) {
+      await metaDispatch("/internal/v1/whatsapp/mark-read", { phoneNumberId, messageId, accessToken }, randomUUID());
+    }
+  };
+  registerWorkerConsumers({ eventBus, metaClient: workerMetaClient });
 
   const schedulerTimers = gateway.startSchedulers();
   await gateway.bootstrapPlatformAdmin();

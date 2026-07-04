@@ -1,6 +1,9 @@
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
-import { createEventBus } from "@hyfib/event-bus";
+import { argv } from "node:process";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { createEventBus, type EventBus } from "@hyfib/event-bus";
 import { loadConfig } from "@hyfib/config";
 import { evaluateOutboundPolicy } from "@hyfib/policy-engine";
 import {
@@ -51,7 +54,7 @@ import { evaluateAutomationRules } from "./automation.js";
 
 const config = loadConfig();
 const logger = new Logger("notification-worker", config.logLevel as "debug" | "info" | "warn" | "error");
-const eventBus = createEventBus(config);
+let eventBus = createEventBus(config);
 const redis = getRedisClient(config);
 
 interface InboundEvent {
@@ -89,29 +92,72 @@ const META_STATUS_TO_MESSAGE: Record<string, Message["status"]> = {
   failed: "failed"
 };
 
-/** POSTs a send request to a meta-adapter endpoint and returns the message id. */
+/**
+ * Meta send transport. Injectable so the modular monolith swaps the HTTP calls
+ * to the meta-adapter for direct in-process function calls (Phase 5); the
+ * standalone worker keeps the fetch implementation below.
+ */
+export interface WorkerMetaClient {
+  send(
+    endpoint: string,
+    tenantId: string,
+    payload: Record<string, unknown>
+  ): Promise<{ messageId?: string; accepted: boolean }>;
+  markRead(
+    phoneNumberId: string,
+    messageId: string,
+    tenantId: string,
+    accessToken?: string
+  ): Promise<void>;
+}
+
+const defaultMetaClient: WorkerMetaClient = {
+  async send(endpoint, tenantId, payload) {
+    const response = await fetch(`${config.metaAdapterUrl}${endpoint}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-tenant-id": tenantId,
+        "x-request-id": randomUUID(),
+        "x-internal-secret": config.internalServiceSecret
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(20_000)
+    });
+    const body = (await response.json()) as { result?: { messageId?: string; status?: string } };
+    if (!response.ok) {
+      throw new Error(`meta_adapter_rejected_${response.status}`);
+    }
+    return { messageId: body.result?.messageId, accepted: body.result?.status === "accepted" };
+  },
+  async markRead(phoneNumberId, messageId, tenantId, accessToken) {
+    try {
+      await fetch(`${config.metaAdapterUrl}/internal/v1/whatsapp/mark-read`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-tenant-id": tenantId,
+          "x-request-id": randomUUID(),
+          "x-internal-secret": config.internalServiceSecret
+        },
+        body: JSON.stringify({ phoneNumberId, messageId, accessToken }),
+        signal: AbortSignal.timeout(5_000)
+      });
+    } catch (error) {
+      logger.warn("mark_read_failed", { error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+};
+
+let metaClient: WorkerMetaClient = defaultMetaClient;
+
+/** POSTs a send request to the meta transport and returns the message id. */
 async function callMetaAdapter(
   endpoint: string,
   tenantId: string,
-  payload: Record<string, unknown>,
-  timeoutMs = 20_000
+  payload: Record<string, unknown>
 ): Promise<{ messageId?: string; accepted: boolean }> {
-  const response = await fetch(`${config.metaAdapterUrl}${endpoint}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-tenant-id": tenantId,
-      "x-request-id": randomUUID(),
-      "x-internal-secret": config.internalServiceSecret
-    },
-    body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(timeoutMs)
-  });
-  const body = (await response.json()) as { result?: { messageId?: string; status?: string } };
-  if (!response.ok) {
-    throw new Error(`meta_adapter_rejected_${response.status}`);
-  }
-  return { messageId: body.result?.messageId, accepted: body.result?.status === "accepted" };
+  return metaClient.send(endpoint, tenantId, payload);
 }
 
 /**
@@ -433,21 +479,7 @@ async function markRead(channel: ChannelCredentials, messageId: string | undefin
   if (!messageId) {
     return;
   }
-  try {
-    await fetch(`${config.metaAdapterUrl}/internal/v1/whatsapp/mark-read`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-tenant-id": tenantId,
-        "x-request-id": randomUUID(),
-        "x-internal-secret": config.internalServiceSecret
-      },
-      body: JSON.stringify({ phoneNumberId: channel.phoneNumberId, messageId, accessToken: channel.accessToken }),
-      signal: AbortSignal.timeout(5_000)
-    });
-  } catch (error) {
-    logger.warn("mark_read_failed", { error: error instanceof Error ? error.message : String(error) });
-  }
+  await metaClient.markRead(channel.phoneNumberId, messageId, tenantId, channel.accessToken);
 }
 
 async function handleInbound(event: EventEnvelope): Promise<void> {
@@ -770,13 +802,39 @@ async function handleAutomationTemplate(event: EventEnvelope): Promise<void> {
   });
 }
 
-eventBus.subscribe(EventTopics.CampaignDispatchRequested, "campaign-dispatch", handleDispatch);
-eventBus.subscribe(EventTopics.CampaignDispatchResult, "campaign-results", handleDispatchResult);
-eventBus.subscribe(EventTopics.CampaignRunRequested, "campaign-run", handleCampaignRun);
-eventBus.subscribe(EventTopics.WhatsAppInboundReceived, "inbound-messages", handleInbound);
-eventBus.subscribe(EventTopics.WhatsAppStatusUpdated, "status-updates", handleStatus);
-eventBus.subscribe(EventTopics.WhatsAppOutboundRequested, "outbound-messages", handleOutbound);
-eventBus.subscribe(EventTopics.AutomationTemplateRequested, "automation-templates", handleAutomationTemplate);
+export interface WorkerDeps {
+  /** Shared in-process event bus (app-server). Falls back to the worker's own. */
+  eventBus?: EventBus;
+  /** Direct in-process meta transport (app-server). Falls back to HTTP fetch. */
+  metaClient?: WorkerMetaClient;
+}
+
+/**
+ * Register all worker consumers on the (possibly shared) event bus. In the
+ * monolith app-server passes its shared bus + a direct meta client so the
+ * worker consumes gateway-published events in-process.
+ *
+ * Durability: campaign runs and outbound sends are enqueued to the DB outbox by
+ * the gateway; the gateway's outbox relay (started by app-server) re-publishes
+ * unprocessed rows after a crash, and the synchronous in-memory bus + idempotent
+ * claimPendingBatch make re-processing safe — so no separate resume sweep is
+ * needed here.
+ */
+export function registerWorkerConsumers(deps: WorkerDeps = {}): void {
+  if (deps.eventBus) {
+    eventBus = deps.eventBus;
+  }
+  if (deps.metaClient) {
+    metaClient = deps.metaClient;
+  }
+  eventBus.subscribe(EventTopics.CampaignDispatchRequested, "campaign-dispatch", handleDispatch);
+  eventBus.subscribe(EventTopics.CampaignDispatchResult, "campaign-results", handleDispatchResult);
+  eventBus.subscribe(EventTopics.CampaignRunRequested, "campaign-run", handleCampaignRun);
+  eventBus.subscribe(EventTopics.WhatsAppInboundReceived, "inbound-messages", handleInbound);
+  eventBus.subscribe(EventTopics.WhatsAppStatusUpdated, "status-updates", handleStatus);
+  eventBus.subscribe(EventTopics.WhatsAppOutboundRequested, "outbound-messages", handleOutbound);
+  eventBus.subscribe(EventTopics.AutomationTemplateRequested, "automation-templates", handleAutomationTemplate);
+}
 
 const server = createServer(async (req, res) => {
   const path = parseUrlPath(req.url);
@@ -802,18 +860,6 @@ const server = createServer(async (req, res) => {
   sendJson(res, 404, { error: "route_not_found" });
 });
 
-server.listen(config.notificationWorkerPort, () => {
-  logger.info("service_started", {
-    port: config.notificationWorkerPort,
-    nodeEnv: config.nodeEnv,
-    eventBus: config.eventBus
-  });
-});
-
-server.on("error", (error) => {
-  logger.error("service_error", { error: error instanceof Error ? error.message : String(error) });
-});
-
 async function shutdown(signal: string): Promise<void> {
   logger.info("shutdown_started", { signal });
   server.close(async () => {
@@ -824,5 +870,24 @@ async function shutdown(signal: string): Promise<void> {
   setTimeout(() => process.exit(0), 10_000).unref();
 }
 
-process.on("SIGTERM", () => void shutdown("SIGTERM"));
-process.on("SIGINT", () => void shutdown("SIGINT"));
+// Boot the standalone worker only when executed directly; when imported by
+// app-server, only registerWorkerConsumers() is used (on the shared bus).
+const isMain = argv[1] !== undefined && resolve(argv[1]) === fileURLToPath(import.meta.url);
+if (isMain) {
+  registerWorkerConsumers();
+
+  server.listen(config.notificationWorkerPort, () => {
+    logger.info("service_started", {
+      port: config.notificationWorkerPort,
+      nodeEnv: config.nodeEnv,
+      eventBus: config.eventBus
+    });
+  });
+
+  server.on("error", (error) => {
+    logger.error("service_error", { error: error instanceof Error ? error.message : String(error) });
+  });
+
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+}

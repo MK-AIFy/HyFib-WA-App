@@ -280,6 +280,143 @@ export async function markReadDirect(
   }
 }
 
+/**
+ * Route an internal `/internal/v1/whatsapp/*` send/mark-read request to the
+ * matching Graph builder + send, returning the same status/body the HTTP
+ * endpoint produces. The worker calls this in-process in the monolith instead
+ * of POSTing to the meta-adapter.
+ */
+export async function metaDispatch(
+  endpoint: string,
+  payload: Record<string, unknown>,
+  requestId: string
+): Promise<MetaDispatchResult> {
+  const p = payload as {
+    phoneNumberId?: string;
+    to?: string;
+    accessToken?: string;
+    text?: string;
+    previewUrl?: boolean;
+    mediaType?: WhatsAppMediaSendRequest["mediaType"];
+    link?: string;
+    mediaId?: string;
+    caption?: string;
+    filename?: string;
+    interactiveType?: WhatsAppInteractiveSendRequest["interactiveType"];
+    bodyText?: string;
+    headerText?: string;
+    footerText?: string;
+    buttons?: WhatsAppInteractiveSendRequest["buttons"];
+    buttonLabel?: string;
+    sections?: unknown;
+    catalogId?: string;
+    productRetailerId?: string;
+    flowId?: string;
+    flowToken?: string;
+    ctaButtonText?: string;
+    mode?: "draft" | "published";
+  };
+
+  switch (endpoint) {
+    case "/internal/v1/whatsapp/send-template":
+      return sendTemplateDirect(payload as unknown as WhatsAppSendRequest, requestId);
+
+    case "/internal/v1/whatsapp/send-text": {
+      if (!p.phoneNumberId || !p.to || !p.text) {
+        return { status: 400, body: { error: "phoneNumberId, to and text are required" } };
+      }
+      const body = buildTextBody({ to: p.to, text: p.text, previewUrl: p.previewUrl });
+      return sendGraphMessage(requestId, p.phoneNumberId, body, p.accessToken);
+    }
+
+    case "/internal/v1/whatsapp/send-media": {
+      if (!p.phoneNumberId || !p.to || !p.mediaType || (!p.link && !p.mediaId)) {
+        return { status: 400, body: { error: "phoneNumberId, to, mediaType and one of link/mediaId are required" } };
+      }
+      const body = buildMediaBody({
+        to: p.to,
+        mediaType: p.mediaType,
+        link: p.link,
+        mediaId: p.mediaId,
+        caption: p.caption,
+        filename: p.filename
+      });
+      return sendGraphMessage(requestId, p.phoneNumberId, body, p.accessToken);
+    }
+
+    case "/internal/v1/whatsapp/send-interactive": {
+      if (!p.phoneNumberId || !p.to || !p.interactiveType || !p.bodyText) {
+        return { status: 400, body: { error: "phoneNumberId, to, interactiveType and bodyText are required" } };
+      }
+      const body = buildInteractiveBody({
+        to: p.to,
+        interactiveType: p.interactiveType,
+        bodyText: p.bodyText,
+        headerText: p.headerText,
+        footerText: p.footerText,
+        buttons: p.buttons,
+        buttonLabel: p.buttonLabel,
+        sections: p.sections as never
+      });
+      return sendGraphMessage(requestId, p.phoneNumberId, body, p.accessToken);
+    }
+
+    case "/internal/v1/whatsapp/send-product": {
+      if (!p.phoneNumberId || !p.to || !p.catalogId || !p.productRetailerId) {
+        return { status: 400, body: { error: "phoneNumberId, to, catalogId and productRetailerId are required" } };
+      }
+      const body = buildProductMessage({
+        to: p.to,
+        catalogId: p.catalogId,
+        productRetailerId: p.productRetailerId,
+        bodyText: p.bodyText
+      });
+      return sendGraphMessage(requestId, p.phoneNumberId, body, p.accessToken);
+    }
+
+    case "/internal/v1/whatsapp/send-catalog": {
+      if (!p.phoneNumberId || !p.to || !p.catalogId || !(p.sections as unknown[] | undefined)?.length) {
+        return { status: 400, body: { error: "phoneNumberId, to, catalogId and sections are required" } };
+      }
+      const body = buildCatalogMessage({
+        to: p.to,
+        catalogId: p.catalogId,
+        sections: p.sections as never,
+        headerText: p.headerText,
+        bodyText: p.bodyText,
+        footerText: p.footerText
+      });
+      return sendGraphMessage(requestId, p.phoneNumberId, body, p.accessToken);
+    }
+
+    case "/internal/v1/whatsapp/send-flow": {
+      if (!p.phoneNumberId || !p.to || !p.flowId || !p.flowToken || !p.bodyText || !p.ctaButtonText) {
+        return {
+          status: 400,
+          body: { error: "phoneNumberId, to, flowId, flowToken, bodyText and ctaButtonText are required" }
+        };
+      }
+      const body = buildFlowMessage({
+        to: p.to,
+        flowId: p.flowId,
+        flowToken: p.flowToken,
+        bodyText: p.bodyText,
+        ctaButtonText: p.ctaButtonText,
+        headerText: p.headerText,
+        footerText: p.footerText,
+        mode: p.mode
+      });
+      return sendGraphMessage(requestId, p.phoneNumberId, body, p.accessToken);
+    }
+
+    case "/internal/v1/whatsapp/mark-read":
+      return markReadDirect(payload as unknown as WhatsAppMarkReadRequest, requestId);
+
+    default:
+      return { status: 404, body: { error: "unknown_meta_endpoint", endpoint } };
+  }
+}
+
 const server = createServer(async (req, res) => {
   try {
   const path = parseUrlPath(req.url);

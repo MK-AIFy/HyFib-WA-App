@@ -179,6 +179,12 @@ importers:
       '@hyfib/event-bus':
         specifier: workspace:*
         version: link:../../packages/event-bus
+      '@hyfib/meta-adapter':
+        specifier: workspace:*
+        version: link:../meta-adapter
+      '@hyfib/notification-worker':
+        specifier: workspace:*
+        version: link:../notification-worker
       '@hyfib/persistence':
         specifier: workspace:*
         version: link:../../packages/persistence

@@ -17,6 +17,8 @@
     "@hyfib/config": "workspace:*",
     "@hyfib/db": "workspace:*",
     "@hyfib/event-bus": "workspace:*",
+    "@hyfib/meta-adapter": "workspace:*",
+    "@hyfib/notification-worker": "workspace:*",
     "@hyfib/persistence": "workspace:*",
     "@hyfib/ratelimit": "workspace:*",
     "@hyfib/shared-core": "workspace:*",
