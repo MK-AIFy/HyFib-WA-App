@@ -1,5 +1,8 @@
 import { createServer, type ServerResponse } from "node:http";
 import { setTimeout as sleep } from "node:timers/promises";
+import { argv } from "node:process";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { loadConfig } from "@hyfib/config";
 import {
   Logger,
@@ -180,6 +183,39 @@ async function parseGraphError(response: Response): Promise<GraphError> {
  * messages edge, map a Graph error to 502 / circuit-open to 503, and return the
  * Meta message id on success.
  */
+export interface MetaDispatchResult {
+  status: number;
+  body: Record<string, unknown>;
+}
+
+/**
+ * Transport-free core of a Graph send: performs the request and returns the
+ * status + JSON body the HTTP endpoint would have written. Reused by the
+ * standalone server (via dispatchSend) and by the exported direct callers that
+ * app-server injects into the worker in the monolith.
+ */
+async function sendGraphMessage(
+  requestId: string,
+  phoneNumberId: string,
+  body: Record<string, unknown>,
+  accessToken?: string
+): Promise<MetaDispatchResult> {
+  try {
+    const response = await graphRequest(`/${phoneNumberId}/messages`, "POST", body, accessToken);
+    if (!response.ok) {
+      const graphError = await parseGraphError(response);
+      logger.warn("meta_send_failed", { requestId, statusCode: response.status, graphError: graphError.message });
+      return { status: 502, body: { error: "meta_send_failed", details: graphError } };
+    }
+    const parsed = (await response.json()) as { messages?: Array<{ id: string }> };
+    const result: WhatsAppSendResult = { messageId: parsed.messages?.[0]?.id, status: "accepted" };
+    return { status: 202, body: { requestId, result } };
+  } catch (error) {
+    logger.error("meta_send_exception", { requestId, error: error instanceof Error ? error.message : String(error) });
+    return { status: 503, body: { error: "meta_adapter_unavailable" } };
+  }
+}
+
 async function dispatchSend(
   res: ServerResponse,
   requestId: string,
@@ -187,20 +223,60 @@ async function dispatchSend(
   body: Record<string, unknown>,
   accessToken?: string
 ): Promise<void> {
+  const { status, body: payload } = await sendGraphMessage(requestId, phoneNumberId, body, accessToken);
+  sendJson(res, status, payload);
+}
+
+/**
+ * Direct in-process template send. Validates + builds the Graph body + sends,
+ * returning the same status/body the `/internal/v1/whatsapp/send-template`
+ * endpoint produces. The worker calls this in the monolith instead of HTTP.
+ */
+export async function sendTemplateDirect(
+  payload: WhatsAppSendRequest,
+  requestId: string
+): Promise<MetaDispatchResult> {
+  if (!payload.phoneNumberId || !payload.to || !payload.templateName || !payload.templateLanguage) {
+    return { status: 400, body: { error: "Missing required fields for template send" } };
+  }
+  const graphBody = buildTemplateBody({
+    to: payload.to,
+    templateName: payload.templateName,
+    templateLanguage: payload.templateLanguage,
+    parameters: payload.parameters ?? [],
+    components: payload.components
+  });
+  return sendGraphMessage(requestId, payload.phoneNumberId, graphBody, payload.accessToken);
+}
+
+/**
+ * Direct in-process mark-read. Mirrors the `/internal/v1/whatsapp/mark-read`
+ * endpoint so the worker can mark inbound messages read without an HTTP hop.
+ */
+export async function markReadDirect(
+  payload: WhatsAppMarkReadRequest,
+  _requestId: string
+): Promise<MetaDispatchResult> {
+  if (!payload.phoneNumberId || !payload.messageId) {
+    return { status: 400, body: { error: "phoneNumberId and messageId are required" } };
+  }
   try {
-    const response = await graphRequest(`/${phoneNumberId}/messages`, "POST", body, accessToken);
+    const response = await graphRequest(
+      `/${payload.phoneNumberId}/messages`,
+      "POST",
+      buildMarkReadBody(payload.messageId),
+      payload.accessToken
+    );
     if (!response.ok) {
       const graphError = await parseGraphError(response);
-      logger.warn("meta_send_failed", { requestId, statusCode: response.status, graphError: graphError.message });
-      sendJson(res, 502, { error: "meta_send_failed", details: graphError });
-      return;
+      return { status: 502, body: { error: "meta_mark_read_failed", details: graphError } };
     }
-    const parsed = (await response.json()) as { messages?: Array<{ id: string }> };
-    const result: WhatsAppSendResult = { messageId: parsed.messages?.[0]?.id, status: "accepted" };
-    sendJson(res, 202, { requestId, result });
+    return { status: 200, body: { status: "read", messageId: payload.messageId } };
   } catch (error) {
-    logger.error("meta_send_exception", { requestId, error: error instanceof Error ? error.message : String(error) });
-    sendJson(res, 503, { error: "meta_adapter_unavailable" });
+    return {
+      status: 503,
+      body: { error: "meta_adapter_unavailable", details: error instanceof Error ? error.message : String(error) }
+    };
   }
 }
 
@@ -243,19 +319,8 @@ const server = createServer(async (req, res) => {
     }
 
     const payload = await readJsonBody<WhatsAppSendRequest>(req);
-    if (!payload.phoneNumberId || !payload.to || !payload.templateName || !payload.templateLanguage) {
-      sendJson(res, 400, { error: "Missing required fields for template send" });
-      return;
-    }
-
-    const graphBody = buildTemplateBody({
-      to: payload.to,
-      templateName: payload.templateName,
-      templateLanguage: payload.templateLanguage,
-      parameters: payload.parameters ?? [],
-      components: payload.components
-    });
-    await dispatchSend(res, ctx.requestId, payload.phoneNumberId, graphBody, payload.accessToken);
+    const { status, body } = await sendTemplateDirect(payload, ctx.requestId);
+    sendJson(res, status, body);
     return;
   }
 
@@ -426,29 +491,8 @@ const server = createServer(async (req, res) => {
       return;
     }
     const payload = await readJsonBody<WhatsAppMarkReadRequest>(req);
-    if (!payload.phoneNumberId || !payload.messageId) {
-      sendJson(res, 400, { error: "phoneNumberId and messageId are required" });
-      return;
-    }
-    try {
-      const response = await graphRequest(
-        `/${payload.phoneNumberId}/messages`,
-        "POST",
-        buildMarkReadBody(payload.messageId),
-        payload.accessToken
-      );
-      if (!response.ok) {
-        const graphError = await parseGraphError(response);
-        sendJson(res, 502, { error: "meta_mark_read_failed", details: graphError });
-        return;
-      }
-      sendJson(res, 200, { status: "read", messageId: payload.messageId });
-    } catch (error) {
-      sendJson(res, 503, {
-        error: "meta_adapter_unavailable",
-        details: error instanceof Error ? error.message : String(error)
-      });
-    }
+    const { status, body } = await markReadDirect(payload, ctx.requestId);
+    sendJson(res, status, body);
     return;
   }
 
@@ -728,12 +772,17 @@ const server = createServer(async (req, res) => {
   }
 });
 
-server.listen(port, () => {
-  logger.info("service_started", { port, nodeEnv: config.nodeEnv });
-});
-
-server.on("error", (error) => {
-  logger.error("service_error", {
-    error: error instanceof Error ? error.message : String(error)
+// Boot the standalone HTTP service only when executed directly, never when the
+// package is imported by app-server for its exported send/mark-read functions.
+const isMain = argv[1] !== undefined && resolve(argv[1]) === fileURLToPath(import.meta.url);
+if (isMain) {
+  server.listen(port, () => {
+    logger.info("service_started", { port, nodeEnv: config.nodeEnv });
   });
-});
+
+  server.on("error", (error) => {
+    logger.error("service_error", {
+      error: error instanceof Error ? error.message : String(error)
+    });
+  });
+}
