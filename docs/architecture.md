@@ -1,5 +1,16 @@
 # Architecture Overview
 
+> **Update (2026-07): backend consolidated to a modular monolith.** The former
+> per-service containers (api-gateway, meta-adapter, webhook-ingestor,
+> notification-worker, ai/billing/reporting) now run as in-process modules of a
+> single `app-server` over a shared in-process event bus (`EVENT_BUS=memory`);
+> the legacy `web-portal` is replaced by the React `web-app`. Runtime topology is
+> 5 containers (edge-proxy, app-server, web-app, postgres-primary, redis-master),
+> with Prometheus/Grafana behind `docker compose --profile observability`. The
+> external API contract and RLS model below are unchanged. Each `services/*`
+> package keeps a guarded standalone entrypoint (set `EVENT_BUS=rabbitmq` to run
+> a module as its own process again). See the README "Architecture" section.
+
 ## Goals
 
 - On-prem VM deployment with Docker Compose.

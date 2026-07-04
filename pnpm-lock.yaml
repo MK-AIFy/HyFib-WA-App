@@ -361,15 +361,6 @@ importers:
         specifier: ^4.1.9
         version: 4.1.9(@types/node@24.12.4)(jsdom@29.1.1)(vite@8.1.2(@types/node@24.12.4)(jiti@2.7.0))
 
-  services/web-portal:
-    dependencies:
-      '@hyfib/config':
-        specifier: workspace:*
-        version: link:../../packages/config
-      '@hyfib/shared-core':
-        specifier: workspace:*
-        version: link:../../packages/shared-core
-
   services/webhook-ingestor:
     dependencies:
       '@hyfib/config':
