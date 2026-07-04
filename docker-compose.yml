@@ -9,32 +9,48 @@ services:
       - "80:80"
       - "443:443"
     depends_on:
-      - api-gateway
-      - web-portal
+      - app-server
+      - web-app
     networks:
       - dmz-net
       - app-net
     restart: unless-stopped
 
-  web-portal:
+  # Modular monolith: gateway + ingestor + meta + worker + ai/billing/reporting
+  # in one process on an in-process event bus. Replaces the former 7 services.
+  app-server:
     build:
       context: .
-      dockerfile: services/web-portal/Dockerfile
-    container_name: web-portal
+      dockerfile: services/app-server/Dockerfile
+    container_name: app-server
     env_file:
       - .env
     environment:
-      - API_GATEWAY_HOST=api-gateway
+      # In-process event bus (no RabbitMQ). Set EVENT_BUS=rabbitmq + RABBITMQ_URL
+      # to scale the worker out to a separate process again.
+      - EVENT_BUS=memory
+    depends_on:
+      - postgres-primary
+      - redis-master
     ports:
-      - "3001:3000"
+      - "18080:8080"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     networks:
       - app-net
-    depends_on:
-      - api-gateway
+      - data-net
     restart: unless-stopped
 
-  # New React SPA, built as a parallel app. Runs alongside web-portal until the
-  # nginx `location /` cutover is flipped to web_app (see infra/nginx/nginx.conf).
   web-app:
     build:
       context: .
@@ -45,7 +61,7 @@ services:
     networks:
       - app-net
     depends_on:
-      - api-gateway
+      - app-server
     restart: unless-stopped
 
   postgres-primary:
@@ -69,36 +85,6 @@ services:
       - data-net
     restart: unless-stopped
 
-  postgres-standby:
-    image: postgres:16-alpine
-    container_name: postgres-standby
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
-    depends_on:
-      - postgres-primary
-    volumes:
-      - pg_standby_data:/var/lib/postgresql/data
-    networks:
-      - data-net
-    restart: unless-stopped
-
-  postgres-replica:
-    image: postgres:16-alpine
-    container_name: postgres-replica
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
-    depends_on:
-      - postgres-primary
-    volumes:
-      - pg_replica_data:/var/lib/postgresql/data
-    networks:
-      - data-net
-    restart: unless-stopped
-
   redis-master:
     image: redis:7.4-alpine
     container_name: redis-master
@@ -109,183 +95,11 @@ services:
       - data-net
     restart: unless-stopped
 
-  redis-replica:
-    image: redis:7.4-alpine
-    container_name: redis-replica
-    command:
-      [
-        "redis-server",
-        "--replicaof",
-        "redis-master",
-        "6379",
-        "--masterauth",
-        "${REDIS_PASSWORD}",
-        "--requirepass",
-        "${REDIS_PASSWORD}"
-      ]
-    depends_on:
-      - redis-master
-    volumes:
-      - redis_replica_data:/data
-    networks:
-      - data-net
-    restart: unless-stopped
-
-  redis-sentinel-1:
-    image: redis:7.4-alpine
-    container_name: redis-sentinel-1
-    environment:
-      REDIS_PASSWORD: ${REDIS_PASSWORD}
-    # Sentinel must rewrite its config at runtime, so run from a writable copy
-    # with the auth placeholder substituted.
-    command:
-      [
-        "sh",
-        "-c",
-        'cp /etc/redis/sentinel.conf /tmp/sentinel.conf && sed -i "s|__REDIS_PASSWORD__|$$REDIS_PASSWORD|" /tmp/sentinel.conf && exec redis-sentinel /tmp/sentinel.conf'
-      ]
-    volumes:
-      - ./infra/redis/sentinel.conf:/etc/redis/sentinel.conf:ro
-    depends_on:
-      - redis-master
-    networks:
-      - data-net
-    restart: unless-stopped
-
-  redis-sentinel-2:
-    image: redis:7.4-alpine
-    container_name: redis-sentinel-2
-    environment:
-      REDIS_PASSWORD: ${REDIS_PASSWORD}
-    # Sentinel must rewrite its config at runtime, so run from a writable copy
-    # with the auth placeholder substituted.
-    command:
-      [
-        "sh",
-        "-c",
-        'cp /etc/redis/sentinel.conf /tmp/sentinel.conf && sed -i "s|__REDIS_PASSWORD__|$$REDIS_PASSWORD|" /tmp/sentinel.conf && exec redis-sentinel /tmp/sentinel.conf'
-      ]
-    volumes:
-      - ./infra/redis/sentinel.conf:/etc/redis/sentinel.conf:ro
-    depends_on:
-      - redis-master
-    networks:
-      - data-net
-    restart: unless-stopped
-
-  redis-sentinel-3:
-    image: redis:7.4-alpine
-    container_name: redis-sentinel-3
-    environment:
-      REDIS_PASSWORD: ${REDIS_PASSWORD}
-    # Sentinel must rewrite its config at runtime, so run from a writable copy
-    # with the auth placeholder substituted.
-    command:
-      [
-        "sh",
-        "-c",
-        'cp /etc/redis/sentinel.conf /tmp/sentinel.conf && sed -i "s|__REDIS_PASSWORD__|$$REDIS_PASSWORD|" /tmp/sentinel.conf && exec redis-sentinel /tmp/sentinel.conf'
-      ]
-    volumes:
-      - ./infra/redis/sentinel.conf:/etc/redis/sentinel.conf:ro
-    depends_on:
-      - redis-master
-    networks:
-      - data-net
-    restart: unless-stopped
-
-  rabbitmq:
-    image: rabbitmq:3.13-management-alpine
-    container_name: rabbitmq
-    environment:
-      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER}
-      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS}
-    volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
-    ports:
-      - "15672:15672"
-    networks:
-      - data-net
-    restart: unless-stopped
-
-  minio:
-    image: minio/minio:latest
-    container_name: minio
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
-    volumes:
-      - minio_data:/data
-    ports:
-      - "9000:9000"
-      - "9001:9001"
-    networks:
-      - data-net
-    restart: unless-stopped
-
-  opensearch:
-    image: opensearchproject/opensearch:2.18.0
-    container_name: opensearch
-    environment:
-      - discovery.type=single-node
-      - bootstrap.memory_lock=true
-      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
-      - DISABLE_SECURITY_PLUGIN=true
-    ulimits:
-      memlock:
-        soft: -1
-        hard: -1
-    volumes:
-      - opensearch_data:/usr/share/opensearch/data
-    ports:
-      - "9200:9200"
-    networks:
-      - data-net
-    restart: unless-stopped
-
-  vault:
-    image: hashicorp/vault:1.18
-    container_name: vault
-    cap_add:
-      - IPC_LOCK
-    environment:
-      VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_DEV_ROOT_TOKEN_ID}
-      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
-    command: vault server -dev
-    ports:
-      - "8200:8200"
-    networks:
-      - app-net
-      - data-net
-    restart: unless-stopped
-
-  keycloak:
-    image: quay.io/keycloak/keycloak:26.1
-    container_name: keycloak
-    command: start-dev --import-realm
-    environment:
-      KC_DB: postgres
-      KC_DB_URL_HOST: postgres-primary
-      KC_DB_URL_DATABASE: ${POSTGRES_DB}
-      KC_DB_USERNAME: ${POSTGRES_USER}
-      KC_DB_PASSWORD: ${POSTGRES_PASSWORD}
-      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN}
-      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
-    volumes:
-      - ./infra/keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
-    ports:
-      - "8081:8080"
-    depends_on:
-      - postgres-primary
-    networks:
-      - app-net
-      - data-net
-    restart: unless-stopped
-
+  # ── Observability (opt-in): docker compose --profile observability up ──
   prometheus:
     image: prom/prometheus:v2.55.0
     container_name: prometheus
+    profiles: ["observability"]
     command:
       - --config.file=/etc/prometheus/prometheus.yml
     volumes:
@@ -300,6 +114,7 @@ services:
   grafana:
     image: grafana/grafana:11.3.0
     container_name: grafana
+    profiles: ["observability"]
     volumes:
       - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
@@ -310,116 +125,6 @@ services:
       - app-net
     restart: unless-stopped
 
-  api-gateway:
-    build:
-      context: .
-      dockerfile: services/api-gateway/Dockerfile
-    container_name: api-gateway
-    env_file:
-      - .env
-    depends_on:
-      - rabbitmq
-      - redis-master
-      - postgres-primary
-      - webhook-ingestor
-      - notification-worker
-      - meta-adapter
-      - billing-usage-service
-      - reporting-service
-      - ai-intelligence-service
-    ports:
-      - "18080:8080"
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "node",
-          "-e",
-          "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
-        ]
-      interval: 30s
-      timeout: 5s
-      retries: 5
-      start_period: 20s
-    networks:
-      - app-net
-      - data-net
-    restart: unless-stopped
-
-  meta-adapter:
-    build:
-      context: .
-      dockerfile: services/meta-adapter/Dockerfile
-    env_file:
-      - .env
-    networks:
-      - app-net
-      - data-net
-    restart: unless-stopped
-
-  webhook-ingestor:
-    build:
-      context: .
-      dockerfile: services/webhook-ingestor/Dockerfile
-    env_file:
-      - .env
-    networks:
-      - app-net
-      - data-net
-    restart: unless-stopped
-
-  notification-worker:
-    build:
-      context: .
-      dockerfile: services/notification-worker/Dockerfile
-    env_file:
-      - .env
-    depends_on:
-      - rabbitmq
-    networks:
-      - app-net
-      - data-net
-    restart: unless-stopped
-
-  ai-intelligence-service:
-    build:
-      context: .
-      dockerfile: services/ai-intelligence-service/Dockerfile
-    env_file:
-      - .env
-    networks:
-      - app-net
-      - data-net
-    restart: unless-stopped
-
-  billing-usage-service:
-    build:
-      context: .
-      dockerfile: services/billing-usage-service/Dockerfile
-    container_name: billing-usage-service
-    env_file:
-      - .env
-    depends_on:
-      - postgres-primary
-    networks:
-      - app-net
-      - data-net
-    restart: unless-stopped
-
-  reporting-service:
-    build:
-      context: .
-      dockerfile: services/reporting-service/Dockerfile
-    container_name: reporting-service
-    env_file:
-      - .env
-    depends_on:
-      - postgres-primary
-    networks:
-      - app-net
-      - data-net
-    restart: unless-stopped
-
 networks:
   dmz-net:
   app-net:
@@ -427,12 +132,6 @@ networks:
 
 volumes:
   pg_primary_data:
-  pg_standby_data:
-  pg_replica_data:
   redis_master_data:
-  redis_replica_data:
-  rabbitmq_data:
-  minio_data:
-  opensearch_data:
   prometheus_data:
   grafana_data:
