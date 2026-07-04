@@ -1,12 +1,15 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID, createHash, scrypt, randomBytes, timingSafeEqual } from "node:crypto";
 import { promisify } from "node:util";
+import { argv } from "node:process";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const scryptAsync = promisify(scrypt);
 import { evaluateOutboundPolicy } from "@hyfib/policy-engine";
 import { loadConfig } from "@hyfib/config";
 import { createAuthenticator, hasAnyRole, normalizeRoles, AuthError, type AuthContext } from "@hyfib/auth";
-import { createEventBus } from "@hyfib/event-bus";
+import { createEventBus, type EventBus } from "@hyfib/event-bus";
 import {
   auditRepository,
   autoReplyRuleRepository,
@@ -227,8 +230,108 @@ const AUTOMATION_ACTIONS = new Set<AutomationActionType>(["send_template", "assi
 const config = loadConfig();
 const logger = new Logger("api-gateway", config.logLevel as "debug" | "info" | "warn" | "error");
 const authenticator = createAuthenticator(config);
-const eventBus = createEventBus(config);
+let eventBus = createEventBus(config);
 const webhookIdempotency = new RedisIdempotencyStore(getRedisClient(config), 24 * 60 * 60);
+
+// Internal proxy to the webhook-ingestor. Injectable so the modular monolith
+// swaps in a direct in-process call instead of HTTP (Phase 3).
+export type IngestWebhookProxy = (forwarded: {
+  rawBody: string;
+  signature?: string;
+  tenantId?: string;
+}) => Promise<{ ok: boolean; body: unknown }>;
+
+async function defaultIngestWebhookProxy(forwarded: {
+  rawBody: string;
+  signature?: string;
+}): Promise<{ ok: boolean; body: unknown }> {
+  const proxyResponse = await fetch(`${config.webhookIngestorUrl}/internal/v1/webhooks/meta/whatsapp`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-request-id": randomUUID() },
+    body: JSON.stringify({ rawBody: forwarded.rawBody, signature: forwarded.signature }),
+    signal: AbortSignal.timeout(10_000)
+  });
+  const body = (await proxyResponse.json()) as unknown;
+  return { ok: proxyResponse.ok, body };
+}
+
+let ingestWebhookProxy: IngestWebhookProxy = defaultIngestWebhookProxy;
+
+// Internal proxies to the small read/AI services. Injectable so the monolith
+// swaps them for direct in-process calls (Phases 6–8).
+export interface ServiceProxyContext {
+  tenantId: string;
+  requestId: string;
+}
+export type ReportsOverviewProxy = (
+  ctx: ServiceProxyContext
+) => Promise<{ status: number; body: Record<string, unknown> }>;
+export type UsageProxy = (
+  ctx: ServiceProxyContext,
+  days: string
+) => Promise<{ status: number; body: Record<string, unknown> }>;
+export type AiProxy = (
+  ctx: ServiceProxyContext,
+  aiPath: string,
+  method: string,
+  rawBody?: string
+) => Promise<{ status: number; body: Record<string, unknown> }>;
+
+async function defaultReportsOverviewProxy(
+  ctx: ServiceProxyContext
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const upstream = await fetch(`${config.reportingServiceUrl}/internal/v1/reports/overview`, {
+    headers: {
+      "x-tenant-id": ctx.tenantId,
+      "x-request-id": ctx.requestId,
+      "x-internal-secret": config.internalServiceSecret
+    },
+    signal: AbortSignal.timeout(10_000)
+  });
+  const body = (await upstream.json()) as Record<string, unknown>;
+  return { status: upstream.ok ? 200 : upstream.status, body };
+}
+
+async function defaultUsageProxy(
+  ctx: ServiceProxyContext,
+  days: string
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const upstream = await fetch(`${config.billingUsageServiceUrl}/internal/v1/usage?days=${encodeURIComponent(days)}`, {
+    headers: {
+      "x-tenant-id": ctx.tenantId,
+      "x-request-id": ctx.requestId,
+      "x-internal-secret": config.internalServiceSecret
+    },
+    signal: AbortSignal.timeout(10_000)
+  });
+  const body = (await upstream.json()) as Record<string, unknown>;
+  return { status: upstream.ok ? 200 : upstream.status, body };
+}
+
+async function defaultAiProxy(
+  ctx: ServiceProxyContext,
+  aiPath: string,
+  method: string,
+  rawBody?: string
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const upstream = await fetch(`${config.aiIntelligenceUrl}/internal/v1/ai/${aiPath}`, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      "x-tenant-id": ctx.tenantId,
+      "x-request-id": ctx.requestId,
+      "x-internal-secret": config.internalServiceSecret
+    },
+    ...(rawBody !== undefined ? { body: rawBody } : {}),
+    signal: AbortSignal.timeout(90_000)
+  });
+  const body = (await upstream.json()) as Record<string, unknown>;
+  return { status: upstream.ok ? 200 : upstream.status, body };
+}
+
+let reportsOverviewProxy: ReportsOverviewProxy = defaultReportsOverviewProxy;
+let usageProxy: UsageProxy = defaultUsageProxy;
+let aiProxy: AiProxy = defaultAiProxy;
 
 const E164 = /^\+[1-9]\d{7,14}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -1009,13 +1112,22 @@ async function forwardEventToSse(event: EventEnvelope): Promise<void> {
 }
 
 const sseQueuePrefix = `api-gateway-sse.${randomUUID().slice(0, 8)}`;
-eventBus.subscribe(EventTopics.WhatsAppInboundReceived, `${sseQueuePrefix}.inbound`, forwardEventToSse, {
-  ephemeral: true
-});
-eventBus.subscribe(EventTopics.WhatsAppStatusUpdated, `${sseQueuePrefix}.status`, forwardEventToSse, {
-  ephemeral: true
-});
-sseHub.startKeepAlive();
+
+/**
+ * Subscribe SSE fan-out to the (possibly shared) event bus and start the
+ * keep-alive ticker. Deferred out of module scope so the modular monolith can
+ * inject its shared bus via createGatewayHandler() before any subscription is
+ * registered; the standalone entrypoint calls it too.
+ */
+function registerSseForwarding(): void {
+  eventBus.subscribe(EventTopics.WhatsAppInboundReceived, `${sseQueuePrefix}.inbound`, forwardEventToSse, {
+    ephemeral: true
+  });
+  eventBus.subscribe(EventTopics.WhatsAppStatusUpdated, `${sseQueuePrefix}.status`, forwardEventToSse, {
+    ephemeral: true
+  });
+  sseHub.startKeepAlive();
+}
 
 // ─── Request handler ───────────────────────────────────────────────────────────
 
@@ -1118,14 +1230,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         }
       }
     }
-    const proxyResponse = await fetch(`${config.webhookIngestorUrl}/internal/v1/webhooks/meta/whatsapp`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-request-id": randomUUID() },
-      body: JSON.stringify({ rawBody, signature: normalizedSignature }),
-      signal: AbortSignal.timeout(10_000)
-    });
-    const proxyBody = (await proxyResponse.json()) as Record<string, unknown>;
-    sendJson(res, proxyResponse.ok ? 200 : 502, { requestId: ctx.requestId, upstream: proxyBody });
+    const { ok, body: proxyBody } = await ingestWebhookProxy({ rawBody, signature: normalizedSignature });
+    sendJson(res, ok ? 200 : 502, { requestId: ctx.requestId, upstream: proxyBody });
     return;
   }
 
@@ -3015,35 +3121,16 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 
   // ─── Reporting service proxy ──────────────────────────────────────────────
   if (path === "/api/v1/reports/overview" && method === "GET") {
-    const upstream = await fetch(`${config.reportingServiceUrl}/internal/v1/reports/overview`, {
-      headers: {
-        "x-tenant-id": tenantId,
-        "x-request-id": ctx.requestId,
-        "x-internal-secret": config.internalServiceSecret
-      },
-      signal: AbortSignal.timeout(10_000)
-    });
-    const body = (await upstream.json()) as Record<string, unknown>;
-    sendJson(res, upstream.ok ? 200 : upstream.status, body);
+    const { status, body } = await reportsOverviewProxy({ tenantId, requestId: ctx.requestId });
+    sendJson(res, status, body);
     return;
   }
 
   // ─── Billing / usage proxy ────────────────────────────────────────────────
   if (path === "/api/v1/usage" && method === "GET") {
     const days = parseQuery(req.url).get("days") ?? "7";
-    const upstream = await fetch(
-      `${config.billingUsageServiceUrl}/internal/v1/usage?days=${encodeURIComponent(days)}`,
-      {
-        headers: {
-          "x-tenant-id": tenantId,
-          "x-request-id": ctx.requestId,
-          "x-internal-secret": config.internalServiceSecret
-        },
-        signal: AbortSignal.timeout(10_000)
-      }
-    );
-    const body = (await upstream.json()) as Record<string, unknown>;
-    sendJson(res, upstream.ok ? 200 : upstream.status, body);
+    const { status, body } = await usageProxy({ tenantId, requestId: ctx.requestId }, days);
+    sendJson(res, status, body);
     return;
   }
 
@@ -3056,79 +3143,143 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return;
     }
     const raw = method === "POST" ? await readRawBody(req) : undefined;
-    const upstream = await fetch(`${config.aiIntelligenceUrl}/internal/v1/ai/${aiPath}`, {
-      method,
-      headers: {
-        "Content-Type": "application/json",
-        "x-tenant-id": tenantId,
-        "x-request-id": ctx.requestId,
-        "x-internal-secret": config.internalServiceSecret
-      },
-      ...(raw !== undefined ? { body: raw } : {}),
-      signal: AbortSignal.timeout(90_000)
-    });
-    const body = (await upstream.json()) as Record<string, unknown>;
-    sendJson(res, upstream.ok ? 200 : upstream.status, body);
+    const { status, body } = await aiProxy({ tenantId, requestId: ctx.requestId }, aiPath, method, raw);
+    sendJson(res, status, body);
     return;
   }
 
   sendJson(res, 404, { error: "route_not_found", method, path, requestId: ctx.requestId });
 }
 
-// ─── Server lifecycle ─────────────────────────────────────────────────────────
+// ─── Modular-monolith mount point ───────────────────────────────────────────
 
-const server = createServer((req, res) => {
-  applySecurityHeaders(res);
-  handle(req, res).catch((error) => {
-    logger.error("request_failed", {
-      method: req.method,
-      url: req.url,
-      error: error instanceof Error ? error.message : String(error)
-    });
-    if (!res.headersSent) {
-      sendJson(res, 500, { error: "internal_error" });
-    } else {
-      res.end();
-    }
-  });
-});
-
-const relayTimer = startOutboxRelay();
-const schedulerTimer = startCampaignScheduler();
-const noReplyTimer = startNoReplyScheduler();
-const reminderTimer = startReminderScheduler();
-const sessionPurgeTimer = startSessionPurgeScheduler();
-
-await bootstrapPlatformAdmin();
-
-server.listen(config.apiGatewayPort, () => {
-  logger.info("service_started", {
-    port: config.apiGatewayPort,
-    nodeEnv: config.nodeEnv,
-    authEnabled: config.authEnabled
-  });
-});
-
-server.on("error", (error) => {
-  logger.error("service_error", { error: error instanceof Error ? error.message : String(error) });
-});
-
-async function shutdown(signal: string): Promise<void> {
-  logger.info("shutdown_started", { signal });
-  clearInterval(relayTimer);
-  clearInterval(schedulerTimer);
-  clearInterval(noReplyTimer);
-  clearInterval(reminderTimer);
-  clearInterval(sessionPurgeTimer);
-  sseHub.close();
-  server.close(async () => {
-    await eventBus.close().catch(() => undefined);
-    await closePool().catch(() => undefined);
-    logger.info("shutdown_complete", { signal });
-    process.exit(0);
-  });
-  setTimeout(() => process.exit(0), 10_000).unref();
+export interface GatewayDeps {
+  /**
+   * Shared in-process event bus. When provided (by app-server) the gateway
+   * publishes/consumes on it so worker consumers see gateway-published events;
+   * when omitted the gateway uses its own bus (standalone service).
+   */
+  eventBus?: EventBus;
+  /**
+   * Direct in-process webhook ingestion. When provided the gateway calls it
+   * instead of proxying to the webhook-ingestor over HTTP (Phase 3).
+   */
+  proxyWebhookToIngestor?: IngestWebhookProxy;
+  /** Direct in-process reports/overview (Phase 8). */
+  proxyReportsOverview?: ReportsOverviewProxy;
+  /** Direct in-process usage (Phase 7). */
+  proxyUsage?: UsageProxy;
+  /** Direct in-process AI intelligence (Phase 6). */
+  proxyAi?: AiProxy;
 }
 
-process.on("SIGTERM", () => void shutdown("SIGTERM"));
-process.on("SIGINT", () => void shutdown("SIGINT"));
+export interface GatewayModule {
+  handle: (req: IncomingMessage, res: ServerResponse) => Promise<void>;
+  applySecurityHeaders: (res: ServerResponse) => void;
+  startSchedulers: () => NodeJS.Timeout[];
+  bootstrapPlatformAdmin: () => Promise<void>;
+  close: () => Promise<void>;
+}
+
+/**
+ * Composition seam for the modular monolith. Injects the shared event bus (if
+ * given), registers SSE forwarding on it, and returns the request handler plus
+ * lifecycle hooks. All request/scheduler logic above is unchanged — this only
+ * wires it into a host process (standalone service or app-server).
+ */
+export function createGatewayHandler(deps: GatewayDeps = {}): GatewayModule {
+  if (deps.eventBus) {
+    eventBus = deps.eventBus;
+  }
+  if (deps.proxyWebhookToIngestor) {
+    ingestWebhookProxy = deps.proxyWebhookToIngestor;
+  }
+  if (deps.proxyReportsOverview) {
+    reportsOverviewProxy = deps.proxyReportsOverview;
+  }
+  if (deps.proxyUsage) {
+    usageProxy = deps.proxyUsage;
+  }
+  if (deps.proxyAi) {
+    aiProxy = deps.proxyAi;
+  }
+  registerSseForwarding();
+  return {
+    handle,
+    applySecurityHeaders,
+    startSchedulers: () => [
+      startOutboxRelay(),
+      startCampaignScheduler(),
+      startNoReplyScheduler(),
+      startReminderScheduler(),
+      startSessionPurgeScheduler()
+    ],
+    bootstrapPlatformAdmin,
+    close: async () => {
+      await eventBus.close().catch(() => undefined);
+    }
+  };
+}
+
+// ─── Standalone entrypoint ──────────────────────────────────────────────────
+
+async function startStandalone(): Promise<void> {
+  const gateway = createGatewayHandler();
+
+  const server = createServer((req, res) => {
+    gateway.applySecurityHeaders(res);
+    gateway.handle(req, res).catch((error) => {
+      logger.error("request_failed", {
+        method: req.method,
+        url: req.url,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      if (!res.headersSent) {
+        sendJson(res, 500, { error: "internal_error" });
+      } else {
+        res.end();
+      }
+    });
+  });
+
+  const schedulerTimers = gateway.startSchedulers();
+
+  await gateway.bootstrapPlatformAdmin();
+
+  server.listen(config.apiGatewayPort, () => {
+    logger.info("service_started", {
+      port: config.apiGatewayPort,
+      nodeEnv: config.nodeEnv,
+      authEnabled: config.authEnabled
+    });
+  });
+
+  server.on("error", (error) => {
+    logger.error("service_error", { error: error instanceof Error ? error.message : String(error) });
+  });
+
+  const shutdown = async (signal: string): Promise<void> => {
+    logger.info("shutdown_started", { signal });
+    for (const timer of schedulerTimers) {
+      clearInterval(timer);
+    }
+    sseHub.close();
+    server.close(async () => {
+      await gateway.close();
+      await closePool().catch(() => undefined);
+      logger.info("shutdown_complete", { signal });
+      process.exit(0);
+    });
+    setTimeout(() => process.exit(0), 10_000).unref();
+  };
+
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+}
+
+// Boot the standalone HTTP service only when executed directly, never when
+// imported by app-server or tests.
+const isMain = argv[1] !== undefined && resolve(argv[1]) === fileURLToPath(import.meta.url);
+if (isMain) {
+  void startStandalone();
+}

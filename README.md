@@ -4,8 +4,8 @@ Production-grade on-prem multi-tenant WhatsApp Business Platform for marketing, 
 
 ## What is included
 
-- Multi-service Node.js/TypeScript monorepo with Docker Compose orchestration.
-- Web-based multi-user `web-portal` with tenant/role context controls.
+- Modular-monolith Node.js/TypeScript monorepo (`app-server`) with Docker Compose orchestration.
+- React `web-app` SPA with tenant/role context controls.
 - WhatsApp Cloud API integration contract and webhook security baseline.
 - Consent-first compliance controls (GDPR + India DPDP aligned).
 - Campaign guardrails: opt-in enforcement, quiet hours, template category protection.
@@ -15,7 +15,7 @@ Production-grade on-prem multi-tenant WhatsApp Business Platform for marketing, 
 
 ## Core API contracts
 
-Implemented at `api-gateway`:
+Implemented by the `app-server` gateway module (external contract unchanged):
 
 - `/api/v1/tenants`
 - `/api/v1/users`
@@ -41,23 +41,38 @@ contact out automatically; **START** re-subscribes.
 
 Web entrypoint:
 
-- `/` via `web-portal` (proxied by `edge-proxy`)
+- `/` via `web-app` (React SPA, proxied by `edge-proxy`)
 
-## Architecture (consolidated)
+## Architecture (modular monolith)
 
-Real logic is concentrated in a small set of services that are simple to run
-and secure on a single on-prem host:
+The backend runs as a single **`app-server`** process — a modular monolith that
+composes the former services as in-process modules over a shared event bus
+(`EVENT_BUS=memory`; RabbitMQ remains an opt-in scale-out escape hatch). The
+runtime topology is five containers: `edge-proxy`, `app-server`, `web-app`,
+`postgres-primary`, `redis-master` (Prometheus + Grafana are opt-in via
+`docker compose --profile observability`).
 
-- `api-gateway` — authenticated, PostgreSQL-backed core API (tenants, users,
-  channels, templates, campaigns, contacts, orders, analytics, audit, webhooks).
-- `meta-adapter` — WhatsApp Cloud API integration.
-- `webhook-ingestor` — inbound webhook ingestion with HMAC verification.
-- `notification-worker` — template send execution.
-- `ai-intelligence-service` — internal backoffice intelligence.
-- `web-portal` — operator UI.
+`app-server` wires these modules (each still a workspace package under
+`services/*`, imported as a library so its logic is never duplicated):
 
-Authentication is performed against **Keycloak (OIDC/JWT)**; the gateway derives
-tenant and roles from signed token claims (no header trust). All tenant data is
+- **gateway** (`api-gateway`) — authenticated, PostgreSQL-backed core API
+  (tenants, users, channels, templates, campaigns, contacts, orders, analytics,
+  audit, webhooks) + SSE + schedulers (outbox relay, campaign/no-reply/reminder,
+  session purge).
+- **ingestor** (`webhook-ingestor`) — inbound webhook normalize + publish (HMAC verified).
+- **meta** (`meta-adapter`) — WhatsApp Cloud API client (send + mark-read).
+- **worker** (`notification-worker`) — event consumers: campaign dispatch, inbound,
+  status, outbound, automation.
+- **ai / billing / reporting** — internal backoffice intelligence, usage, and reports.
+- **web-app** — React SPA (served by its own nginx container).
+
+Internal service-to-service HTTP (`/internal/v1/*`) is gone: modules call each
+other as direct functions in one process. Each `services/*` package keeps a
+guarded standalone entrypoint, so any module can still be run as its own process
+(set `EVENT_BUS=rabbitmq` for cross-process eventing).
+
+Runtime authentication uses **native database sessions** (scrypt-hashed
+passwords, `sessions` table, Bearer token in `Authorization`). All tenant data is
 stored in PostgreSQL with **row-level security**, enforced by connecting as a
 dedicated non-superuser role (`hyfib_app`).
 
@@ -89,7 +104,7 @@ docker compose ps
 
 ```bash
 curl -k https://localhost/health        # via edge proxy (TLS)
-curl http://localhost:18080/health      # api-gateway direct (DB-backed)
+curl http://localhost:18080/health      # app-server direct (DB-backed)
 ```
 
 5. Open the web app: `https://localhost`

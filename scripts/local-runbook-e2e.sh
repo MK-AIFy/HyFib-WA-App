@@ -96,25 +96,14 @@ require_env WHATSAPP_WABA_ID
 require_env WHATSAPP_PHONE_NUMBER_ID
 require_env WHATSAPP_REGISTER_PIN
 
-APP_NET="$(docker network ls --format '{{.Name}}' | grep '_app-net$' | head -n1 || true)"
-if [[ -z "${APP_NET}" ]]; then
-  echo "Could not detect app network (*_app-net)."
-  exit 1
-fi
-echo "APP_NET=${APP_NET}"
-
-docker run --rm --network "${APP_NET}" "${CURL_IMAGE}" -fsS -X POST \
-  "http://meta-adapter:8092/internal/v1/whatsapp/subscribe-app" \
-  -H 'content-type: application/json' \
-  -d "{\"wabaId\":\"${WHATSAPP_WABA_ID}\"}" | jq .
-
-docker run --rm --network "${APP_NET}" "${CURL_IMAGE}" -fsS \
-  "http://meta-adapter:8092/internal/v1/whatsapp/phone-numbers?wabaId=${WHATSAPP_WABA_ID}" | jq .
-
-docker run --rm --network "${APP_NET}" "${CURL_IMAGE}" -fsS -X POST \
-  "http://meta-adapter:8092/internal/v1/whatsapp/register-number" \
-  -H 'content-type: application/json' \
-  -d "{\"phoneNumberId\":\"${WHATSAPP_PHONE_NUMBER_ID}\",\"pin\":\"${WHATSAPP_REGISTER_PIN}\"}" | jq .
+# NOTE (modular monolith): the meta-adapter is now an in-process module of
+# app-server, not a standalone container, so its internal provisioning endpoints
+# (subscribe-app / phone-numbers / register-number) are not reachable over the
+# network. WhatsApp number provisioning is a one-time real-Meta step — do it via
+# the Meta dashboard, or run a standalone meta-adapter
+# (node services/meta-adapter/dist/index.js) with real WABA credentials. See
+# docs/runbooks/whatsapp-marketing-number-onboarding.md.
+echo "Skipping direct meta-adapter provisioning (in-process module in the monolith)."
 
 curl -fsS -X POST "${BASE_URL}/api/v1/channels/whatsapp" \
   -H 'content-type: application/json' \
@@ -240,7 +229,7 @@ curl -fsS "${BASE_URL}/api/v1/audit" \
   -H "x-tenant-id: ${TENANT_ID}" | jq .
 
 echo "[9/9] Service logs"
-docker compose logs --tail 100 api-gateway webhook-ingestor notification-worker meta-adapter
+docker compose logs --tail 100 app-server
 
 echo
 echo "Run completed."

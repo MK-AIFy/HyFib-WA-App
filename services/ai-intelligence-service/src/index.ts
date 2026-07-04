@@ -1,11 +1,13 @@
 import { createServer } from "node:http";
+import { argv } from "node:process";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { loadConfig } from "@hyfib/config";
 import {
   Logger,
-  methodNotAllowed,
   notFound,
   parseUrlPath,
-  readJsonBody,
+  readRawBody,
   redactPII,
   requestContext,
   sendJson,
@@ -127,6 +129,112 @@ async function runWithFallback(
   }
 }
 
+function safeParse<T>(raw: string | undefined): T {
+  try {
+    return (raw ? JSON.parse(raw) : {}) as T;
+  } catch {
+    return {} as T;
+  }
+}
+
+/**
+ * Route an `/internal/v1/ai/*` request to the matching handler, returning the
+ * status + body the HTTP endpoint produces. Exported so app-server calls it
+ * directly in-process (the gateway forwards the raw JSON body).
+ */
+export async function dispatchAi(
+  aiPath: string,
+  method: string,
+  rawBody: string | undefined,
+  requestId: string
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  if (method !== "POST") {
+    return { status: 405, body: { error: "method_not_allowed" } };
+  }
+
+  if (aiPath === "campaign-draft") {
+    const payload = safeParse<DraftCampaignRequest>(rawBody);
+    const VALID_TONES = ["professional", "friendly", "urgent"] as const;
+    if (!payload.objective || !payload.audienceDescription || !payload.offer || !payload.tone || !payload.language) {
+      return { status: 400, body: { error: "objective, audienceDescription, offer, tone and language are required" } };
+    }
+    if (!VALID_TONES.includes(payload.tone as (typeof VALID_TONES)[number])) {
+      return { status: 400, body: { error: `tone must be one of: ${VALID_TONES.join(", ")}` } };
+    }
+    if (
+      String(payload.objective).length > 500 ||
+      String(payload.audienceDescription).length > 500 ||
+      String(payload.offer).length > 500 ||
+      String(payload.language).length > 50
+    ) {
+      return {
+        status: 400,
+        body: { error: "objective, audienceDescription, offer must be ≤500 chars; language ≤50 chars" }
+      };
+    }
+    const system =
+      "You are a B2B WhatsApp marketing assistant. Output policy-safe campaign drafts only. Never bypass consent or template policy.";
+    const user = `Create a concise campaign draft. Objective: ${payload.objective}. Audience: ${payload.audienceDescription}. Offer: ${payload.offer}. Tone: ${payload.tone}. Language: ${payload.language}. Include a clear opt-out reminder.`;
+    const result = await runWithFallback(system, user, fallbackCampaignDraft(payload));
+    return { status: 200, body: { requestId, mode: result.mode, draft: result.text } };
+  }
+
+  if (aiPath === "segment-summary") {
+    const payload = safeParse<SegmentSummaryRequest>(rawBody);
+    if (!payload.segmentName || typeof payload.contacts !== "number" || payload.contacts <= 0) {
+      return { status: 400, body: { error: "segmentName and contacts (>0) are required" } };
+    }
+    if (String(payload.segmentName).length > 200) {
+      return { status: 400, body: { error: "segmentName must be ≤200 chars" } };
+    }
+    const cr = Number(payload.conversionRate);
+    const oor = Number(payload.optOutRate);
+    if (!Number.isFinite(cr) || cr < 0 || cr > 100 || !Number.isFinite(oor) || oor < 0 || oor > 1) {
+      return { status: 400, body: { error: "conversionRate must be 0-100; optOutRate must be 0-1" } };
+    }
+    const system = "You summarize marketing segment quality and operational risk for internal analysts.";
+    const user = `Summarize segment ${payload.segmentName} with contacts=${payload.contacts}, conversionRate=${payload.conversionRate}, optOutRate=${payload.optOutRate}. Output max 5 bullet points.`;
+    const result = await runWithFallback(system, user, fallbackSegmentSummary(payload));
+    return { status: 200, body: { requestId, mode: result.mode, summary: result.text } };
+  }
+
+  if (aiPath === "lead-score") {
+    const payload = safeParse<LeadScoreRequest>(rawBody);
+    const rd = Number(payload.recencyDays);
+    const es = Number(payload.engagementScore);
+    const pc = Number(payload.purchaseCount);
+    const aov = Number(payload.averageOrderValue);
+    if (
+      !Number.isFinite(rd) || rd < 0 || rd > 3650 ||
+      !Number.isFinite(es) || es < 0 || es > 100 ||
+      !Number.isFinite(pc) || pc < 0 ||
+      !Number.isFinite(aov) || aov < 0
+    ) {
+      return {
+        status: 400,
+        body: { error: "recencyDays 0-3650, engagementScore 0-100, purchaseCount ≥0, averageOrderValue ≥0 required" }
+      };
+    }
+    const score = fallbackLeadScore(payload);
+    return {
+      status: 200,
+      body: {
+        requestId,
+        score,
+        scale: "0-100",
+        recommendation:
+          score >= 75
+            ? "Prioritize for marketing follow-up"
+            : score >= 45
+              ? "Nurture with informational template"
+              : "Low priority; suppress from high-frequency campaigns"
+      }
+    };
+  }
+
+  return { status: 404, body: { error: "route_not_found" } };
+}
+
 const server = createServer(async (req, res) => {
   try {
   const path = parseUrlPath(req.url);
@@ -160,114 +268,11 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  if (path === "/internal/v1/ai/campaign-draft") {
-    if (method !== "POST") {
-      methodNotAllowed(res);
-      return;
-    }
-
-    const payload = await readJsonBody<DraftCampaignRequest>(req);
-    const VALID_TONES = ["professional", "friendly", "urgent"] as const;
-    if (!payload.objective || !payload.audienceDescription || !payload.offer || !payload.tone || !payload.language) {
-      sendJson(res, 400, { error: "objective, audienceDescription, offer, tone and language are required" });
-      return;
-    }
-    if (!VALID_TONES.includes(payload.tone as (typeof VALID_TONES)[number])) {
-      sendJson(res, 400, { error: `tone must be one of: ${VALID_TONES.join(", ")}` });
-      return;
-    }
-    if (
-      String(payload.objective).length > 500 ||
-      String(payload.audienceDescription).length > 500 ||
-      String(payload.offer).length > 500 ||
-      String(payload.language).length > 50
-    ) {
-      sendJson(res, 400, { error: "objective, audienceDescription, offer must be ≤500 chars; language ≤50 chars" });
-      return;
-    }
-
-    const system =
-      "You are a B2B WhatsApp marketing assistant. Output policy-safe campaign drafts only. Never bypass consent or template policy.";
-    const user = `Create a concise campaign draft. Objective: ${payload.objective}. Audience: ${payload.audienceDescription}. Offer: ${payload.offer}. Tone: ${payload.tone}. Language: ${payload.language}. Include a clear opt-out reminder.`;
-    const fallback = fallbackCampaignDraft(payload);
-
-    const result = await runWithFallback(system, user, fallback);
-    sendJson(res, 200, {
-      requestId: ctx.requestId,
-      mode: result.mode,
-      draft: result.text
-    });
-    return;
-  }
-
-  if (path === "/internal/v1/ai/segment-summary") {
-    if (method !== "POST") {
-      methodNotAllowed(res);
-      return;
-    }
-
-    const payload = await readJsonBody<SegmentSummaryRequest>(req);
-    if (!payload.segmentName || typeof payload.contacts !== "number" || payload.contacts <= 0) {
-      sendJson(res, 400, { error: "segmentName and contacts (>0) are required" });
-      return;
-    }
-    if (String(payload.segmentName).length > 200) {
-      sendJson(res, 400, { error: "segmentName must be ≤200 chars" });
-      return;
-    }
-    const cr = Number(payload.conversionRate);
-    const oor = Number(payload.optOutRate);
-    if (!Number.isFinite(cr) || cr < 0 || cr > 100 || !Number.isFinite(oor) || oor < 0 || oor > 1) {
-      sendJson(res, 400, { error: "conversionRate must be 0-100; optOutRate must be 0-1" });
-      return;
-    }
-
-    const system = "You summarize marketing segment quality and operational risk for internal analysts.";
-    const user = `Summarize segment ${payload.segmentName} with contacts=${payload.contacts}, conversionRate=${payload.conversionRate}, optOutRate=${payload.optOutRate}. Output max 5 bullet points.`;
-    const fallback = fallbackSegmentSummary(payload);
-
-    const result = await runWithFallback(system, user, fallback);
-    sendJson(res, 200, {
-      requestId: ctx.requestId,
-      mode: result.mode,
-      summary: result.text
-    });
-    return;
-  }
-
-  if (path === "/internal/v1/ai/lead-score") {
-    if (method !== "POST") {
-      methodNotAllowed(res);
-      return;
-    }
-
-    const payload = await readJsonBody<LeadScoreRequest>(req);
-    const rd = Number(payload.recencyDays);
-    const es = Number(payload.engagementScore);
-    const pc = Number(payload.purchaseCount);
-    const aov = Number(payload.averageOrderValue);
-    if (
-      !Number.isFinite(rd) || rd < 0 || rd > 3650 ||
-      !Number.isFinite(es) || es < 0 || es > 100 ||
-      !Number.isFinite(pc) || pc < 0 ||
-      !Number.isFinite(aov) || aov < 0
-    ) {
-      sendJson(res, 400, { error: "recencyDays 0-3650, engagementScore 0-100, purchaseCount ≥0, averageOrderValue ≥0 required" });
-      return;
-    }
-    const score = fallbackLeadScore(payload);
-
-    sendJson(res, 200, {
-      requestId: ctx.requestId,
-      score,
-      scale: "0-100",
-      recommendation:
-        score >= 75
-          ? "Prioritize for marketing follow-up"
-          : score >= 45
-            ? "Nurture with informational template"
-            : "Low priority; suppress from high-frequency campaigns"
-    });
+  if (path.startsWith("/internal/v1/ai/")) {
+    const aiPath = path.slice("/internal/v1/ai/".length);
+    const raw = await readRawBody(req);
+    const { status, body } = await dispatchAi(aiPath, method, raw, ctx.requestId);
+    sendJson(res, status, body);
     return;
   }
 
@@ -280,15 +285,20 @@ const server = createServer(async (req, res) => {
   }
 });
 
-server.listen(config.aiIntelligencePort, () => {
-  logger.info("service_started", {
-    port: config.aiIntelligencePort,
-    nodeEnv: config.nodeEnv
+// Boot the standalone service only when executed directly, never when imported
+// by app-server for its exported dispatchAi function.
+const isMain = argv[1] !== undefined && resolve(argv[1]) === fileURLToPath(import.meta.url);
+if (isMain) {
+  server.listen(config.aiIntelligencePort, () => {
+    logger.info("service_started", {
+      port: config.aiIntelligencePort,
+      nodeEnv: config.nodeEnv
+    });
   });
-});
 
-server.on("error", (error) => {
-  logger.error("service_error", {
-    error: error instanceof Error ? error.message : String(error)
+  server.on("error", (error) => {
+    logger.error("service_error", {
+      error: error instanceof Error ? error.message : String(error)
+    });
   });
-});
+}

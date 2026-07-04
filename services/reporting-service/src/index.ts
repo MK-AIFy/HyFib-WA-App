@@ -1,4 +1,7 @@
 import { createServer } from "node:http";
+import { argv } from "node:process";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { loadConfig } from "@hyfib/config";
 import { waitForReady, withTenant } from "@hyfib/db";
 import { Logger, notFound, parseUrlPath, requestContext, sendJson, sendMetrics } from "@hyfib/shared-core";
@@ -21,6 +24,48 @@ interface DailyRow {
 const config = loadConfig();
 const logger = new Logger("reporting-service", config.logLevel as "debug" | "info" | "warn" | "error");
 const port = config.reportingServicePort;
+
+/**
+ * Cross-entity reporting overview for a tenant. Exported so app-server calls it
+ * directly in-process; the standalone service's endpoint wraps it.
+ */
+export async function getReportsOverview(tenantId: string): Promise<Record<string, unknown>> {
+  const data = await withTenant(tenantId, async (tx) => {
+    const counts = await tx.queryOne<CountsRow>(
+      `SELECT
+        (SELECT COUNT(*)::text FROM conversations) AS conversations,
+        (SELECT COUNT(*)::text FROM contacts)      AS contacts,
+        (SELECT COUNT(*)::text FROM templates)     AS templates,
+        (SELECT COUNT(*)::text FROM campaigns)     AS campaigns,
+        (SELECT COUNT(*)::text FROM messages WHERE direction='inbound')  AS inbound,
+        (SELECT COUNT(*)::text FROM messages WHERE direction='outbound') AS outbound,
+        (SELECT COUNT(*)::text FROM messages WHERE status='failed')      AS failed`
+    );
+    const dailyRows = await tx.query<DailyRow>(
+      `SELECT to_char(date_trunc('day', created_at), 'YYYY-MM-DD') AS bucket_date,
+              COUNT(*)::text AS n
+         FROM messages
+        WHERE created_at >= now() - INTERVAL '14 days'
+        GROUP BY 1
+        ORDER BY 1 DESC`
+    );
+    return {
+      totals: counts
+        ? {
+            conversations: Number(counts.conversations),
+            contacts: Number(counts.contacts),
+            templates: Number(counts.templates),
+            campaigns: Number(counts.campaigns),
+            messagesInbound: Number(counts.inbound),
+            messagesOutbound: Number(counts.outbound),
+            messagesFailed: Number(counts.failed)
+          }
+        : {},
+      last14Days: dailyRows.map((r) => ({ date: r.bucket_date, count: Number(r.n) }))
+    };
+  });
+  return { tenantId, ...data };
+}
 
 const server = createServer(async (req, res) => {
   try {
@@ -48,43 +93,7 @@ const server = createServer(async (req, res) => {
         sendJson(res, 400, { error: "x-tenant-id required" });
         return;
       }
-
-      const data = await withTenant(tenantId, async (tx) => {
-        const counts = await tx.queryOne<CountsRow>(
-          `SELECT
-            (SELECT COUNT(*)::text FROM conversations) AS conversations,
-            (SELECT COUNT(*)::text FROM contacts)      AS contacts,
-            (SELECT COUNT(*)::text FROM templates)     AS templates,
-            (SELECT COUNT(*)::text FROM campaigns)     AS campaigns,
-            (SELECT COUNT(*)::text FROM messages WHERE direction='inbound')  AS inbound,
-            (SELECT COUNT(*)::text FROM messages WHERE direction='outbound') AS outbound,
-            (SELECT COUNT(*)::text FROM messages WHERE status='failed')      AS failed`
-        );
-        const dailyRows = await tx.query<DailyRow>(
-          `SELECT to_char(date_trunc('day', created_at), 'YYYY-MM-DD') AS bucket_date,
-                  COUNT(*)::text AS n
-             FROM messages
-            WHERE created_at >= now() - INTERVAL '14 days'
-            GROUP BY 1
-            ORDER BY 1 DESC`
-        );
-        return {
-          totals: counts
-            ? {
-                conversations: Number(counts.conversations),
-                contacts: Number(counts.contacts),
-                templates: Number(counts.templates),
-                campaigns: Number(counts.campaigns),
-                messagesInbound: Number(counts.inbound),
-                messagesOutbound: Number(counts.outbound),
-                messagesFailed: Number(counts.failed)
-              }
-            : {},
-          last14Days: dailyRows.map((r) => ({ date: r.bucket_date, count: Number(r.n) }))
-        };
-      });
-
-      sendJson(res, 200, { tenantId, ...data });
+      sendJson(res, 200, await getReportsOverview(tenantId));
       return;
     }
 
@@ -110,4 +119,9 @@ server.on("error", (error) => {
   logger.error("service_error", { error: error instanceof Error ? error.message : String(error) });
 });
 
-void bootstrap();
+// Boot the standalone service only when executed directly, never when imported
+// by app-server for its exported getReportsOverview function.
+const isMain = argv[1] !== undefined && resolve(argv[1]) === fileURLToPath(import.meta.url);
+if (isMain) {
+  void bootstrap();
+}

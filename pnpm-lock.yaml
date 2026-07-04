@@ -165,6 +165,48 @@ importers:
         specifier: workspace:*
         version: link:../../packages/shared-core
 
+  services/app-server:
+    dependencies:
+      '@hyfib/ai-intelligence-service':
+        specifier: workspace:*
+        version: link:../ai-intelligence-service
+      '@hyfib/api-gateway':
+        specifier: workspace:*
+        version: link:../api-gateway
+      '@hyfib/billing-usage-service':
+        specifier: workspace:*
+        version: link:../billing-usage-service
+      '@hyfib/config':
+        specifier: workspace:*
+        version: link:../../packages/config
+      '@hyfib/db':
+        specifier: workspace:*
+        version: link:../../packages/db
+      '@hyfib/event-bus':
+        specifier: workspace:*
+        version: link:../../packages/event-bus
+      '@hyfib/meta-adapter':
+        specifier: workspace:*
+        version: link:../meta-adapter
+      '@hyfib/notification-worker':
+        specifier: workspace:*
+        version: link:../notification-worker
+      '@hyfib/persistence':
+        specifier: workspace:*
+        version: link:../../packages/persistence
+      '@hyfib/ratelimit':
+        specifier: workspace:*
+        version: link:../../packages/ratelimit
+      '@hyfib/reporting-service':
+        specifier: workspace:*
+        version: link:../reporting-service
+      '@hyfib/shared-core':
+        specifier: workspace:*
+        version: link:../../packages/shared-core
+      '@hyfib/webhook-ingestor':
+        specifier: workspace:*
+        version: link:../webhook-ingestor
+
   services/billing-usage-service:
     dependencies:
       '@hyfib/config':
@@ -318,15 +360,6 @@ importers:
       vitest:
         specifier: ^4.1.9
         version: 4.1.9(@types/node@24.12.4)(jsdom@29.1.1)(vite@8.1.2(@types/node@24.12.4)(jiti@2.7.0))
-
-  services/web-portal:
-    dependencies:
-      '@hyfib/config':
-        specifier: workspace:*
-        version: link:../../packages/config
-      '@hyfib/shared-core':
-        specifier: workspace:*
-        version: link:../../packages/shared-core
 
   services/webhook-ingestor:
     dependencies:

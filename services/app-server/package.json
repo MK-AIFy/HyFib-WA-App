@@ -1,0 +1,30 @@
+{
+  "name": "@hyfib/app-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/main.js",
+  "types": "dist/main.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/main.js",
+    "dev": "node --watch dist/main.js",
+    "test": "node --test",
+    "lint": "eslint src"
+  },
+  "dependencies": {
+    "@hyfib/ai-intelligence-service": "workspace:*",
+    "@hyfib/api-gateway": "workspace:*",
+    "@hyfib/billing-usage-service": "workspace:*",
+    "@hyfib/config": "workspace:*",
+    "@hyfib/db": "workspace:*",
+    "@hyfib/event-bus": "workspace:*",
+    "@hyfib/meta-adapter": "workspace:*",
+    "@hyfib/notification-worker": "workspace:*",
+    "@hyfib/persistence": "workspace:*",
+    "@hyfib/ratelimit": "workspace:*",
+    "@hyfib/reporting-service": "workspace:*",
+    "@hyfib/shared-core": "workspace:*",
+    "@hyfib/webhook-ingestor": "workspace:*"
+  }
+}
