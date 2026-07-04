@@ -13,7 +13,9 @@
     "lint": "eslint src"
   },
   "dependencies": {
+    "@hyfib/ai-intelligence-service": "workspace:*",
     "@hyfib/api-gateway": "workspace:*",
+    "@hyfib/billing-usage-service": "workspace:*",
     "@hyfib/config": "workspace:*",
     "@hyfib/db": "workspace:*",
     "@hyfib/event-bus": "workspace:*",
@@ -21,6 +23,7 @@
     "@hyfib/notification-worker": "workspace:*",
     "@hyfib/persistence": "workspace:*",
     "@hyfib/ratelimit": "workspace:*",
+    "@hyfib/reporting-service": "workspace:*",
     "@hyfib/shared-core": "workspace:*",
     "@hyfib/webhook-ingestor": "workspace:*"
   }

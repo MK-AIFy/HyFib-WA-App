@@ -167,9 +167,15 @@ importers:
 
   services/app-server:
     dependencies:
+      '@hyfib/ai-intelligence-service':
+        specifier: workspace:*
+        version: link:../ai-intelligence-service
       '@hyfib/api-gateway':
         specifier: workspace:*
         version: link:../api-gateway
+      '@hyfib/billing-usage-service':
+        specifier: workspace:*
+        version: link:../billing-usage-service
       '@hyfib/config':
         specifier: workspace:*
         version: link:../../packages/config
@@ -191,6 +197,9 @@ importers:
       '@hyfib/ratelimit':
         specifier: workspace:*
         version: link:../../packages/ratelimit
+      '@hyfib/reporting-service':
+        specifier: workspace:*
+        version: link:../reporting-service
       '@hyfib/shared-core':
         specifier: workspace:*
         version: link:../../packages/shared-core

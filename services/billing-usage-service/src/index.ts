@@ -1,4 +1,7 @@
 import { createServer } from "node:http";
+import { argv } from "node:process";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { loadConfig } from "@hyfib/config";
 import { waitForReady, withTenant } from "@hyfib/db";
 import {
@@ -22,6 +25,38 @@ interface UsageRow {
 const config = loadConfig();
 const logger = new Logger("billing-usage-service", config.logLevel as "debug" | "info" | "warn" | "error");
 const port = config.billingUsageServicePort;
+
+/**
+ * Per-day message usage for a tenant over the last `days` (clamped 1–90).
+ * Exported so app-server calls it directly in-process; the standalone service's
+ * endpoint wraps it.
+ */
+export async function getUsage(tenantId: string, daysRaw: string | number): Promise<Record<string, unknown>> {
+  const days = Math.max(1, Math.min(90, Number(daysRaw ?? "7")));
+  const rows = await withTenant(tenantId, (tx) =>
+    tx.query<UsageRow>(
+      `SELECT to_char(date_trunc('day', created_at), 'YYYY-MM-DD') AS bucket_date,
+              direction,
+              COALESCE(category, 'none') AS category,
+              COUNT(*)::text AS n
+         FROM messages
+        WHERE created_at >= now() - ($1 || ' days')::interval
+        GROUP BY 1, 2, 3
+        ORDER BY 1 DESC`,
+      [String(days)]
+    )
+  );
+  return {
+    tenantId,
+    days,
+    items: rows.map((r) => ({
+      date: r.bucket_date,
+      direction: r.direction,
+      category: r.category,
+      count: Number(r.n)
+    }))
+  };
+}
 
 const server = createServer(async (req, res) => {
   try {
@@ -59,33 +94,8 @@ const server = createServer(async (req, res) => {
         return;
       }
 
-      const q = parseQuery(req.url);
-      const days = Math.max(1, Math.min(90, Number(q.get("days") ?? "7")));
-
-      const rows = await withTenant(tenantId, (tx) =>
-        tx.query<UsageRow>(
-          `SELECT to_char(date_trunc('day', created_at), 'YYYY-MM-DD') AS bucket_date,
-                  direction,
-                  COALESCE(category, 'none') AS category,
-                  COUNT(*)::text AS n
-             FROM messages
-            WHERE created_at >= now() - ($1 || ' days')::interval
-            GROUP BY 1, 2, 3
-            ORDER BY 1 DESC`,
-          [String(days)]
-        )
-      );
-
-      sendJson(res, 200, {
-        tenantId,
-        days,
-        items: rows.map((r) => ({
-          date: r.bucket_date,
-          direction: r.direction,
-          category: r.category,
-          count: Number(r.n)
-        }))
-      });
+      const days = parseQuery(req.url).get("days") ?? "7";
+      sendJson(res, 200, await getUsage(tenantId, days));
       return;
     }
 
@@ -111,4 +121,9 @@ server.on("error", (error) => {
   logger.error("service_error", { error: error instanceof Error ? error.message : String(error) });
 });
 
-void bootstrap();
+// Boot the standalone service only when executed directly, never when imported
+// by app-server for its exported getUsage function.
+const isMain = argv[1] !== undefined && resolve(argv[1]) === fileURLToPath(import.meta.url);
+if (isMain) {
+  void bootstrap();
+}

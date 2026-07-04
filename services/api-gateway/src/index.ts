@@ -257,6 +257,82 @@ async function defaultIngestWebhookProxy(forwarded: {
 
 let ingestWebhookProxy: IngestWebhookProxy = defaultIngestWebhookProxy;
 
+// Internal proxies to the small read/AI services. Injectable so the monolith
+// swaps them for direct in-process calls (Phases 6–8).
+export interface ServiceProxyContext {
+  tenantId: string;
+  requestId: string;
+}
+export type ReportsOverviewProxy = (
+  ctx: ServiceProxyContext
+) => Promise<{ status: number; body: Record<string, unknown> }>;
+export type UsageProxy = (
+  ctx: ServiceProxyContext,
+  days: string
+) => Promise<{ status: number; body: Record<string, unknown> }>;
+export type AiProxy = (
+  ctx: ServiceProxyContext,
+  aiPath: string,
+  method: string,
+  rawBody?: string
+) => Promise<{ status: number; body: Record<string, unknown> }>;
+
+async function defaultReportsOverviewProxy(
+  ctx: ServiceProxyContext
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const upstream = await fetch(`${config.reportingServiceUrl}/internal/v1/reports/overview`, {
+    headers: {
+      "x-tenant-id": ctx.tenantId,
+      "x-request-id": ctx.requestId,
+      "x-internal-secret": config.internalServiceSecret
+    },
+    signal: AbortSignal.timeout(10_000)
+  });
+  const body = (await upstream.json()) as Record<string, unknown>;
+  return { status: upstream.ok ? 200 : upstream.status, body };
+}
+
+async function defaultUsageProxy(
+  ctx: ServiceProxyContext,
+  days: string
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const upstream = await fetch(`${config.billingUsageServiceUrl}/internal/v1/usage?days=${encodeURIComponent(days)}`, {
+    headers: {
+      "x-tenant-id": ctx.tenantId,
+      "x-request-id": ctx.requestId,
+      "x-internal-secret": config.internalServiceSecret
+    },
+    signal: AbortSignal.timeout(10_000)
+  });
+  const body = (await upstream.json()) as Record<string, unknown>;
+  return { status: upstream.ok ? 200 : upstream.status, body };
+}
+
+async function defaultAiProxy(
+  ctx: ServiceProxyContext,
+  aiPath: string,
+  method: string,
+  rawBody?: string
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const upstream = await fetch(`${config.aiIntelligenceUrl}/internal/v1/ai/${aiPath}`, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      "x-tenant-id": ctx.tenantId,
+      "x-request-id": ctx.requestId,
+      "x-internal-secret": config.internalServiceSecret
+    },
+    ...(rawBody !== undefined ? { body: rawBody } : {}),
+    signal: AbortSignal.timeout(90_000)
+  });
+  const body = (await upstream.json()) as Record<string, unknown>;
+  return { status: upstream.ok ? 200 : upstream.status, body };
+}
+
+let reportsOverviewProxy: ReportsOverviewProxy = defaultReportsOverviewProxy;
+let usageProxy: UsageProxy = defaultUsageProxy;
+let aiProxy: AiProxy = defaultAiProxy;
+
 const E164 = /^\+[1-9]\d{7,14}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -3045,35 +3121,16 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 
   // ─── Reporting service proxy ──────────────────────────────────────────────
   if (path === "/api/v1/reports/overview" && method === "GET") {
-    const upstream = await fetch(`${config.reportingServiceUrl}/internal/v1/reports/overview`, {
-      headers: {
-        "x-tenant-id": tenantId,
-        "x-request-id": ctx.requestId,
-        "x-internal-secret": config.internalServiceSecret
-      },
-      signal: AbortSignal.timeout(10_000)
-    });
-    const body = (await upstream.json()) as Record<string, unknown>;
-    sendJson(res, upstream.ok ? 200 : upstream.status, body);
+    const { status, body } = await reportsOverviewProxy({ tenantId, requestId: ctx.requestId });
+    sendJson(res, status, body);
     return;
   }
 
   // ─── Billing / usage proxy ────────────────────────────────────────────────
   if (path === "/api/v1/usage" && method === "GET") {
     const days = parseQuery(req.url).get("days") ?? "7";
-    const upstream = await fetch(
-      `${config.billingUsageServiceUrl}/internal/v1/usage?days=${encodeURIComponent(days)}`,
-      {
-        headers: {
-          "x-tenant-id": tenantId,
-          "x-request-id": ctx.requestId,
-          "x-internal-secret": config.internalServiceSecret
-        },
-        signal: AbortSignal.timeout(10_000)
-      }
-    );
-    const body = (await upstream.json()) as Record<string, unknown>;
-    sendJson(res, upstream.ok ? 200 : upstream.status, body);
+    const { status, body } = await usageProxy({ tenantId, requestId: ctx.requestId }, days);
+    sendJson(res, status, body);
     return;
   }
 
@@ -3086,19 +3143,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return;
     }
     const raw = method === "POST" ? await readRawBody(req) : undefined;
-    const upstream = await fetch(`${config.aiIntelligenceUrl}/internal/v1/ai/${aiPath}`, {
-      method,
-      headers: {
-        "Content-Type": "application/json",
-        "x-tenant-id": tenantId,
-        "x-request-id": ctx.requestId,
-        "x-internal-secret": config.internalServiceSecret
-      },
-      ...(raw !== undefined ? { body: raw } : {}),
-      signal: AbortSignal.timeout(90_000)
-    });
-    const body = (await upstream.json()) as Record<string, unknown>;
-    sendJson(res, upstream.ok ? 200 : upstream.status, body);
+    const { status, body } = await aiProxy({ tenantId, requestId: ctx.requestId }, aiPath, method, raw);
+    sendJson(res, status, body);
     return;
   }
 
@@ -3119,6 +3165,12 @@ export interface GatewayDeps {
    * instead of proxying to the webhook-ingestor over HTTP (Phase 3).
    */
   proxyWebhookToIngestor?: IngestWebhookProxy;
+  /** Direct in-process reports/overview (Phase 8). */
+  proxyReportsOverview?: ReportsOverviewProxy;
+  /** Direct in-process usage (Phase 7). */
+  proxyUsage?: UsageProxy;
+  /** Direct in-process AI intelligence (Phase 6). */
+  proxyAi?: AiProxy;
 }
 
 export interface GatewayModule {
@@ -3141,6 +3193,15 @@ export function createGatewayHandler(deps: GatewayDeps = {}): GatewayModule {
   }
   if (deps.proxyWebhookToIngestor) {
     ingestWebhookProxy = deps.proxyWebhookToIngestor;
+  }
+  if (deps.proxyReportsOverview) {
+    reportsOverviewProxy = deps.proxyReportsOverview;
+  }
+  if (deps.proxyUsage) {
+    usageProxy = deps.proxyUsage;
+  }
+  if (deps.proxyAi) {
+    aiProxy = deps.proxyAi;
   }
   registerSseForwarding();
   return {

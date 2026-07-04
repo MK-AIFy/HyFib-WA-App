@@ -8,10 +8,20 @@ import { waitForReady, closePool as closeDbPool } from "@hyfib/db";
 import { closePool as closePersistencePool } from "@hyfib/persistence";
 import { closeRedis, getRedisClient } from "@hyfib/ratelimit";
 import { createEventBus, type EventBus } from "@hyfib/event-bus";
-import { createGatewayHandler, type GatewayModule, type IngestWebhookProxy } from "@hyfib/api-gateway";
+import {
+  createGatewayHandler,
+  type GatewayModule,
+  type IngestWebhookProxy,
+  type ReportsOverviewProxy,
+  type UsageProxy,
+  type AiProxy
+} from "@hyfib/api-gateway";
 import { processForwardedWebhook } from "@hyfib/webhook-ingestor";
 import { metaDispatch } from "@hyfib/meta-adapter";
 import { registerWorkerConsumers, type WorkerMetaClient } from "@hyfib/notification-worker";
+import { getReportsOverview } from "@hyfib/reporting-service";
+import { getUsage } from "@hyfib/billing-usage-service";
+import { dispatchAi } from "@hyfib/ai-intelligence-service";
 import { Logger, RedisIdempotencyStore, sendJson } from "@hyfib/shared-core";
 
 export interface AppServerDeps {
@@ -19,6 +29,10 @@ export interface AppServerDeps {
   eventBus: EventBus;
   /** Direct in-process webhook ingestion; when omitted the gateway proxies over HTTP. */
   proxyWebhookToIngestor?: IngestWebhookProxy;
+  /** Direct in-process reports/usage/AI; when omitted the gateway proxies over HTTP. */
+  proxyReportsOverview?: ReportsOverviewProxy;
+  proxyUsage?: UsageProxy;
+  proxyAi?: AiProxy;
 }
 
 export interface AppServer {
@@ -37,7 +51,10 @@ export interface AppServer {
 export function createAppServer(deps: AppServerDeps): AppServer {
   const gateway = createGatewayHandler({
     eventBus: deps.eventBus,
-    proxyWebhookToIngestor: deps.proxyWebhookToIngestor
+    proxyWebhookToIngestor: deps.proxyWebhookToIngestor,
+    proxyReportsOverview: deps.proxyReportsOverview,
+    proxyUsage: deps.proxyUsage,
+    proxyAi: deps.proxyAi
   });
 
   const server = createServer((req, res) => {
@@ -89,7 +106,15 @@ async function main(): Promise<void> {
     return { ok: verified, body: { status: verified ? "accepted" : "invalid_signature", ...summary } };
   };
 
-  const { server, gateway, shutdown } = createAppServer({ logger, eventBus, proxyWebhookToIngestor });
+  const { server, gateway, shutdown } = createAppServer({
+    logger,
+    eventBus,
+    proxyWebhookToIngestor,
+    // Direct in-process calls to the former read/AI services (no HTTP hop).
+    proxyReportsOverview: async (ctx) => ({ status: 200, body: await getReportsOverview(ctx.tenantId) }),
+    proxyUsage: async (ctx, days) => ({ status: 200, body: await getUsage(ctx.tenantId, days) }),
+    proxyAi: async (ctx, aiPath, method, rawBody) => dispatchAi(aiPath, method, rawBody, ctx.requestId)
+  });
 
   // Register worker consumers on the shared bus with a direct in-process meta
   // transport (no HTTP hop to the meta-adapter). Durable delivery is provided
