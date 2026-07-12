@@ -1371,11 +1371,13 @@ interface ConversationRow {
   channel_id: string;
   last_message_at: Date | null;
   last_inbound_at: Date | null;
+  last_read_at: Date | null;
   assigned_user_id: string | null;
   state: string;
   contact_name: string | null;
   contact_phone: string | null;
   last_message: string | null;
+  unread_count: number;
 }
 
 function mapConversation(row: ConversationRow): Conversation {
@@ -1389,6 +1391,8 @@ function mapConversation(row: ConversationRow): Conversation {
     lastMessage: row.last_message ?? undefined,
     lastMessageAt: row.last_message_at?.toISOString(),
     lastInboundAt: row.last_inbound_at?.toISOString(),
+    lastReadAt: row.last_read_at?.toISOString(),
+    unreadCount: row.unread_count,
     assignedUserId: row.assigned_user_id ?? undefined,
     state: (row.state ?? "open") as Conversation["state"]
   };
@@ -1396,13 +1400,16 @@ function mapConversation(row: ConversationRow): Conversation {
 
 const CONV_SELECT = `
   SELECT c.id, c.tenant_id, c.contact_id, c.channel_id,
-         c.last_message_at, c.last_inbound_at, c.assigned_user_id, c.state,
+         c.last_message_at, c.last_inbound_at, c.last_read_at, c.assigned_user_id, c.state,
          NULLIF(TRIM(CONCAT_WS(' ', co.first_name, co.last_name)), '') AS contact_name,
          co.phone_e164 AS contact_phone,
          (SELECT m.payload->>'text'
           FROM messages m
           WHERE m.conversation_id = c.id
-          ORDER BY m.created_at DESC LIMIT 1) AS last_message
+          ORDER BY m.created_at DESC LIMIT 1) AS last_message,
+         (SELECT COUNT(*)::int FROM messages m
+          WHERE m.conversation_id = c.id AND m.direction = 'inbound'
+            AND m.created_at > COALESCE(c.last_read_at, '-infinity'::timestamptz)) AS unread_count
   FROM conversations c
   LEFT JOIN contacts co ON co.id = c.contact_id`;
 
@@ -1504,6 +1511,12 @@ export const conversationRepository = {
   async setState(tenantId: string, conversationId: string, state: "open" | "pending" | "closed"): Promise<void> {
     await withTenant(tenantId, async (client) => {
       await client.query("UPDATE conversations SET state = $2 WHERE id = $1", [conversationId, state]);
+    });
+  },
+  /** Advances the read watermark to now(). Idempotent by construction — no counter to race. */
+  async markRead(tenantId: string, conversationId: string): Promise<void> {
+    await withTenant(tenantId, async (client) => {
+      await client.query("UPDATE conversations SET last_read_at = now() WHERE id = $1", [conversationId]);
     });
   },
   /** Returns the timestamp of the last inbound message for a contact across all channels (for 24h window check). */

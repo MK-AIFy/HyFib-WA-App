@@ -5,6 +5,7 @@ import {
   channelRepository,
   contactRepository,
   conversationRepository,
+  messageRepository,
   closePool
 } from "../dist/index.js";
 
@@ -113,6 +114,72 @@ test("existing no-q behavior is unchanged: list returns all conversations for th
   const { items, total } = await conversationRepository.list(tenant.id, {});
   assert.equal(total, 3);
   assert.equal(items.length, 3);
+});
+
+test("unread watermark: inbound messages count as unread until markRead, outbound never count", { skip }, async () => {
+  const { tenant, channel } = await seedTenantWithChannel("Unread Watermark Tenant");
+  const { conversation } = await seedConversation(tenant, channel, {
+    phoneE164: "+15556660001",
+    firstName: "Watermark",
+    lastName: "Test"
+  });
+
+  // Baseline: no messages yet — never-read conversation, zero unread.
+  let fetched = await conversationRepository.getById(tenant.id, conversation.id);
+  assert.equal(fetched.lastReadAt, undefined);
+  assert.equal(fetched.unreadCount, 0);
+
+  // 1. Two inbound messages → unreadCount 2, lastReadAt still null.
+  await messageRepository.create(tenant.id, {
+    conversationId: conversation.id,
+    direction: "inbound",
+    status: "delivered",
+    payload: { text: "first inbound" }
+  });
+  await messageRepository.create(tenant.id, {
+    conversationId: conversation.id,
+    direction: "inbound",
+    status: "delivered",
+    payload: { text: "second inbound" }
+  });
+  // 4. Outbound messages never count toward unread.
+  await messageRepository.create(tenant.id, {
+    conversationId: conversation.id,
+    direction: "outbound",
+    status: "sent",
+    payload: { text: "agent reply" }
+  });
+
+  fetched = await conversationRepository.getById(tenant.id, conversation.id);
+  assert.equal(fetched.unreadCount, 2, "two inbound messages should be unread; the outbound one never counts");
+  assert.equal(fetched.lastReadAt, undefined);
+
+  // Also verify list() carries the same fields consistently.
+  const { items } = await conversationRepository.list(tenant.id, {});
+  const listed = items.find((c) => c.id === conversation.id);
+  assert.equal(listed.unreadCount, 2);
+  assert.equal(listed.lastReadAt, undefined);
+
+  // 2. markRead → unreadCount 0, lastReadAt set.
+  await conversationRepository.markRead(tenant.id, conversation.id);
+  fetched = await conversationRepository.getById(tenant.id, conversation.id);
+  assert.equal(fetched.unreadCount, 0);
+  assert.ok(fetched.lastReadAt, "lastReadAt should be set after markRead");
+
+  // 3. A new inbound message arriving after markRead is unread again.
+  await messageRepository.create(tenant.id, {
+    conversationId: conversation.id,
+    direction: "inbound",
+    status: "delivered",
+    payload: { text: "third inbound, after read" }
+  });
+  fetched = await conversationRepository.getById(tenant.id, conversation.id);
+  assert.equal(fetched.unreadCount, 1);
+
+  // markRead is idempotent — calling it again with no new messages keeps unreadCount 0.
+  await conversationRepository.markRead(tenant.id, conversation.id);
+  fetched = await conversationRepository.getById(tenant.id, conversation.id);
+  assert.equal(fetched.unreadCount, 0);
 });
 
 test.after(async () => {

@@ -2752,6 +2752,20 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
 
+  // Auth-only (no role gate): marking read is low-privilege and high-frequency,
+  // same posture as GET .../messages. No audit entry — high-frequency, low-value.
+  if (path.startsWith("/api/v1/conversations/") && path.endsWith("/read") && method === "POST") {
+    const conversationId = extractPathSegment(path, "/api/v1/conversations/");
+    if (!conversationId || !UUID.test(conversationId)) {
+      sendJson(res, 400, { error: "Invalid conversation id" });
+      return;
+    }
+    await conversationRepository.markRead(tenantId, conversationId);
+    sseHub.broadcast(tenantId, "conversation.read", randomUUID(), { conversationId });
+    sendJson(res, 200, { status: "read", conversationId });
+    return;
+  }
+
   // ─── Conversation internal notes ──────────────────────────────────────────
   if (path.startsWith("/api/v1/conversations/") && path.endsWith("/notes")) {
     const conversationId = extractPathSegment(path, "/api/v1/conversations/");

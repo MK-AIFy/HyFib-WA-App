@@ -241,6 +241,8 @@ export interface Conversation {
   lastMessage?: string;
   lastMessageAt?: string;
   lastInboundAt?: string;
+  lastReadAt?: string;
+  unreadCount: number;
   assignedUserId?: string;
   state: "open" | "pending" | "closed";
 }
