@@ -32,6 +32,35 @@ function fakeIdempotency() {
   };
 }
 
+/** An idempotency store whose release() always throws, to test that the release
+ * failure never masks the original publish error. */
+function fakeIdempotencyReleaseThrows() {
+  const seen = new Set();
+  return {
+    async isDuplicate(key) {
+      if (seen.has(key)) return true;
+      seen.add(key);
+      return false;
+    },
+    async release() {
+      throw new Error("redis down");
+    }
+  };
+}
+
+function fakeLogger() {
+  const warnings = [];
+  return {
+    warnings,
+    warn(message, metadata) {
+      warnings.push({ message, metadata });
+    },
+    debug() {},
+    info() {},
+    error() {}
+  };
+}
+
 /** A bus whose publish() throws on its Nth call (1-indexed), succeeding otherwise. */
 function fakeBusFailingOnCall(failOnCall) {
   const published = [];
@@ -151,4 +180,39 @@ test("a failed status publish releases exactly the status's key and rethrows; re
   const summary = await ingestMetaWebhook(payload, "tenant-1", { eventBus: bus, idempotency: idem });
   assert.deepEqual(summary, { inbound: 0, statuses: 1, duplicates: 1 });
   assert.equal(bus.published.length, 2);
+});
+
+test("release() throwing after a failed publish does not mask the original error", async () => {
+  // The bus fails on its 1st call (inbound publish); release() then also
+  // throws (e.g. Redis is down too). The ORIGINAL publish error ("db down")
+  // must still be the one that propagates, not the release error
+  // ("redis down"), and the release failure is logged distinctly instead.
+  const bus = fakeBusFailingOnCall(1);
+  const idem = fakeIdempotencyReleaseThrows();
+  const logger = fakeLogger();
+
+  await assert.rejects(
+    () => ingestMetaWebhook(payload, "tenant-1", { eventBus: bus, idempotency: idem, logger }),
+    (error) => {
+      assert.equal(error.message, "db down");
+      return true;
+    }
+  );
+
+  assert.equal(logger.warnings.length, 1);
+  assert.equal(logger.warnings[0].message, "idempotency_release_failed");
+  assert.equal(logger.warnings[0].metadata.key, "inbound:wamid.1");
+  assert.equal(logger.warnings[0].metadata.error, "redis down");
+});
+
+test("release() throwing without a logger dep still propagates the original error", async () => {
+  // No logger supplied — deps.logger is optional and must default to silent
+  // rather than throwing on the diagnostic path.
+  const bus = fakeBusFailingOnCall(1);
+  const idem = fakeIdempotencyReleaseThrows();
+
+  await assert.rejects(
+    () => ingestMetaWebhook(payload, "tenant-1", { eventBus: bus, idempotency: idem }),
+    /db down/
+  );
 });

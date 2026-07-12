@@ -120,7 +120,8 @@ async function main(): Promise<void> {
     const { verified, summary } = await processForwardedWebhook(forwarded, {
       eventBus: durableWebhookBus,
       idempotency: webhookIdempotency,
-      metaAppSecret: config.metaAppSecret
+      metaAppSecret: config.metaAppSecret,
+      logger
     });
     return { ok: verified, body: { status: verified ? "accepted" : "invalid_signature", ...summary } };
   };

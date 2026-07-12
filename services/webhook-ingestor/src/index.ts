@@ -25,7 +25,7 @@ const config = loadConfig();
 const logger = new Logger("webhook-ingestor", config.logLevel as "debug" | "info" | "warn" | "error");
 const eventBus = createEventBus(config);
 const idempotency = new RedisIdempotencyStore(getRedisClient(config), 24 * 60 * 60);
-const ingestDeps = { eventBus, idempotency };
+const ingestDeps = { eventBus, idempotency, logger };
 
 const server = createServer(async (req, res) => {
   try {

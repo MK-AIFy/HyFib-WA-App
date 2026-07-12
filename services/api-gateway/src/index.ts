@@ -1269,14 +1269,56 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       }
     }
     try {
+      // Two call paths land here, and only one of them throws:
+      //  1. In-process proxy (app-server monolith, proxyWebhookToIngestor):
+      //     processForwardedWebhook/ingestMetaWebhook throws when the outbox
+      //     enqueue/publish fails (e.g. DB outage) — handled by the catch
+      //     block below. It returns normally (ok:false) only when the
+      //     signature failed to verify downstream, with body.status ===
+      //     "invalid_signature" — not a processing failure.
+      //  2. Standalone HTTP proxy (defaultIngestWebhookProxy): fetch() only
+      //     throws on network errors, not HTTP error statuses, so a 5xx from
+      //     the webhook-ingestor service (e.g. its own DB outage) surfaces as
+      //     a normal ok:false return here, never via the catch block.
       const { ok, body: proxyBody } = await ingestWebhookProxy({ rawBody, signature: normalizedSignature });
+      if (!ok) {
+        const isInvalidSignature =
+          typeof proxyBody === "object" &&
+          proxyBody !== null &&
+          (proxyBody as { status?: unknown }).status === "invalid_signature";
+        if (!isInvalidSignature) {
+          // Genuine processing failure reported without a throw (path 2
+          // above, and defensively any future non-throwing failure of path
+          // 1). Release the signature key so Meta's retry of the same
+          // delivery isn't swallowed as a duplicate. Invalid-signature
+          // responses intentionally skip this — pre-existing dedupe
+          // semantics for bad signatures stay unchanged.
+          try {
+            await webhookIdempotency.release(signatureKey);
+          } catch (releaseError) {
+            logger.warn("idempotency_release_failed", {
+              key: signatureKey,
+              error: releaseError instanceof Error ? releaseError.message : String(releaseError)
+            });
+          }
+        }
+      }
       sendJson(res, ok ? 200 : 502, { requestId: ctx.requestId, upstream: proxyBody });
     } catch (error) {
       // The signature-level idempotency key was claimed before this call.
       // Processing failed (e.g. outbox enqueue hit a DB outage) before the
       // webhook was durably recorded, so release the key: Meta will retry
-      // the same delivery and it must not be swallowed as a duplicate.
-      await webhookIdempotency.release(signatureKey);
+      // the same delivery and it must not be swallowed as a duplicate. Guard
+      // the release itself: if it also fails, log that separately and still
+      // respond based on the ORIGINAL error, not the release failure.
+      try {
+        await webhookIdempotency.release(signatureKey);
+      } catch (releaseError) {
+        logger.warn("idempotency_release_failed", {
+          key: signatureKey,
+          error: releaseError instanceof Error ? releaseError.message : String(releaseError)
+        });
+      }
       logger.error("webhook_ingest_failed", { error: error instanceof Error ? error.message : String(error) });
       sendJson(res, 502, { error: "webhook_processing_unavailable" });
     }

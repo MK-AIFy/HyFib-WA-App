@@ -1,4 +1,5 @@
 import { EventTopics, incCounter, verifyMetaSignature } from "@hyfib/shared-core";
+import type { Logger } from "@hyfib/shared-core";
 import type { EventBus } from "@hyfib/event-bus";
 import { normalizeInbound, normalizeStatus, type RawValue } from "./normalize.js";
 
@@ -26,6 +27,13 @@ export interface IdempotencyStore {
 export interface IngestDeps {
   eventBus: EventBus;
   idempotency: IdempotencyStore;
+  /**
+   * Optional diagnostics logger. Never affects control flow — e.g. when a
+   * release() call (see below) itself fails, it's logged here rather than
+   * replacing the original error. Optional/silent-by-default so existing
+   * callers and tests that don't supply one remain compatible.
+   */
+  logger?: Logger;
 }
 
 export interface IngestSummary {
@@ -88,8 +96,17 @@ export async function ingestMetaWebhook(
         } catch (error) {
           // Publish failed after the idempotency key was claimed — release it
           // so a retry of the same webhook (e.g. Meta re-delivery) isn't
-          // swallowed as a duplicate.
-          await deps.idempotency.release?.(key);
+          // swallowed as a duplicate. Guard the release itself: if it throws
+          // (e.g. Redis is also down), log that separately and still rethrow
+          // the ORIGINAL publish error rather than masking it.
+          try {
+            await deps.idempotency.release?.(key);
+          } catch (releaseError) {
+            deps.logger?.warn("idempotency_release_failed", {
+              key,
+              error: releaseError instanceof Error ? releaseError.message : String(releaseError)
+            });
+          }
           throw error;
         }
       }
@@ -114,8 +131,17 @@ export async function ingestMetaWebhook(
         } catch (error) {
           // Publish failed after the idempotency key was claimed — release it
           // so a retry of the same webhook (e.g. Meta re-delivery) isn't
-          // swallowed as a duplicate.
-          await deps.idempotency.release?.(key);
+          // swallowed as a duplicate. Guard the release itself: if it throws
+          // (e.g. Redis is also down), log that separately and still rethrow
+          // the ORIGINAL publish error rather than masking it.
+          try {
+            await deps.idempotency.release?.(key);
+          } catch (releaseError) {
+            deps.logger?.warn("idempotency_release_failed", {
+              key,
+              error: releaseError instanceof Error ? releaseError.message : String(releaseError)
+            });
+          }
           throw error;
         }
       }
