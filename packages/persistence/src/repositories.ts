@@ -1374,6 +1374,8 @@ interface ConversationRow {
   last_read_at: Date | null;
   assigned_user_id: string | null;
   state: string;
+  archived_at: Date | null;
+  pinned_at: Date | null;
   contact_name: string | null;
   contact_phone: string | null;
   last_message: string | null;
@@ -1394,13 +1396,16 @@ function mapConversation(row: ConversationRow): Conversation {
     lastReadAt: row.last_read_at?.toISOString(),
     unreadCount: row.unread_count,
     assignedUserId: row.assigned_user_id ?? undefined,
-    state: (row.state ?? "open") as Conversation["state"]
+    state: (row.state ?? "open") as Conversation["state"],
+    archivedAt: row.archived_at?.toISOString(),
+    pinnedAt: row.pinned_at?.toISOString()
   };
 }
 
 const CONV_SELECT = `
   SELECT c.id, c.tenant_id, c.contact_id, c.channel_id,
          c.last_message_at, c.last_inbound_at, c.last_read_at, c.assigned_user_id, c.state,
+         c.archived_at, c.pinned_at,
          NULLIF(TRIM(CONCAT_WS(' ', co.first_name, co.last_name)), '') AS contact_name,
          co.phone_e164 AS contact_phone,
          (SELECT m.payload->>'text'
@@ -1426,7 +1431,7 @@ export function escapeLike(value: string): string {
 export const conversationRepository = {
   async list(
     tenantId: string,
-    opts?: { state?: string; assignedUserId?: string; q?: string; limit?: number; offset?: number }
+    opts?: { state?: string; assignedUserId?: string; q?: string; archived?: boolean; limit?: number; offset?: number }
   ): Promise<{ items: Conversation[]; total: number }> {
     const limit = opts?.limit ?? 50;
     const offset = opts?.offset ?? 0;
@@ -1434,6 +1439,11 @@ export const conversationRepository = {
     return withTenant(tenantId, async (client) => {
       const conditions: string[] = [];
       const params: unknown[] = [];
+      // Archived conversations are excluded from the default (inbox) list —
+      // this is a deliberate contract change, not a bug. Pass archived:true
+      // to see the archive instead. Always present (not conditional on
+      // opts?.archived being set) so the COUNT and items queries agree.
+      conditions.push(opts?.archived ? `c.archived_at IS NOT NULL` : `c.archived_at IS NULL`);
       if (opts?.state) {
         params.push(opts.state);
         conditions.push(`c.state = $${params.length}`);
@@ -1459,8 +1469,12 @@ export const conversationRepository = {
           : `SELECT COUNT(*)::text AS total FROM conversations c ${where}`,
         params
       );
+      // Pinned conversations sort first, most-recently-pinned first, then
+      // fall back to the existing recency ordering.
       const result = await client.query<ConversationRow>(
-        `${CONV_SELECT} ${where} ORDER BY c.last_message_at DESC NULLS LAST LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+        `${CONV_SELECT} ${where}
+         ORDER BY (c.pinned_at IS NOT NULL) DESC, c.pinned_at DESC NULLS LAST, c.last_message_at DESC NULLS LAST
+         LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
         [...params, limit, offset]
       );
       return { items: result.rows.map(mapConversation), total: Number(totalResult.rows[0]?.total ?? "0") };
@@ -1517,6 +1531,24 @@ export const conversationRepository = {
   async markRead(tenantId: string, conversationId: string): Promise<void> {
     await withTenant(tenantId, async (client) => {
       await client.query("UPDATE conversations SET last_read_at = now() WHERE id = $1", [conversationId]);
+    });
+  },
+  /** Sets or clears archived_at. Idempotent — archiving an already-archived conversation is a no-op timestamp refresh. */
+  async setArchived(tenantId: string, conversationId: string, archived: boolean): Promise<void> {
+    await withTenant(tenantId, async (client) => {
+      await client.query(
+        "UPDATE conversations SET archived_at = CASE WHEN $2 THEN now() ELSE NULL END WHERE id = $1",
+        [conversationId, archived]
+      );
+    });
+  },
+  /** Sets or clears pinned_at. Idempotent, same shape as setArchived. */
+  async setPinned(tenantId: string, conversationId: string, pinned: boolean): Promise<void> {
+    await withTenant(tenantId, async (client) => {
+      await client.query(
+        "UPDATE conversations SET pinned_at = CASE WHEN $2 THEN now() ELSE NULL END WHERE id = $1",
+        [conversationId, pinned]
+      );
     });
   },
   /** Returns the timestamp of the last inbound message for a contact across all channels (for 24h window check). */

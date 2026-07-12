@@ -2678,6 +2678,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       state: query.get("state") ?? undefined,
       assignedUserId: query.get("assignee") ?? undefined,
       q,
+      archived: query.get("archived") === "true",
       limit: page.limit,
       offset: page.offset
     });
@@ -2749,6 +2750,48 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     await conversationRepository.setState(tenantId, conversationId, body.state);
     sseHub.broadcast(tenantId, "conversation.state_changed", randomUUID(), { conversationId, state: body.state });
     sendJson(res, 200, { status: "updated", conversationId, state: body.state });
+    return;
+  }
+
+  if (path.startsWith("/api/v1/conversations/") && path.endsWith("/archive") && method === "POST") {
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "support_agent", "sales_agent", "marketing_manager"])) {
+      sendJson(res, 403, { error: "Insufficient role" });
+      return;
+    }
+    const conversationId = extractPathSegment(path, "/api/v1/conversations/");
+    if (!conversationId || !UUID.test(conversationId)) {
+      sendJson(res, 400, { error: "Invalid conversation id" });
+      return;
+    }
+    const body = await readJsonBody<{ archived: boolean }>(req);
+    if (typeof body.archived !== "boolean") {
+      sendJson(res, 400, { error: "archived must be a boolean" });
+      return;
+    }
+    await conversationRepository.setArchived(tenantId, conversationId, body.archived);
+    sseHub.broadcast(tenantId, "conversation.archived", randomUUID(), { conversationId, archived: body.archived });
+    sendJson(res, 200, { status: "archived", conversationId, archived: body.archived });
+    return;
+  }
+
+  if (path.startsWith("/api/v1/conversations/") && path.endsWith("/pin") && method === "POST") {
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "support_agent", "sales_agent", "marketing_manager"])) {
+      sendJson(res, 403, { error: "Insufficient role" });
+      return;
+    }
+    const conversationId = extractPathSegment(path, "/api/v1/conversations/");
+    if (!conversationId || !UUID.test(conversationId)) {
+      sendJson(res, 400, { error: "Invalid conversation id" });
+      return;
+    }
+    const body = await readJsonBody<{ pinned: boolean }>(req);
+    if (typeof body.pinned !== "boolean") {
+      sendJson(res, 400, { error: "pinned must be a boolean" });
+      return;
+    }
+    await conversationRepository.setPinned(tenantId, conversationId, body.pinned);
+    sseHub.broadcast(tenantId, "conversation.pinned", randomUUID(), { conversationId, pinned: body.pinned });
+    sendJson(res, 200, { status: "pinned", conversationId, pinned: body.pinned });
     return;
   }
 

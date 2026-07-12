@@ -182,6 +182,106 @@ test("unread watermark: inbound messages count as unread until markRead, outboun
   assert.equal(fetched.unreadCount, 0);
 });
 
+test("setArchived(true) removes a conversation from the default list and surfaces it under archived:true", { skip }, async () => {
+  const { tenant, channel } = await seedTenantWithChannel("Archive Tenant");
+  const { conversation: target } = await seedConversation(tenant, channel, {
+    phoneE164: "+15558880001",
+    firstName: "Archive",
+    lastName: "Me"
+  });
+  await seedConversation(tenant, channel, { phoneE164: "+15558880002", firstName: "Stay", lastName: "Active" });
+
+  await conversationRepository.setArchived(tenant.id, target.id, true);
+
+  const defaultList = await conversationRepository.list(tenant.id, {});
+  assert.equal(defaultList.total, 1, "archived conversation should not count toward the default total");
+  assert.equal(defaultList.items.length, 1);
+  assert.ok(
+    !defaultList.items.some((c) => c.id === target.id),
+    "archived conversation should be absent from the default list"
+  );
+
+  const archivedList = await conversationRepository.list(tenant.id, { archived: true });
+  assert.equal(archivedList.total, 1, "archived total should match archived items");
+  assert.equal(archivedList.items.length, 1);
+  assert.equal(archivedList.items[0].id, target.id);
+  assert.ok(archivedList.items[0].archivedAt, "archivedAt should be set");
+});
+
+test("setArchived(false) restores a conversation to the default list", { skip }, async () => {
+  const { tenant, channel } = await seedTenantWithChannel("Unarchive Tenant");
+  const { conversation: target } = await seedConversation(tenant, channel, {
+    phoneE164: "+15559990001",
+    firstName: "Restore",
+    lastName: "Me"
+  });
+
+  await conversationRepository.setArchived(tenant.id, target.id, true);
+  let { items, total } = await conversationRepository.list(tenant.id, {});
+  assert.equal(total, 0);
+  assert.equal(items.length, 0);
+
+  await conversationRepository.setArchived(tenant.id, target.id, false);
+  ({ items, total } = await conversationRepository.list(tenant.id, {}));
+  assert.equal(total, 1);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].id, target.id);
+  assert.equal(items[0].archivedAt, undefined, "archivedAt should be cleared");
+});
+
+test("pinning the older of two conversations sorts it first in the default list", { skip }, async () => {
+  const { tenant, channel } = await seedTenantWithChannel("Pin Order Tenant");
+  const { conversation: older } = await seedConversation(tenant, channel, {
+    phoneE164: "+15557770001",
+    firstName: "Older",
+    lastName: "Conv"
+  });
+  await conversationRepository.touchInbound(tenant.id, older.id);
+  // Separate the two last_message_at values enough to make recency ordering
+  // deterministic (timestamptz has microsecond resolution; 50ms is generous).
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const { conversation: newer } = await seedConversation(tenant, channel, {
+    phoneE164: "+15557770002",
+    firstName: "Newer",
+    lastName: "Conv"
+  });
+  await conversationRepository.touchInbound(tenant.id, newer.id);
+
+  // Baseline: without pinning, plain recency ordering puts the newer conversation first.
+  let { items } = await conversationRepository.list(tenant.id, {});
+  assert.equal(items[0].id, newer.id, "unpinned: most recent last_message_at sorts first");
+
+  await conversationRepository.setPinned(tenant.id, older.id, true);
+  ({ items } = await conversationRepository.list(tenant.id, {}));
+  assert.equal(items[0].id, older.id, "pinned conversation sorts first regardless of recency");
+  assert.ok(items[0].pinnedAt, "pinnedAt should be set");
+});
+
+test("an archived, pinned conversation appears only in the archived list, not the default list", { skip }, async () => {
+  const { tenant, channel } = await seedTenantWithChannel("Archive Pin Tenant");
+  const { conversation: target } = await seedConversation(tenant, channel, {
+    phoneE164: "+15551110001",
+    firstName: "Pinned",
+    lastName: "Archived"
+  });
+  await seedConversation(tenant, channel, { phoneE164: "+15551110002", firstName: "Other", lastName: "Active" });
+
+  await conversationRepository.setPinned(tenant.id, target.id, true);
+  await conversationRepository.setArchived(tenant.id, target.id, true);
+
+  const defaultList = await conversationRepository.list(tenant.id, {});
+  assert.equal(defaultList.total, 1);
+  assert.ok(
+    !defaultList.items.some((c) => c.id === target.id),
+    "archived+pinned conversation should not appear in the default list despite being pinned"
+  );
+
+  const archivedList = await conversationRepository.list(tenant.id, { archived: true });
+  assert.equal(archivedList.total, 1);
+  assert.equal(archivedList.items[0].id, target.id);
+  assert.ok(archivedList.items[0].pinnedAt, "pinnedAt should still be set even though the conversation is archived");
+});
+
 test.after(async () => {
   if (!skip) {
     await closePool();

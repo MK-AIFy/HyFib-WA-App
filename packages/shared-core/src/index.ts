@@ -245,6 +245,8 @@ export interface Conversation {
   unreadCount: number;
   assignedUserId?: string;
   state: "open" | "pending" | "closed";
+  archivedAt?: string;
+  pinnedAt?: string;
 }
 
 export interface ConversationNote {
