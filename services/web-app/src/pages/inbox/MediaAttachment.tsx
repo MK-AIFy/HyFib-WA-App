@@ -73,7 +73,7 @@ function StoredMediaAttachment({
 
   if (kind === "image") {
     return (
-      <a href={objectUrl} target="_blank" rel="noreferrer" className="mb-1 block">
+      <a href={objectUrl} target="_blank" rel="noopener noreferrer" className="mb-1 block">
         <img src={objectUrl} alt={filename ?? "Attachment"} className="max-h-64 rounded-md object-contain" />
       </a>
     );
@@ -98,7 +98,12 @@ function StoredMediaAttachment({
   return (
     <div className="mb-1 flex items-center justify-between gap-2 rounded-md border border-border bg-background/50 px-3 py-2 text-xs">
       <span className="truncate">{filename ?? "Document"}</span>
-      <a href={objectUrl} download={filename} className="shrink-0 font-medium text-primary underline">
+      <a
+        href={objectUrl}
+        download={filename}
+        aria-label={`Download ${filename ?? "attachment"}`}
+        className="shrink-0 font-medium text-primary underline"
+      >
         Download
       </a>
     </div>

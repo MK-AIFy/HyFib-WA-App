@@ -1,6 +1,7 @@
 import { render, screen } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { api, ApiError } from "@/lib/api";
 import type { MediaInfo } from "@/lib/media";
 import { MediaAttachment } from "./MediaAttachment";
 
@@ -37,6 +38,7 @@ describe("MediaAttachment", () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.restoreAllMocks();
   });
 
   it("shows a processing placeholder when the asset hasn't been linked to the message yet", () => {
@@ -70,14 +72,20 @@ describe("MediaAttachment", () => {
   });
 
   it("shows a processing placeholder (not an error) on a 409 media_not_ready response", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(jsonResponse(409, { error: "media_not_ready", status: "pending" }))
-    );
+    const getBlobMock = vi.spyOn(api, "getBlob").mockRejectedValue(new ApiError(409, "media_not_ready"));
 
     renderMedia({ assetId: "asset-1", mimeType: "image/png" });
 
+    // The hook configures retry: 1, so the query calls getBlob twice before
+    // settling. Wait for both attempts to land so the query has actually
+    // reached its error state — the loading state renders the identical
+    // "Attachment processing…" text, so asserting on that text alone (before
+    // the query settles) would pass even if the `error.status === 409`
+    // branch were inverted.
+    await vi.waitFor(() => expect(getBlobMock).toHaveBeenCalledTimes(2), { timeout: 5000 });
+
     expect(await screen.findByText("Attachment processing…", {}, { timeout: 3000 })).toBeInTheDocument();
+    expect(screen.queryByText("Attachment unavailable")).not.toBeInTheDocument();
   });
 
   it("shows an unavailable message on a non-409 error", async () => {
@@ -94,7 +102,7 @@ describe("MediaAttachment", () => {
 
     renderMedia({ assetId: "asset-1", mimeType: "application/pdf", filename: "invoice.pdf" });
 
-    const link = await screen.findByRole("link", { name: "Download" });
+    const link = await screen.findByRole("link", { name: "Download invoice.pdf" });
     expect(link).toHaveAttribute("href", "blob:mock-url");
     expect(link).toHaveAttribute("download", "invoice.pdf");
     expect(screen.getByText("invoice.pdf")).toBeInTheDocument();
