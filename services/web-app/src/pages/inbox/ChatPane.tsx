@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { ArrowLeft } from "lucide-react";
+import { Archive, ArrowLeft, Pin } from "lucide-react";
 import type { Conversation } from "@hyfib/shared-core";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -7,7 +7,13 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { cn } from "@/lib/utils";
 import { timeAgo } from "@/lib/format";
 import { mediaAssetOf } from "@/lib/media";
-import { messageText, useMessages, useSetConversationState } from "@/hooks/use-conversations";
+import {
+  messageText,
+  useArchiveConversation,
+  useMessages,
+  usePinConversation,
+  useSetConversationState
+} from "@/hooks/use-conversations";
 import { Composer } from "./Composer";
 import { MediaAttachment } from "./MediaAttachment";
 
@@ -16,8 +22,12 @@ const STATE_BADGE = { open: "green", pending: "yellow", closed: "gray" } as cons
 export function ChatPane({ conversation, onBack }: { conversation: Conversation; onBack?: () => void }) {
   const { data, isLoading } = useMessages(conversation.id);
   const setState = useSetConversationState(conversation.id);
+  const pinConversation = usePinConversation();
+  const archiveConversation = useArchiveConversation();
   const endRef = useRef<HTMLDivElement>(null);
   const messages = data?.items ?? [];
+  const isPinned = Boolean(conversation.pinnedAt);
+  const isArchived = Boolean(conversation.archivedAt);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ block: "end" });
@@ -36,6 +46,26 @@ export function ChatPane({ conversation, onBack }: { conversation: Conversation;
           <p className="truncate text-xs text-muted-foreground">{conversation.contactPhone}</p>
         </div>
         <Badge variant={STATE_BADGE[conversation.state]}>{conversation.state}</Badge>
+        <Button
+          variant="ghost"
+          size="icon"
+          aria-pressed={isPinned}
+          aria-label={isPinned ? "Unpin conversation" : "Pin conversation"}
+          title={isPinned ? "Unpin conversation" : "Pin conversation"}
+          onClick={() => pinConversation.mutate({ id: conversation.id, pinned: !isPinned })}
+        >
+          <Pin className={cn("size-4", isPinned && "fill-current")} aria-hidden="true" />
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon"
+          aria-pressed={isArchived}
+          aria-label={isArchived ? "Unarchive conversation" : "Archive conversation"}
+          title={isArchived ? "Unarchive conversation" : "Archive conversation"}
+          onClick={() => archiveConversation.mutate({ id: conversation.id, archived: !isArchived })}
+        >
+          <Archive className="size-4" aria-hidden="true" />
+        </Button>
         <Select
           value={conversation.state}
           onValueChange={(v) => setState.mutate(v as "open" | "pending" | "closed")}

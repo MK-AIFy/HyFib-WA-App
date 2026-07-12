@@ -86,6 +86,15 @@ function handleEvent(evt: SseEvent, queryClient: QueryClient): void {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       return;
     }
+    case "conversation.archived":
+    case "conversation.pinned": {
+      // Broadcast via sseHub.broadcast(tenantId, "conversation.archived"/"conversation.pinned",
+      // id, { conversationId, archived/pinned }) in api-gateway/src/index.ts — flat payloads,
+      // same shape as conversation.read above. A full ["conversations"] invalidation covers
+      // both the archived-folder membership change and pinned-first reordering.
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      return;
+    }
     case "whatsapp.inbound.received":
     case "whatsapp.status.updated": {
       const data = evt.payload as { payload?: { conversationId?: string } };

@@ -128,4 +128,54 @@ describe("useSse", () => {
 
     unmount();
   });
+
+  it("invalidates conversations queries on a conversation.archived event", async () => {
+    // Flat payload — { conversationId, archived } directly as `data`, matching
+    // api-gateway's sseHub.broadcast call for POST /:id/archive.
+    const frame = 'event: conversation.archived\ndata: {"conversationId":"c1","archived":true}\n\n';
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(frame));
+        controller.close();
+      }
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(stream, { status: 200 })));
+
+    const client = new QueryClient();
+    const invalidateSpy = vi.spyOn(client, "invalidateQueries");
+    function wrapper({ children }: { children: ReactNode }) {
+      return createElement(QueryClientProvider, { client }, children);
+    }
+
+    const { unmount } = renderHook(() => useSse(true), { wrapper });
+
+    await waitFor(() => expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] }));
+
+    unmount();
+  });
+
+  it("invalidates conversations queries on a conversation.pinned event", async () => {
+    // Flat payload — { conversationId, pinned } directly as `data`, matching
+    // api-gateway's sseHub.broadcast call for POST /:id/pin.
+    const frame = 'event: conversation.pinned\ndata: {"conversationId":"c1","pinned":true}\n\n';
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(frame));
+        controller.close();
+      }
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(stream, { status: 200 })));
+
+    const client = new QueryClient();
+    const invalidateSpy = vi.spyOn(client, "invalidateQueries");
+    function wrapper({ children }: { children: ReactNode }) {
+      return createElement(QueryClientProvider, { client }, children);
+    }
+
+    const { unmount } = renderHook(() => useSse(true), { wrapper });
+
+    await waitFor(() => expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] }));
+
+    unmount();
+  });
 });

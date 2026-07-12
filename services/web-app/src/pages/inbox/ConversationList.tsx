@@ -1,6 +1,7 @@
-import { useMemo, useState } from "react";
+import { Archive, Pin } from "lucide-react";
 import type { Conversation } from "@hyfib/shared-core";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -16,39 +17,63 @@ interface Props {
    * locally here: InboxPage needs to read live rows for whatever tab is
    * currently displayed (to know when to re-fire mark-read on a fresh
    * inbound), and that's only correct if it queries the SAME
-   * `["conversations", { state }]` cache entry this list renders from. A
-   * locally-owned `state` here + a separately-fixed `state` in InboxPage
-   * (e.g. always "all") would let the two diverge whenever the user is on a
-   * non-default tab — see Task 22 review finding 1.
+   * `["conversations", { state, q, archived }]` cache entry this list
+   * renders from. A locally-owned `state`/`q`/`archived` here diverging from
+   * what InboxPage passes to its own useConversations call would let the two
+   * cache entries split apart whenever the user searches, filters archived,
+   * or is on a non-default tab — see Task 22 review finding 1 (state) and
+   * Task 24 (q/archived extend the same invariant).
    */
   state: ConvStateFilter;
   onStateChange: (state: ConvStateFilter) => void;
+  /** Raw (un-debounced) search box value — controlled from InboxPage so typing stays responsive. */
+  search: string;
+  onSearchChange: (value: string) => void;
+  /** Debounced search value actually sent to useConversations — MUST match InboxPage's own call. */
+  q: string;
+  archived: boolean;
+  onArchivedChange: (archived: boolean) => void;
 }
 
-export function ConversationList({ activeId, onSelect, state, onStateChange }: Props) {
-  const [search, setSearch] = useState("");
-  const { data, isLoading } = useConversations(state);
-
-  const items = useMemo(() => {
-    const all = data?.items ?? [];
-    const q = search.trim().toLowerCase();
-    if (!q) return all;
-    // Client-side filter over the loaded page; server-side search is a
-    // flagged backend follow-up (see plan "Out of scope").
-    return all.filter((c) =>
-      [c.contactName, c.contactPhone, c.lastMessage].some((f) => f?.toLowerCase().includes(q))
-    );
-  }, [data, search]);
+export function ConversationList({
+  activeId,
+  onSelect,
+  state,
+  onStateChange,
+  search,
+  onSearchChange,
+  q,
+  archived,
+  onArchivedChange
+}: Props) {
+  // Server now does the filtering/sorting (search on contact name/phone,
+  // archived-folder membership, pinned-first ordering) — no client-side
+  // useMemo filter or sort needed; `items` is rendered straight off the page.
+  const { data, isLoading } = useConversations(state, q, archived);
+  const items = data?.items ?? [];
 
   return (
     <div className="flex h-full w-full flex-col border-r border-border md:w-80">
       <div className="flex flex-col gap-2 border-b border-border p-3">
-        <Input
-          placeholder="Search loaded conversations…"
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          aria-label="Search conversations"
-        />
+        <div className="flex items-center gap-2">
+          <Input
+            placeholder="Search conversations…"
+            value={search}
+            onChange={(e) => onSearchChange(e.target.value)}
+            aria-label="Search conversations"
+          />
+          <Button
+            type="button"
+            variant={archived ? "secondary" : "ghost"}
+            size="icon"
+            aria-pressed={archived}
+            aria-label={archived ? "Show active conversations" : "Show archived conversations"}
+            title={archived ? "Showing archived" : "Show archived"}
+            onClick={() => onArchivedChange(!archived)}
+          >
+            <Archive className="size-4" aria-hidden="true" />
+          </Button>
+        </div>
         <Tabs value={state} onValueChange={(v) => onStateChange(v as ConvStateFilter)}>
           <TabsList className="w-full">
             <TabsTrigger value="all">All</TabsTrigger>
@@ -84,8 +109,13 @@ export function ConversationList({ activeId, onSelect, state, onStateChange }: P
                   </span>
                   <span className="min-w-0 flex-1">
                     <span className="flex items-center justify-between gap-2">
-                      <span className="truncate text-sm font-medium">
-                        {c.contactName || c.contactPhone || "Unknown"}
+                      <span className="flex min-w-0 items-center gap-1">
+                        {c.pinnedAt ? (
+                          <Pin className="size-3 shrink-0 text-muted-foreground" aria-label="Pinned" />
+                        ) : null}
+                        <span className="truncate text-sm font-medium">
+                          {c.contactName || c.contactPhone || "Unknown"}
+                        </span>
                       </span>
                       <span className="shrink-0 text-xs text-muted-foreground">{timeAgo(c.lastMessageAt)}</span>
                     </span>

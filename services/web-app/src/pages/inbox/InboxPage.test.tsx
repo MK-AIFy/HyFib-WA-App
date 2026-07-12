@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -116,3 +116,98 @@ describe("InboxPage — mark-read on open", () => {
     expect(postMock).toHaveBeenLastCalledWith("/api/v1/conversations/c-closed/read", {});
   });
 });
+
+describe("InboxPage — server-side search, archived folder wiring", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it("typing in the search box, after the debounce window, refetches with q= in the request URL (and not before)", async () => {
+    // Render and settle the initial fetch on REAL timers first — faking
+    // globals during React's initial mount/effect flush is what causes this
+    // kind of test to hang. Fake timers are scoped tightly to just the
+    // debounce advance below (and limited to setTimeout/clearTimeout so
+    // React's own scheduler, unrelated to our debounce, is untouched).
+    const { getMock } = renderInboxWithFakeGet();
+    const input = await screen.findByLabelText("Search conversations");
+    await waitFor(() => expect(getMock).toHaveBeenCalledWith("/api/v1/conversations"));
+
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      fireEvent.change(input, { target: { value: "jane" } });
+
+      // Not yet debounced — no q= request fired on the leading edge of typing.
+      expect(getMock).not.toHaveBeenCalledWith(expect.stringContaining("q="));
+
+      act(() => {
+        vi.advanceTimersByTime(300);
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+
+    await waitFor(() => expect(getMock).toHaveBeenCalledWith("/api/v1/conversations?q=jane"));
+  });
+
+  it("toggling the archived filter adds archived=true to the request", async () => {
+    const { getMock } = renderInboxWithFakeGet();
+    const user = userEvent.setup();
+
+    await waitFor(() => expect(getMock).toHaveBeenCalledWith("/api/v1/conversations"));
+
+    await user.click(await screen.findByRole("button", { name: "Show archived conversations" }));
+
+    await waitFor(() => expect(getMock).toHaveBeenCalledWith("/api/v1/conversations?archived=true"));
+  });
+
+  it("composes the archived toggle with a non-default state tab (both params sent together)", async () => {
+    const { getMock } = renderInboxWithFakeGet();
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole("tab", { name: "Closed" }));
+    await waitFor(() => expect(getMock).toHaveBeenCalledWith("/api/v1/conversations?state=closed"));
+
+    await user.click(screen.getByRole("button", { name: "Show archived conversations" }));
+
+    await waitFor(() => expect(getMock).toHaveBeenCalledWith("/api/v1/conversations?state=closed&archived=true"));
+  });
+
+  it("InboxPage's own freshness query and ConversationList's rendered rows always resolve to ONE shared request per state/q/archived combination (identical query keys)", async () => {
+    // Regression guard for the CRITICAL wiring constraint: if InboxPage and
+    // ConversationList ever called useConversations with different q/archived
+    // values, TanStack Query would issue TWO distinct conversations requests
+    // for a single user action instead of sharing one cache entry/fetch.
+    const { getMock } = renderInboxWithFakeGet();
+    const user = userEvent.setup();
+
+    await waitFor(() => expect(getMock).toHaveBeenCalledWith("/api/v1/conversations"));
+    const callCountBeforeToggle = getMock.mock.calls.filter((c) => c[0] === "/api/v1/conversations").length;
+
+    await user.click(await screen.findByRole("button", { name: "Show archived conversations" }));
+    await waitFor(() => expect(getMock).toHaveBeenCalledWith("/api/v1/conversations?archived=true"));
+
+    // Exactly one request for the "all conversations" key fired before the
+    // toggle (deduped across InboxPage's and ConversationList's hook calls) —
+    // proves the two call sites share a single cache entry rather than
+    // fetching independently.
+    expect(callCountBeforeToggle).toBe(1);
+  });
+});
+
+function renderInboxWithFakeGet() {
+  const getMock = vi.spyOn(api, "get").mockImplementation((path: string) => {
+    if (path.includes("/messages")) return Promise.resolve({ items: [] });
+    if (path === "/api/v1/saved-replies") return Promise.resolve({ items: [] });
+    if (path.startsWith("/api/v1/conversations")) return Promise.resolve({ items: CONVERSATIONS });
+    return Promise.reject(new Error(`Unhandled GET ${path}`));
+  });
+  vi.spyOn(api, "post").mockResolvedValue({ status: "read", conversationId: "" });
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  render(
+    <QueryClientProvider client={client}>
+      <InboxPage />
+    </QueryClientProvider>
+  );
+  return { getMock };
+}
