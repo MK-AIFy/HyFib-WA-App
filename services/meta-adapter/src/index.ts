@@ -65,6 +65,10 @@ const BASE_BACKOFF_MS = 500;
 // up to 100MB are not accepted through this endpoint. Keep in sync with the
 // gateway's upload limit and nginx client_max_body_size.
 const MEDIA_UPLOAD_MAX_BYTES = 16 * 1024 * 1024;
+// fetchMediaDirect: resolve + download counts as one attempt. A second attempt
+// only happens to re-resolve an expired download URL; the worker's outbox
+// retry is the real backstop for anything beyond that.
+const MEDIA_FETCH_MAX_ATTEMPTS = 2;
 let consecutiveFailures = 0;
 let breakerOpenUntil = 0;
 
@@ -415,6 +419,182 @@ export async function metaDispatch(
     default:
       return { status: 404, body: { error: "unknown_meta_endpoint", endpoint } };
   }
+}
+
+export interface FetchedMedia {
+  buffer: Buffer;
+  mimeType?: string;
+  sha256?: string;
+  fileSizeBytes: number;
+}
+
+export interface MediaFetchResult {
+  status: number;
+  media?: FetchedMedia;
+  error?: string;
+}
+
+interface ResolvedMediaUrl {
+  url: string;
+  mimeType?: string;
+  sha256?: string;
+}
+
+type ResolveOutcome = { ok: true; data: ResolvedMediaUrl } | { ok: false; status: number; error: string };
+
+type DownloadOutcome =
+  | { ok: true; buffer: Buffer; contentType?: string }
+  | { ok: false; kind: "cap"; status: 413; error: "media_too_large" }
+  | { ok: false; kind: "network"; status: 503; error: "meta_adapter_unavailable" }
+  | { ok: false; kind: "http"; status: number; error: "meta_media_download_failed" };
+
+/**
+ * Resolves a Graph media id to a short-lived download URL + metadata. Mirrors
+ * the `/internal/v1/whatsapp/media/:id` metadata route's error mapping
+ * (always 502 for a non-OK Graph response, 503 for a network/timeout
+ * failure) so fetchMediaDirect and that HTTP route behave identically.
+ * Never logs the token or the resolved (short-lived) URL.
+ */
+async function resolveMediaUrl(
+  fetchImpl: typeof fetch,
+  mediaId: string,
+  token: string,
+  requestId?: string
+): Promise<ResolveOutcome> {
+  try {
+    const response = await fetchImpl(`https://graph.facebook.com/${config.whatsappGraphVersion}/${mediaId}`, {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(10_000)
+    });
+    if (!response.ok) {
+      logger.warn("meta_media_resolve_failed", { requestId, mediaId, statusCode: response.status });
+      return { ok: false, status: 502, error: "meta_media_failed" };
+    }
+    const body = (await response.json()) as { url?: string; mime_type?: string; sha256?: string };
+    if (!body.url) {
+      logger.warn("meta_media_resolve_missing_url", { requestId, mediaId });
+      return { ok: false, status: 502, error: "meta_media_failed" };
+    }
+    return { ok: true, data: { url: body.url, mimeType: body.mime_type, sha256: body.sha256 } };
+  } catch (error) {
+    logger.error("meta_media_resolve_exception", {
+      requestId,
+      mediaId,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return { ok: false, status: 503, error: "meta_adapter_unavailable" };
+  }
+}
+
+/**
+ * Downloads media bytes from a resolved Graph URL, enforcing
+ * MEDIA_UPLOAD_MAX_BYTES against both the advertised content-length header
+ * (fast rejection) and the actual downloaded buffer length (authoritative —
+ * a missing/lying content-length must not bypass the cap). Never logs the
+ * token or the URL (it is short-lived but still sensitive).
+ */
+async function downloadMediaBytes(
+  fetchImpl: typeof fetch,
+  url: string,
+  token: string,
+  requestId?: string
+): Promise<DownloadOutcome> {
+  let response: Response;
+  try {
+    response = await fetchImpl(url, {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(60_000)
+    });
+  } catch (error) {
+    logger.error("meta_media_download_exception", {
+      requestId,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return { ok: false, kind: "network", status: 503, error: "meta_adapter_unavailable" };
+  }
+
+  if (!response.ok) {
+    logger.warn("meta_media_download_failed", { requestId, statusCode: response.status });
+    return { ok: false, kind: "http", status: response.status, error: "meta_media_download_failed" };
+  }
+
+  const contentLengthHeader = response.headers.get("content-length");
+  const contentLength = contentLengthHeader ? Number(contentLengthHeader) : NaN;
+  if (Number.isFinite(contentLength) && contentLength > MEDIA_UPLOAD_MAX_BYTES) {
+    logger.warn("meta_media_too_large", { requestId, contentLength });
+    return { ok: false, kind: "cap", status: 413, error: "media_too_large" };
+  }
+
+  const arrayBuffer = await response.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+  if (buffer.length > MEDIA_UPLOAD_MAX_BYTES) {
+    logger.warn("meta_media_too_large", { requestId, actualBytes: buffer.length });
+    return { ok: false, kind: "cap", status: 413, error: "media_too_large" };
+  }
+
+  return { ok: true, buffer, contentType: response.headers.get("content-type") ?? undefined };
+}
+
+/**
+ * Direct in-process media download: resolves the Graph media id to a
+ * short-lived URL and downloads it, re-resolving once if the URL has
+ * expired (401/403/404 on download). Never stores/reuses URLs across calls —
+ * a fresh one is fetched at the start of every attempt, per Meta's ~5 minute
+ * download-URL lifetime (the media id itself stays retrievable ~30 days).
+ * Self-contained: uses opts.fetchImpl directly instead of the shared
+ * graphRequest helper (retry/backoff/circuit-breaker) so it stays cheaply
+ * testable with a fake fetch — the worker's own outbox retry is the real
+ * backstop for anything beyond the 2 attempts here.
+ */
+export async function fetchMediaDirect(
+  mediaId: string,
+  accessToken?: string,
+  opts?: { fetchImpl?: typeof fetch; requestId?: string }
+): Promise<MediaFetchResult> {
+  const fetchImpl = opts?.fetchImpl ?? fetch;
+  const requestId = opts?.requestId;
+  const token = accessToken || config.whatsappAccessToken || undefined;
+
+  if (!token) {
+    logger.warn("meta_media_fetch_no_token", { requestId, mediaId });
+    return { status: 503, error: "meta_adapter_unavailable" };
+  }
+
+  let lastFailure: { status: number; error: string } | undefined;
+
+  for (let attempt = 1; attempt <= MEDIA_FETCH_MAX_ATTEMPTS; attempt += 1) {
+    const resolved = await resolveMediaUrl(fetchImpl, mediaId, token, requestId);
+    if (!resolved.ok) {
+      return { status: resolved.status, error: resolved.error };
+    }
+
+    const downloaded = await downloadMediaBytes(fetchImpl, resolved.data.url, token, requestId);
+    if (downloaded.ok) {
+      return {
+        status: 200,
+        media: {
+          buffer: downloaded.buffer,
+          mimeType: downloaded.contentType ?? resolved.data.mimeType,
+          sha256: resolved.data.sha256,
+          fileSizeBytes: downloaded.buffer.length
+        }
+      };
+    }
+
+    if (downloaded.kind === "cap" || downloaded.kind === "network") {
+      return { status: downloaded.status, error: downloaded.error };
+    }
+
+    lastFailure = { status: 502, error: downloaded.error };
+    const expiredUrl = downloaded.status === 401 || downloaded.status === 403 || downloaded.status === 404;
+    if (expiredUrl && attempt < MEDIA_FETCH_MAX_ATTEMPTS) {
+      logger.info("meta_media_url_expired_retry", { requestId, mediaId, attempt });
+      continue;
+    }
+    return lastFailure;
+  }
+
+  return lastFailure ?? { status: 502, error: "meta_media_download_failed" };
 }
 
 const server = createServer(async (req, res) => {
@@ -850,6 +1030,33 @@ const server = createServer(async (req, res) => {
         details: error instanceof Error ? error.message : String(error)
       });
     }
+    return;
+  }
+
+  // Standalone-mode parity for fetchMediaDirect: resolves the media id to a
+  // fresh Graph URL and streams the bytes back. Must be matched before the
+  // metadata route below since that route matches on the same path prefix.
+  if (path.startsWith("/internal/v1/whatsapp/media/") && path.endsWith("/download")) {
+    if (method !== "GET") {
+      methodNotAllowed(res);
+      return;
+    }
+    const mediaId = path.slice("/internal/v1/whatsapp/media/".length, -"/download".length).trim();
+    if (!mediaId) {
+      sendJson(res, 400, { error: "mediaId is required" });
+      return;
+    }
+    const query = parseQuery(req.url);
+    const accessToken = query.get("accessToken") ?? undefined;
+    const result = await fetchMediaDirect(mediaId, accessToken, { requestId: ctx.requestId });
+    if (!result.media) {
+      sendJson(res, result.status, { error: result.error });
+      return;
+    }
+    res.statusCode = result.status;
+    res.setHeader("Content-Type", result.media.mimeType ?? "application/octet-stream");
+    res.setHeader("Content-Length", result.media.fileSizeBytes);
+    res.end(result.media.buffer);
     return;
   }
 
