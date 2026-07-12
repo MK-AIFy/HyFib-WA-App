@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { toast } from "sonner";
 import type { Conversation } from "@hyfib/shared-core";
 import { api } from "@/lib/api";
 import { InboxPage } from "./InboxPage";
@@ -375,5 +376,121 @@ describe("InboxPage — message search result selection (Task 26)", () => {
     await waitFor(() => expect(postMock).toHaveBeenCalledWith("/api/v1/conversations/c-hidden/read", {}), {
       timeout: 3000
     });
+  });
+});
+
+describe("InboxPage — bounded archived-aware fallback for message search selection (review finding 1)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it("escalates to the archived view (one bounded second attempt) and selects a search hit that only exists there", async () => {
+    // The default (non-archived) list NEVER contains this conversation — only
+    // the archived one does. Search hits carry no archived signal up front,
+    // so InboxPage must try the default reset first, find nothing, then
+    // escalate exactly once to archived=true before it can resolve this.
+    const archivedConv = conv({ id: "c-archived", unreadCount: 1, contactName: "Archived Contact" });
+    const searchResult = {
+      id: "sm2",
+      conversationId: "c-archived",
+      direction: "inbound" as const,
+      status: "delivered" as const,
+      createdAt: "2026-07-12T00:00:00.000Z",
+      text: "a message whose conversation lives only in the archived folder",
+      contactName: "Archived Contact"
+    };
+    const postMock = vi.spyOn(api, "post").mockResolvedValue({ status: "read", conversationId: "" });
+    const getMock = vi.spyOn(api, "get").mockImplementation((path: string) => {
+      if (path.startsWith("/api/v1/messages/search")) {
+        return Promise.resolve({ items: [searchResult], total: 1, limit: 20, offset: 0 });
+      }
+      if (path.includes("/messages")) return Promise.resolve({ items: [] });
+      if (path === "/api/v1/saved-replies") return Promise.resolve({ items: [] });
+      if (path === "/api/v1/conversations") return Promise.resolve({ items: CONVERSATIONS });
+      if (path === "/api/v1/conversations?archived=true") return Promise.resolve({ items: [archivedConv] });
+      if (path.startsWith("/api/v1/conversations")) return Promise.resolve({ items: CONVERSATIONS });
+      return Promise.reject(new Error(`Unhandled GET ${path}`));
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <InboxPage />
+      </QueryClientProvider>
+    );
+    const user = userEvent.setup();
+
+    await waitFor(() => expect(getMock).toHaveBeenCalledWith("/api/v1/conversations"));
+
+    const input = await screen.findByLabelText("Search conversations");
+    await user.type(input, "archived folder");
+    await user.click(await screen.findByRole("tab", { name: "Messages" }));
+    await user.click(await screen.findByText("Archived Contact"));
+
+    // The bounded second attempt: escalated to the archived view.
+    await waitFor(() => expect(getMock).toHaveBeenCalledWith("/api/v1/conversations?archived=true"));
+    await screen.findByRole("button", { name: "Show active conversations" });
+
+    // Selection completed against the archived list — proven via mark-read firing.
+    await waitFor(() => expect(postMock).toHaveBeenCalledWith("/api/v1/conversations/c-archived/read", {}), {
+      timeout: 3000
+    });
+  });
+
+  it("disarms the pending selection and surfaces feedback when the target is in neither the default nor archived view (no lingering scan)", async () => {
+    const searchResult = {
+      id: "sm3",
+      conversationId: "c-ghost",
+      direction: "inbound" as const,
+      status: "delivered" as const,
+      createdAt: "2026-07-12T00:00:00.000Z",
+      text: "a message pointing at a conversation that never resolves",
+      contactName: "Ghost Contact"
+    };
+    const postMock = vi.spyOn(api, "post").mockResolvedValue({ status: "read", conversationId: "" });
+    const getMock = vi.spyOn(api, "get").mockImplementation((path: string) => {
+      if (path.startsWith("/api/v1/messages/search")) {
+        return Promise.resolve({ items: [searchResult], total: 1, limit: 20, offset: 0 });
+      }
+      if (path.includes("/messages")) return Promise.resolve({ items: [] });
+      if (path === "/api/v1/saved-replies") return Promise.resolve({ items: [] });
+      // Neither the default nor the archived view ever contains the target.
+      if (path.startsWith("/api/v1/conversations")) return Promise.resolve({ items: CONVERSATIONS });
+      return Promise.reject(new Error(`Unhandled GET ${path}`));
+    });
+    const toastErrorSpy = vi.spyOn(toast, "error").mockImplementation(() => "");
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <InboxPage />
+      </QueryClientProvider>
+    );
+    const user = userEvent.setup();
+
+    await waitFor(() => expect(getMock).toHaveBeenCalledWith("/api/v1/conversations"));
+
+    const input = await screen.findByLabelText("Search conversations");
+    await user.type(input, "ghost");
+    await user.click(await screen.findByRole("tab", { name: "Messages" }));
+    await user.click(await screen.findByText("Ghost Contact"));
+
+    // Escalated to archived (second bounded attempt)...
+    await waitFor(() => expect(getMock).toHaveBeenCalledWith("/api/v1/conversations?archived=true"));
+    // ...which also settles empty, so the fallback disarms and tells the user.
+    await waitFor(() => expect(toastErrorSpy).toHaveBeenCalledTimes(1));
+    expect(toastErrorSpy).toHaveBeenCalledWith(expect.stringContaining("Couldn't open that conversation"));
+
+    // No lingering scan: once pendingSelect is disarmed, a LATER data change
+    // that would satisfy the old target id must NOT retroactively select it.
+    client.setQueryData(["conversations", { state: "all", archived: true }], {
+      items: [{ ...CONVERSATIONS[0], id: "c-ghost", contactName: "Ghost Contact", unreadCount: 5 }]
+    });
+
+    // Wait for the injected row to actually land in the (now-visible, since
+    // search was cleared by the fallback) conversation list — proof the
+    // re-render with the new data happened — then assert it was never
+    // auto-selected/mark-read despite now being resolvable by id.
+    await waitFor(() => expect(screen.getByText("Ghost Contact")).toBeInTheDocument());
+    expect(postMock).not.toHaveBeenCalled();
   });
 });

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import type { Conversation } from "@hyfib/shared-core";
+import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { useConversations, useMarkRead, type ConvStateFilter } from "@/hooks/use-conversations";
 import { useDebouncedValue } from "@/hooks/use-debounced-value";
@@ -42,9 +43,18 @@ export function InboxPage() {
   const [scope, setScope] = useState<SearchScope>("conversations");
   // Set only while resolving a message-search result whose conversation
   // wasn't present in the currently loaded (possibly filtered) list — see
-  // selectConversationById below.
-  const [pendingSelectId, setPendingSelectId] = useState<string | undefined>();
-  const { data } = useConversations(state, query, archived);
+  // selectConversationById below. `stage` is a bounded two-step ladder:
+  //  - "default": filters were just reset to state=all/q=""/archived=false
+  //    and we're waiting for THAT list to settle (search hits carry no
+  //    archived signal, so the non-archived view is tried first).
+  //  - "archived": the "default" view settled without the target, so we
+  //    escalate exactly once more by flipping archived=true.
+  // If "archived" also settles without a match, the render-body resolver
+  // below disarms this (back to undefined) and surfaces feedback instead of
+  // leaving it armed to silently re-scan every future render (review
+  // finding 1, Task 26 re-review).
+  const [pendingSelect, setPendingSelect] = useState<{ id: string; stage: "default" | "archived" } | undefined>();
+  const { data, isFetching, isPlaceholderData } = useConversations(state, query, archived);
 
   const freshActive = active ? data?.items.find((c) => c.id === active.id) : undefined;
   const selectedId = active?.id;
@@ -60,37 +70,76 @@ export function InboxPage() {
   // /api/v1/conversations exist), so when the target isn't in the current
   // (possibly filtered) page, the smallest correct fallback is resetting the
   // filters to their defaults so the list broadens/refetches, then finishing
-  // the selection once that row appears (see the render-body check below).
-  // Known residual gap: if the target conversation is itself archived,
-  // resetting `archived` to false won't surface it — left for a future
-  // single-conversation fetch.
+  // the selection once that row appears (see the render-body resolver
+  // below, which also escalates to the archived view and bounds the
+  // fallback with feedback — review finding 1, Task 26 re-review).
   function selectConversationById(conversationId: string) {
     const found = data?.items.find((c) => c.id === conversationId);
     if (found) {
       select(found);
       return;
     }
-    setPendingSelectId(conversationId);
+    setPendingSelect({ id: conversationId, stage: "default" });
     setState("all");
     setArchived(false);
     setRawQuery("");
   }
 
-  // Resolves a pending fallback selection the moment `data` (already updated
-  // by the filter reset above) contains the target row. Deliberately done
-  // HERE, directly in the render body, rather than in a useEffect: `data`
-  // changing is itself what re-renders this component (TanStack Query owns
-  // that), so this is "adjusting state when a dependency changes" — React's
-  // documented alternative to an effect for this exact shape. It's
-  // self-limiting (setPendingSelectId(undefined) below makes the condition
-  // false on the very next render), so it converges in one extra render
-  // pass, never loops, and — unlike an effect — never commits/flashes the
-  // stale "not yet selected" frame to the screen first.
-  if (pendingSelectId && data) {
-    const found = data.items.find((c) => c.id === pendingSelectId);
+  // Resolves (or bounds) a pending fallback selection once `data` has
+  // actually SETTLED for the CURRENT query key — not while a fetch for that
+  // key is still in flight or still showing `keepPreviousData`'s placeholder
+  // from the OLD key. Judging "not found" against a stale/in-flight `data`
+  // would disarm or escalate prematurely, before the broadened/archived list
+  // it's supposed to check has actually landed.
+  //
+  // Deliberately done HERE, directly in the render body, rather than in a
+  // useEffect: `data`/`isFetching`/`isPlaceholderData` changing is itself
+  // what re-renders this component (TanStack Query owns that), so this is
+  // "adjusting state when a dependency changes" — React's documented
+  // alternative to an effect for this exact shape (and, unlike an effect,
+  // it never commits/flashes the stale "not yet selected" frame first).
+  //
+  // Why this can't loop: `stage` only ever advances through a strictly
+  // bounded ladder — "default" -> "archived" -> disarmed (undefined) — and
+  // every branch below either finishes (select + clear `pendingSelect`) or
+  // advances the stage while flipping `archived`, which is the only thing
+  // that can make `settled` false again on the next render. No branch ever
+  // re-arms "default" or retries "archived" for the same id, so at most two
+  // resolve passes run before this is guaranteed to disarm.
+  // `settled` alone isn't enough: right after selectConversationById resets
+  // state/archived/rawQuery, `query` (the DEBOUNCED search value) still lags
+  // behind rawQuery for up to the debounce window, so `data` can transiently
+  // reflect a stale, only-partially-reset key (e.g. state="all" but q is
+  // still the old search text) that TanStack Query has already fully
+  // fetched/settled for. Judging "not found" against THAT key — instead of
+  // the fully-reset one this stage is actually meant to check — is exactly
+  // what caused a premature escalation/disarm in practice. `stageFiltersSettled`
+  // requires state/archived/query to all match what this stage reset them to
+  // before trusting `data`'s found/not-found verdict.
+  const settled = !isFetching && !isPlaceholderData;
+  const stageFiltersSettled =
+    pendingSelect !== undefined &&
+    state === "all" &&
+    query.trim().length === 0 &&
+    archived === (pendingSelect.stage === "archived");
+  if (pendingSelect && data && settled && stageFiltersSettled) {
+    const found = data.items.find((c) => c.id === pendingSelect.id);
     if (found) {
       select(found);
-      setPendingSelectId(undefined);
+      setPendingSelect(undefined);
+    } else if (pendingSelect.stage === "default") {
+      // Search hits carry no archived signal up front — the target may
+      // simply live in the archived folder. One bounded second attempt
+      // before giving up.
+      setPendingSelect({ id: pendingSelect.id, stage: "archived" });
+      setArchived(true);
+    } else {
+      // Both the default and archived views settled without the target —
+      // it's genuinely unreachable (deleted, wrong tenant, etc). Disarm so
+      // this stops re-scanning every future render, and tell the user
+      // instead of silently no-op'ing.
+      setPendingSelect(undefined);
+      toast.error("Couldn't open that conversation — it may no longer be available.");
     }
   }
 
