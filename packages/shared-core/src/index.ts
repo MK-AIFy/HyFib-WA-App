@@ -539,7 +539,9 @@ export const EventTopics = {
   AutomationTemplateRequested: "automation.template.requested",
   CommerceOrderEvent: "commerce.order.event",
   ComplianceOptOutEvent: "compliance.optout.event",
-  AuditEventRecorded: "audit.event.recorded"
+  AuditEventRecorded: "audit.event.recorded",
+  MediaFetchRequested: "media.fetch.requested",
+  MediaStored: "media.stored"
 } as const;
 
 export type EventTopic = (typeof EventTopics)[keyof typeof EventTopics];
@@ -554,4 +556,21 @@ export interface AutomationTemplateRequest {
   templateLanguage: string;
   /** Caller-assigned idempotency key, stable across outbox replay. See WhatsAppOutboundRequest.dispatchId. */
   dispatchId?: string;
+}
+
+/**
+ * Requests that the Meta media adapter fetch an inbound media asset's bytes
+ * and persist them. Enqueued when a webhook message carries a media id;
+ * consumed by the notification-worker media consumer (later task).
+ */
+export interface MediaFetchRequest {
+  tenantId: string;
+  channelId: string;
+  phoneNumberId?: string;
+  conversationId: string;
+  messageId: string;
+  mediaId: string;
+  mimeType?: string;
+  filename?: string;
+  sha256?: string;
 }

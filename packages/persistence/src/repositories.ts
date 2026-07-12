@@ -1646,6 +1646,20 @@ export const messageRepository = {
       return (result.rowCount ?? 0) > 0;
     });
   },
+  /**
+   * Merges arbitrary keys into a message's JSONB payload by primary key,
+   * without touching existing fields not present in the patch. Used by the
+   * media pipeline to attach fetch status onto the originating message.
+   */
+  async mergePayloadById(tenantId: string, messageId: string, patch: Record<string, unknown>): Promise<boolean> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query(`UPDATE messages SET payload = payload || $2::jsonb WHERE id = $1`, [
+        messageId,
+        JSON.stringify(patch)
+      ]);
+      return (result.rowCount ?? 0) > 0;
+    });
+  },
   async listByConversation(
     tenantId: string,
     conversationId: string,
@@ -2739,6 +2753,171 @@ export const billingRepository = {
         []
       );
       return Number(result.rows[0]?.count ?? "0");
+    });
+  }
+};
+
+export type MediaAssetStatus = "pending" | "stored" | "failed";
+
+export interface MediaAssetMeta {
+  id: string;
+  metaMediaId: string;
+  messageId?: string;
+  conversationId?: string;
+  mimeType?: string;
+  filename?: string;
+  sha256?: string;
+  fileSizeBytes?: number;
+  status: MediaAssetStatus;
+  error?: string;
+  createdAt: string;
+  fetchedAt?: string;
+}
+
+export interface MediaAssetForServing {
+  status: MediaAssetStatus;
+  bytes?: Buffer;
+  mimeType?: string;
+  filename?: string;
+  fileSizeBytes?: number;
+}
+
+interface MediaAssetMetaRow {
+  id: string;
+  meta_media_id: string;
+  message_id: string | null;
+  conversation_id: string | null;
+  mime_type: string | null;
+  filename: string | null;
+  sha256: string | null;
+  file_size_bytes: string | null;
+  status: string;
+  error: string | null;
+  created_at: Date;
+  fetched_at: Date | null;
+}
+
+function mapMediaAssetMeta(row: MediaAssetMetaRow): MediaAssetMeta {
+  return {
+    id: row.id,
+    metaMediaId: row.meta_media_id,
+    messageId: row.message_id ?? undefined,
+    conversationId: row.conversation_id ?? undefined,
+    mimeType: row.mime_type ?? undefined,
+    filename: row.filename ?? undefined,
+    sha256: row.sha256 ?? undefined,
+    fileSizeBytes: row.file_size_bytes != null ? Number(row.file_size_bytes) : undefined,
+    status: row.status as MediaAssetStatus,
+    error: row.error ?? undefined,
+    createdAt: row.created_at.toISOString(),
+    fetchedAt: row.fetched_at ? row.fetched_at.toISOString() : undefined
+  };
+}
+
+/**
+ * Storage for fetched inbound media bytes (see 016_media_assets.sql). Rows
+ * are created `pending` when a webhook message references a media id, then
+ * transition to `stored` (bytes present) or `failed` (error present) once
+ * the meta-adapter attempts the Graph API fetch — see MediaFetchRequest /
+ * MediaStored in @hyfib/shared-core.
+ */
+export const mediaRepository = {
+  /**
+   * Creates the pending row for a newly-seen (tenant, metaMediaId), or is a
+   * no-op re-affirmation if it already exists. `message_id` is COALESCEd so
+   * a later webhook referencing the same media id never clobbers the
+   * message that first introduced it.
+   */
+  async upsertPending(
+    tenantId: string,
+    input: {
+      metaMediaId: string;
+      messageId: string;
+      conversationId: string;
+      mimeType?: string;
+      filename?: string;
+      sha256?: string;
+    }
+  ): Promise<{ id: string; status: MediaAssetStatus }> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<{ id: string; status: string }>(
+        `INSERT INTO media_assets (tenant_id, meta_media_id, message_id, conversation_id, mime_type, filename, sha256)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (tenant_id, meta_media_id) DO UPDATE
+           SET message_id = COALESCE(media_assets.message_id, EXCLUDED.message_id)
+         RETURNING id, status`,
+        [
+          tenantId,
+          input.metaMediaId,
+          input.messageId,
+          input.conversationId,
+          input.mimeType ?? null,
+          input.filename ?? null,
+          input.sha256 ?? null
+        ]
+      );
+      const row = result.rows[0]!;
+      return { id: row.id, status: row.status as MediaAssetStatus };
+    });
+  },
+  /** Persists fetched bytes and transitions the row to `stored`, clearing any prior error. */
+  async markStored(
+    tenantId: string,
+    id: string,
+    input: { bytes: Buffer; mimeType?: string; fileSizeBytes: number }
+  ): Promise<boolean> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query(
+        `UPDATE media_assets
+         SET bytes = $2, mime_type = COALESCE($3, mime_type), file_size_bytes = $4,
+             status = 'stored', fetched_at = now(), error = NULL
+         WHERE id = $1`,
+        [id, input.bytes, input.mimeType ?? null, input.fileSizeBytes]
+      );
+      return (result.rowCount ?? 0) > 0;
+    });
+  },
+  /** Records a failed fetch attempt. Leaves `bytes` untouched (there may be none). */
+  async recordError(tenantId: string, id: string, error: string): Promise<boolean> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query(
+        `UPDATE media_assets SET status = 'failed', error = left($2, 2000) WHERE id = $1`,
+        [id, error]
+      );
+      return (result.rowCount ?? 0) > 0;
+    });
+  },
+  /** Metadata lookup for UI/API consumers — never returns the `bytes` column. */
+  async getMeta(tenantId: string, id: string): Promise<MediaAssetMeta | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<MediaAssetMetaRow>(
+        `SELECT id, meta_media_id, message_id, conversation_id, mime_type, filename, sha256,
+                file_size_bytes, status, error, created_at, fetched_at
+         FROM media_assets WHERE id = $1`,
+        [id]
+      );
+      return result.rows[0] ? mapMediaAssetMeta(result.rows[0]) : undefined;
+    });
+  },
+  /** Fetches the bytes + serving metadata for the gateway serve route (later task). Null-safe when still `pending`. */
+  async getForServing(tenantId: string, id: string): Promise<MediaAssetForServing | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<{
+        bytes: Buffer | null;
+        mime_type: string | null;
+        filename: string | null;
+        file_size_bytes: string | null;
+        status: string;
+      }>(`SELECT bytes, mime_type, filename, file_size_bytes, status FROM media_assets WHERE id = $1`, [id]);
+      const row = result.rows[0];
+      if (!row) return undefined;
+      return {
+        status: row.status as MediaAssetStatus,
+        bytes: row.bytes ?? undefined,
+        mimeType: row.mime_type ?? undefined,
+        filename: row.filename ?? undefined,
+        fileSizeBytes: row.file_size_bytes != null ? Number(row.file_size_bytes) : undefined
+      };
     });
   }
 };
