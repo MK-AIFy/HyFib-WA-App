@@ -97,6 +97,21 @@ describe("useConversations — query string construction and query-key compatibi
     await waitFor(() => expect(getMock).toHaveBeenLastCalledWith("/api/v1/conversations?archived=true"));
   });
 
+  it("trims a whitespace-only q to undefined — no q= param, and the key collapses to the canonical unset shape (review finding 2)", async () => {
+    const getMock = vi.spyOn(api, "get").mockResolvedValue({ items: [] });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    const { result } = renderHook(() => useConversations("all", "   "), { wrapper: wrapperFor(client) });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(getMock).toHaveBeenLastCalledWith("/api/v1/conversations");
+    expect(getMock).not.toHaveBeenCalledWith(expect.stringContaining("q="));
+    // Same cache entry a genuinely-unset q resolves to, not a distinct
+    // "   " entry — proves the key itself was canonicalized, not just the
+    // request URL.
+    expect(client.getQueryData(["conversations", { state: "all" }])).toEqual({ items: [] });
+  });
+
   it("hashes { state, q: undefined, archived: undefined } identically to the pre-Task-24 { state } key, so old cache entries keep matching", () => {
     // TanStack Query's default hashKey serializes the key with JSON.stringify,
     // which drops object properties whose value is `undefined` — this is the

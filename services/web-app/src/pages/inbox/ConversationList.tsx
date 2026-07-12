@@ -111,7 +111,11 @@ export function ConversationList({
                     <span className="flex items-center justify-between gap-2">
                       <span className="flex min-w-0 items-center gap-1">
                         {c.pinnedAt ? (
-                          <Pin className="size-3 shrink-0 text-muted-foreground" aria-label="Pinned" />
+                          <Pin
+                            className="size-3 shrink-0 text-muted-foreground"
+                            role="img"
+                            aria-label="Pinned"
+                          />
                         ) : null}
                         <span className="truncate text-sm font-medium">
                           {c.contactName || c.contactPhone || "Unknown"}

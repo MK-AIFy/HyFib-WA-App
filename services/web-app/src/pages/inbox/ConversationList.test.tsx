@@ -80,12 +80,19 @@ describe("ConversationList", () => {
     expect(screen.queryByText("0")).not.toBeInTheDocument();
   });
 
-  it("renders a pin icon for a conversation with pinnedAt set", async () => {
+  it("renders a pin icon for a conversation with pinnedAt set, exposed to assistive tech as a named image (review finding 3)", async () => {
     renderList([
       conv({ id: "c1", unreadCount: 0, contactName: "Pinned Contact", pinnedAt: "2026-07-12T00:00:00.000Z" })
     ]);
 
     await screen.findByText("Pinned Contact");
+    // `role="img"` on the bare lucide SVG is what makes `aria-label="Pinned"`
+    // reliably reach the accessibility tree (an SVG with no role has no
+    // implicit ARIA role, so an aria-label alone is not dependably exposed
+    // by every screen reader/AT combination) — assert via getByRole, not
+    // just getByLabelText, since the latter matches the aria-label attribute
+    // directly regardless of role and would pass even without the fix.
+    expect(screen.getByRole("img", { name: "Pinned" })).toBeInTheDocument();
     expect(screen.getByLabelText("Pinned")).toBeInTheDocument();
   });
 
@@ -93,6 +100,7 @@ describe("ConversationList", () => {
     renderList([conv({ id: "c1", unreadCount: 0, contactName: "Unpinned Contact" })]);
 
     await screen.findByText("Unpinned Contact");
+    expect(screen.queryByRole("img", { name: "Pinned" })).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Pinned")).not.toBeInTheDocument();
   });
 

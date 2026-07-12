@@ -117,6 +117,72 @@ describe("InboxPage — mark-read on open", () => {
   });
 });
 
+describe("InboxPage — no duplicate mark-read across a query-key transition (review finding 1)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it("fires exactly one POST .../read when the selected conversation's row is still zeroed after the debounced search query transitions to a never-fetched key", async () => {
+    // Reproduction from the reviewer: select an unread conversation (first
+    // POST fires) -> type into search -> advance the 300ms debounce (this
+    // flips the query key from {state:"all", q:undefined} to a NEVER-FETCHED
+    // {state:"all", q:"has"} key) -> a SECOND POST must NOT fire.
+    //
+    // Root cause (pre-fix): without `placeholderData`, TanStack Query makes
+    // `data` transiently `undefined` for a brand-new key. `freshActive`
+    // (`data?.items.find(...)`) becomes undefined, so
+    // `selectedUnreadCount = freshActive?.unreadCount ?? active?.unreadCount ?? 0`
+    // falls back to `active.unreadCount` — the STALE click-time snapshot
+    // (3, captured in `setActive(c)` and never updated), not the
+    // already-zeroed live value. That flips selectedUnreadCount 0 -> 3,
+    // and the mark-read effect (deps: [selectedId, selectedUnreadCount])
+    // re-fires.
+    let items = [conv({ id: "c-unread", unreadCount: 3, contactName: "Has Unread" })];
+    const getMock = vi.spyOn(api, "get").mockImplementation((path: string) => {
+      if (path.includes("/messages")) return Promise.resolve({ items: [] });
+      if (path === "/api/v1/saved-replies") return Promise.resolve({ items: [] });
+      if (path.startsWith("/api/v1/conversations")) return Promise.resolve({ items });
+      return Promise.reject(new Error(`Unhandled GET ${path}`));
+    });
+    // Mock POST to actually persist the read (mirrors the "closed tab"
+    // regression test above) so the cache reflects real zeroed state before
+    // we transition the query key, matching the reviewer's repro precisely.
+    const postMock = vi.spyOn(api, "post").mockImplementation((path: string) => {
+      items = items.map((c) => (path.includes(c.id) ? { ...c, unreadCount: 0 } : c));
+      return Promise.resolve({ status: "read", conversationId: "" });
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <InboxPage />
+      </QueryClientProvider>
+    );
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByText("Has Unread"));
+    await waitFor(() => expect(postMock).toHaveBeenCalledTimes(1));
+    // Let the mutation's onSettled invalidate + refetch land, so the cache
+    // for the CURRENT (pre-search) key is stably zeroed before we type —
+    // the unread badge disappearing is the observable signal of that.
+    await waitFor(() => expect(screen.queryByLabelText(/unread messages/i)).not.toBeInTheDocument());
+
+    const input = await screen.findByLabelText("Search conversations");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      fireEvent.change(input, { target: { value: "has" } });
+      act(() => {
+        vi.advanceTimersByTime(300);
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+
+    await waitFor(() => expect(getMock).toHaveBeenCalledWith("/api/v1/conversations?q=has"));
+    expect(postMock).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("InboxPage — server-side search, archived folder wiring", () => {
   afterEach(() => {
     vi.restoreAllMocks();
