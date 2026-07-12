@@ -1,0 +1,225 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { registerWorkerConsumers } from "../dist/index.js";
+import { channelRepository, messageRepository, contactRepository, autoReplyRuleRepository } from "@hyfib/persistence";
+import { EventTopics } from "@hyfib/shared-core";
+
+/**
+ * These tests exercise the real handleOutbound/handleInbound consumers (captured via a
+ * fake event bus, the same technique consumers.test.js uses to verify wiring) rather than
+ * duplicating their logic. Redis and the phone-number → channel resolver are swapped via
+ * WorkerDeps (the same DI seam already used for eventBus/metaClient); DB-backed repository
+ * singletons are monkey-patched for the duration of each test since they're shared, mutable
+ * objects imported from @hyfib/persistence — no real Postgres/Redis is touched.
+ */
+
+function createFakeBus() {
+  const handlers = new Map();
+  return {
+    handlers,
+    subscribe(topic, _queue, handler) {
+      handlers.set(topic, handler);
+    },
+    async publish() {},
+    async close() {}
+  };
+}
+
+/** In-memory stand-in for ioredis's SET key value EX seconds NX / DEL key semantics. */
+function createFakeRedis() {
+  const store = new Map();
+  return {
+    store,
+    async set(key, value, exFlag, ttlSeconds, nxFlag) {
+      if (nxFlag === "NX" && store.has(key)) {
+        return null;
+      }
+      store.set(key, value);
+      return "OK";
+    },
+    async del(key) {
+      return store.delete(key) ? 1 : 0;
+    }
+  };
+}
+
+function createFakeMetaClient(sendImpl) {
+  return {
+    async send(endpoint, tenantId, payload) {
+      return sendImpl(endpoint, tenantId, payload);
+    },
+    async markRead() {}
+  };
+}
+
+function outboundEvent(id, dispatchId) {
+  return {
+    id,
+    topic: EventTopics.WhatsAppOutboundRequested,
+    occurredAt: new Date().toISOString(),
+    payload: {
+      tenantId: "t-1",
+      channelId: "c-1",
+      conversationId: "conv-1",
+      contactPhoneE164: "+15551230000",
+      kind: "text",
+      text: "hello",
+      ...(dispatchId ? { dispatchId } : {})
+    }
+  };
+}
+
+test("handleOutbound: dispatchId claim — first call sends, replayed dispatchId skips", async () => {
+  const bus = createFakeBus();
+  const redis = createFakeRedis();
+  let sendCalls = 0;
+  let createCalls = 0;
+  const metaClient = createFakeMetaClient(async () => {
+    sendCalls++;
+    return { messageId: `wamid.${sendCalls}`, accepted: true };
+  });
+
+  const originalGetCredentials = channelRepository.getCredentials;
+  const originalCreate = messageRepository.create;
+  channelRepository.getCredentials = async () => ({ id: "c-1", wabaId: "waba-1", phoneNumberId: "PN-1", accessToken: "tok" });
+  messageRepository.create = async () => {
+    createCalls++;
+    return { id: "m-1" };
+  };
+
+  try {
+    registerWorkerConsumers({ eventBus: bus, redis, metaClient });
+    const handleOutbound = bus.handlers.get(EventTopics.WhatsAppOutboundRequested);
+
+    await handleOutbound(outboundEvent("env-1", "dispatch-abc"));
+    assert.equal(sendCalls, 1, "first call should send");
+    assert.equal(createCalls, 1, "first call should persist the outbound message");
+
+    // Replay: same dispatchId, new envelope id (as a re-published outbox row would carry).
+    await handleOutbound(outboundEvent("env-2", "dispatch-abc"));
+    assert.equal(sendCalls, 1, "replay must not send again");
+    assert.equal(createCalls, 1, "replay must not persist again");
+  } finally {
+    channelRepository.getCredentials = originalGetCredentials;
+    messageRepository.create = originalCreate;
+  }
+});
+
+test("handleOutbound: send failure releases the dispatch claim and rethrows", async () => {
+  const bus = createFakeBus();
+  const redis = createFakeRedis();
+  const metaClient = createFakeMetaClient(async () => {
+    throw new Error("meta_adapter_rejected_500");
+  });
+
+  const originalGetCredentials = channelRepository.getCredentials;
+  channelRepository.getCredentials = async () => ({ id: "c-1", wabaId: "waba-1", phoneNumberId: "PN-1", accessToken: "tok" });
+
+  try {
+    registerWorkerConsumers({ eventBus: bus, redis, metaClient });
+    const handleOutbound = bus.handlers.get(EventTopics.WhatsAppOutboundRequested);
+
+    await assert.rejects(
+      () => handleOutbound(outboundEvent("env-1", "dispatch-fail")),
+      /meta_adapter_rejected_500/
+    );
+    assert.equal(redis.store.has("outb:dispatch-fail"), false, "claim key must be released after send failure");
+  } finally {
+    channelRepository.getCredentials = originalGetCredentials;
+  }
+});
+
+test("handleOutbound: no dispatchId sends without touching the redis guard", async () => {
+  const bus = createFakeBus();
+  const redis = createFakeRedis();
+  let setCalls = 0;
+  let delCalls = 0;
+  const baseSet = redis.set.bind(redis);
+  const baseDel = redis.del.bind(redis);
+  redis.set = async (...args) => {
+    setCalls++;
+    return baseSet(...args);
+  };
+  redis.del = async (...args) => {
+    delCalls++;
+    return baseDel(...args);
+  };
+
+  let sendCalls = 0;
+  const metaClient = createFakeMetaClient(async () => {
+    sendCalls++;
+    return { messageId: "wamid.999", accepted: true };
+  });
+
+  const originalGetCredentials = channelRepository.getCredentials;
+  const originalCreate = messageRepository.create;
+  channelRepository.getCredentials = async () => ({ id: "c-1", wabaId: "waba-1", phoneNumberId: "PN-1", accessToken: "tok" });
+  messageRepository.create = async () => ({ id: "m-1" });
+
+  try {
+    registerWorkerConsumers({ eventBus: bus, redis, metaClient });
+    const handleOutbound = bus.handlers.get(EventTopics.WhatsAppOutboundRequested);
+
+    await handleOutbound(outboundEvent("env-1"));
+    assert.equal(sendCalls, 1, "send should still happen without a dispatchId");
+    assert.equal(setCalls, 0, "no dispatchId means the redis guard must not be touched");
+    assert.equal(delCalls, 0, "no dispatchId means nothing to release");
+  } finally {
+    channelRepository.getCredentials = originalGetCredentials;
+    messageRepository.create = originalCreate;
+  }
+});
+
+test("handleInbound: replayed external message id skips message insert and auto-reply", async () => {
+  const bus = createFakeBus();
+  const resolveChannel = async () => ({ tenantId: "t-1", channelId: "c-1" });
+
+  const originalFindByExternalId = messageRepository.findByExternalId;
+  const originalCreate = messageRepository.create;
+  const originalListEnabled = autoReplyRuleRepository.listEnabled;
+  const originalFindOrCreateByPhone = contactRepository.findOrCreateByPhone;
+
+  let createCalls = 0;
+  let autoReplyCalls = 0;
+  let contactCalls = 0;
+  messageRepository.findByExternalId = async () => ({ id: "existing-msg" });
+  messageRepository.create = async () => {
+    createCalls++;
+    throw new Error("must not be called on replay");
+  };
+  autoReplyRuleRepository.listEnabled = async () => {
+    autoReplyCalls++;
+    return [];
+  };
+  contactRepository.findOrCreateByPhone = async () => {
+    contactCalls++;
+    throw new Error("must not be called on replay");
+  };
+
+  try {
+    registerWorkerConsumers({ eventBus: bus, resolveChannel });
+    const handleInbound = bus.handlers.get(EventTopics.WhatsAppInboundReceived);
+
+    await handleInbound({
+      id: "env-1",
+      topic: EventTopics.WhatsAppInboundReceived,
+      occurredAt: new Date().toISOString(),
+      payload: {
+        phoneNumberId: "PN-1",
+        from: "+15559998888",
+        messageId: "wamid.replayed",
+        type: "text",
+        text: "hi again"
+      }
+    });
+
+    assert.equal(createCalls, 0, "replay must not insert a message row");
+    assert.equal(autoReplyCalls, 0, "replay must not evaluate auto-reply rules");
+    assert.equal(contactCalls, 0, "replay must not even look up the contact");
+  } finally {
+    messageRepository.findByExternalId = originalFindByExternalId;
+    messageRepository.create = originalCreate;
+    autoReplyRuleRepository.listEnabled = originalListEnabled;
+    contactRepository.findOrCreateByPhone = originalFindOrCreateByPhone;
+  }
+});

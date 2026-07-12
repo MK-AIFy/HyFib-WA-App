@@ -47,7 +47,13 @@ import {
   type MessageCategory,
   type WhatsAppOutboundRequest
 } from "@hyfib/shared-core";
-import { buildOutboundAdapterCall } from "./outbound.js";
+import {
+  buildOutboundAdapterCall,
+  claimRedisKey,
+  releaseRedisKey,
+  dispatchClaimKey,
+  DISPATCH_CLAIM_TTL_SECONDS
+} from "./outbound.js";
 import { resolveVariables } from "./personalize.js";
 import { matchAutoReply } from "./autoreply.js";
 import { evaluateAutomationRules } from "./automation.js";
@@ -55,7 +61,9 @@ import { evaluateAutomationRules } from "./automation.js";
 const config = loadConfig();
 const logger = new Logger("notification-worker", config.logLevel as "debug" | "info" | "warn" | "error");
 let eventBus = createEventBus(config);
-const redis = getRedisClient(config);
+let redis = getRedisClient(config);
+/** Test-only override for the phone-number-id → tenant/channel lookup (defaults to the DB-backed resolver). */
+let resolveChannel: typeof resolveChannelByPhoneNumberId = resolveChannelByPhoneNumberId;
 
 interface InboundEvent {
   phoneNumberId?: string;
@@ -446,6 +454,22 @@ async function handleOutbound(event: EventEnvelope): Promise<void> {
     logger.warn("outbound_invalid_command", { eventId: event.id });
     return;
   }
+
+  // Replay guard: a redelivered outbox row is re-published with a NEW envelope id, so
+  // claim on the caller-assigned dispatchId (stable across replay) instead of event.id.
+  // No dispatchId means no guard — current unguarded behavior is unchanged.
+  const claimKey = command.dispatchId ? dispatchClaimKey(command.dispatchId) : undefined;
+  if (claimKey) {
+    const claimed = await claimRedisKey(redis, claimKey, DISPATCH_CLAIM_TTL_SECONDS);
+    if (!claimed) {
+      logger.info("outbound_replay_skipped", {
+        conversationId: command.conversationId,
+        dispatchId: command.dispatchId
+      });
+      return;
+    }
+  }
+
   const channel = await resolveSendChannel(command.tenantId, command.channelId);
 
   const call = buildOutboundAdapterCall(command, channel);
@@ -453,6 +477,10 @@ async function handleOutbound(event: EventEnvelope): Promise<void> {
   try {
     result = await callMetaAdapter(call.endpoint, command.tenantId, call.payload);
   } catch (error) {
+    if (claimKey) {
+      // Release the claim so redelivery of this dispatchId can retry the send.
+      await releaseRedisKey(redis, claimKey).catch(() => undefined);
+    }
     logger.error("outbound_adapter_failed", {
       conversationId: command.conversationId,
       error: error instanceof Error ? error.message : String(error)
@@ -488,11 +516,23 @@ async function handleInbound(event: EventEnvelope): Promise<void> {
   if (!inbound.phoneNumberId || !inbound.from) {
     return;
   }
-  const channel = await resolveChannelByPhoneNumberId(inbound.phoneNumberId);
+  const channel = await resolveChannel(inbound.phoneNumberId);
   if (!channel) {
     logger.warn("inbound_unroutable", { phoneNumberId: inbound.phoneNumberId });
     return;
   }
+
+  // Replay guard: a redelivered outbox row is re-published with a NEW envelope id, so
+  // event.id-keyed dedupe wouldn't catch it. Skip if we've already recorded this exact
+  // WhatsApp message — prevents both a duplicate message row and a duplicate auto-reply.
+  if (inbound.messageId) {
+    const existing = await messageRepository.findByExternalId(channel.tenantId, inbound.messageId);
+    if (existing) {
+      logger.info("inbound_replay_skipped", { tenantId: channel.tenantId, messageId: inbound.messageId });
+      return;
+    }
+  }
+
   const contact = await contactRepository.findOrCreateByPhone(channel.tenantId, inbound.from);
   const conversation = await conversationRepository.findOrCreate(channel.tenantId, contact.id, channel.channelId);
 
@@ -573,7 +613,8 @@ async function handleInbound(event: EventEnvelope): Promise<void> {
             conversationId: conversation.id,
             contactPhoneE164: contact.phoneE164,
             kind: "text",
-            text: matched.replyText
+            text: matched.replyText,
+            dispatchId: randomUUID()
           } satisfies WhatsAppOutboundRequest
         });
       });
@@ -635,8 +676,9 @@ async function runNewMessageAutomation(
               channelId,
               contactPhoneE164: contact.phoneE164,
               templateName: action.templateName,
-              templateLanguage: action.templateLanguage
-            }
+              templateLanguage: action.templateLanguage,
+              dispatchId: randomUUID()
+            } satisfies AutomationTemplateRequest
           });
         });
       }
@@ -739,10 +781,13 @@ async function handleAutomationTemplate(event: EventEnvelope): Promise<void> {
     return;
   }
 
-  // At-least-once delivery guard: skip if this event was already processed.
-  const claimed = await redis.set(`atreq:${event.id}`, "1", "EX", 3600, "NX");
+  // At-least-once delivery guard: skip if this dispatch was already processed. Prefer the
+  // caller-assigned dispatchId (stable across outbox replay) over event.id, which is
+  // regenerated on every republish and so wouldn't catch a replayed redelivery.
+  const claimKey = `atreq:${req.dispatchId ?? event.id}`;
+  const claimed = await claimRedisKey(redis, claimKey, 3600);
   if (!claimed) {
-    logger.info("automation_template_duplicate_skipped", { eventId: event.id });
+    logger.info("automation_template_duplicate_skipped", { eventId: event.id, dispatchId: req.dispatchId });
     return;
   }
 
@@ -779,14 +824,25 @@ async function handleAutomationTemplate(event: EventEnvelope): Promise<void> {
     return;
   }
   const channel = await resolveSendChannel(req.tenantId, channelId);
-  const result = await callMetaAdapter("/internal/v1/whatsapp/send-template", req.tenantId, {
-    phoneNumberId: channel.phoneNumberId,
-    to: req.contactPhoneE164,
-    templateName: req.templateName,
-    templateLanguage: req.templateLanguage,
-    parameters: [],
-    accessToken: channel.accessToken
-  });
+  let result: { messageId?: string; accepted: boolean };
+  try {
+    result = await callMetaAdapter("/internal/v1/whatsapp/send-template", req.tenantId, {
+      phoneNumberId: channel.phoneNumberId,
+      to: req.contactPhoneE164,
+      templateName: req.templateName,
+      templateLanguage: req.templateLanguage,
+      parameters: [],
+      accessToken: channel.accessToken
+    });
+  } catch (error) {
+    // Release the claim so redelivery of this dispatch can retry the send.
+    await releaseRedisKey(redis, claimKey).catch(() => undefined);
+    logger.error("automation_template_send_failed", {
+      tenantId: req.tenantId,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    throw error; // Re-throw so the broker can retry.
+  }
   const conversation = await conversationRepository.findOrCreate(req.tenantId, contact.id, channelId);
   await messageRepository.create(req.tenantId, {
     conversationId: conversation.id,
@@ -807,6 +863,10 @@ export interface WorkerDeps {
   eventBus?: EventBus;
   /** Direct in-process meta transport (app-server). Falls back to HTTP fetch. */
   metaClient?: WorkerMetaClient;
+  /** Test-only override for the Redis client used by replay-claim guards. Falls back to the shared client. */
+  redis?: ReturnType<typeof getRedisClient>;
+  /** Test-only override for the phone-number-id → tenant/channel lookup. Falls back to the DB-backed resolver. */
+  resolveChannel?: typeof resolveChannelByPhoneNumberId;
 }
 
 /**
@@ -826,6 +886,12 @@ export function registerWorkerConsumers(deps: WorkerDeps = {}): void {
   }
   if (deps.metaClient) {
     metaClient = deps.metaClient;
+  }
+  if (deps.redis) {
+    redis = deps.redis;
+  }
+  if (deps.resolveChannel) {
+    resolveChannel = deps.resolveChannel;
   }
   eventBus.subscribe(EventTopics.CampaignDispatchRequested, "campaign-dispatch", handleDispatch);
   eventBus.subscribe(EventTopics.CampaignDispatchResult, "campaign-results", handleDispatchResult);

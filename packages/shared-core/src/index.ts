@@ -520,6 +520,12 @@ export interface WhatsAppOutboundRequest {
     footerText?: string;
   };
   actorId?: string;
+  /**
+   * Caller-assigned idempotency key, stable across outbox replay (unlike the
+   * envelope's event.id, which is regenerated on every republish). When set, the
+   * worker claims it before sending so a replayed outbox row can't double-send.
+   */
+  dispatchId?: string;
 }
 
 export const EventTopics = {
@@ -546,4 +552,6 @@ export interface AutomationTemplateRequest {
   contactPhoneE164: string;
   templateName: string;
   templateLanguage: string;
+  /** Caller-assigned idempotency key, stable across outbox replay. See WhatsAppOutboundRequest.dispatchId. */
+  dispatchId?: string;
 }

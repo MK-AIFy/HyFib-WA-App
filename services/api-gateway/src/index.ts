@@ -903,7 +903,8 @@ async function sendConversationMessage(
         product: body.product,
         catalog: body.catalog,
         flow: body.flow,
-        actorId: asActorUuid(auth.subject)
+        actorId: asActorUuid(auth.subject),
+        dispatchId: randomUUID()
       }
     });
   });
