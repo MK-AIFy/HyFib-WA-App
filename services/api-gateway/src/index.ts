@@ -2673,9 +2673,11 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   if (path === "/api/v1/conversations" && method === "GET") {
     const query = parseQuery(req.url);
     const page = parseListQuery(query);
+    const q = (query.get("q") ?? "").trim().slice(0, 200) || undefined;
     const { items, total } = await conversationRepository.list(tenantId, {
       state: query.get("state") ?? undefined,
       assignedUserId: query.get("assignee") ?? undefined,
+      q,
       limit: page.limit,
       offset: page.offset
     });

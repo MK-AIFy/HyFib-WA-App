@@ -1406,13 +1406,24 @@ const CONV_SELECT = `
   FROM conversations c
   LEFT JOIN contacts co ON co.id = c.contact_id`;
 
+/**
+ * Escapes `%`, `_`, and `\` in a raw search fragment so it can be embedded
+ * in a LIKE/ILIKE pattern (wrapped in `%...%` by the caller) without the
+ * fragment's own characters being interpreted as wildcards. Module-level
+ * and reusable — message search (a later task) needs the same escaping.
+ */
+export function escapeLike(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
+}
+
 export const conversationRepository = {
   async list(
     tenantId: string,
-    opts?: { state?: string; assignedUserId?: string; limit?: number; offset?: number }
+    opts?: { state?: string; assignedUserId?: string; q?: string; limit?: number; offset?: number }
   ): Promise<{ items: Conversation[]; total: number }> {
     const limit = opts?.limit ?? 50;
     const offset = opts?.offset ?? 0;
+    const q = opts?.q?.trim();
     return withTenant(tenantId, async (client) => {
       const conditions: string[] = [];
       const params: unknown[] = [];
@@ -1424,9 +1435,21 @@ export const conversationRepository = {
         params.push(opts.assignedUserId);
         conditions.push(`c.assigned_user_id = $${params.length}`);
       }
+      if (q) {
+        params.push(`%${escapeLike(q)}%`);
+        conditions.push(
+          `(co.phone_e164 ILIKE $${params.length} OR (coalesce(co.first_name,'') || ' ' || coalesce(co.last_name,'')) ILIKE $${params.length})`
+        );
+      }
       const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+      // The q condition references co.* (the contacts join), so the COUNT
+      // query must join contacts too when q is present, or `total` will
+      // diverge from `items`. Without q, keep the cheap conversations-only
+      // COUNT path.
       const totalResult = await client.query<{ total: string }>(
-        `SELECT COUNT(*)::text AS total FROM conversations c ${where}`,
+        q
+          ? `SELECT COUNT(*)::text AS total FROM conversations c LEFT JOIN contacts co ON co.id = c.contact_id ${where}`
+          : `SELECT COUNT(*)::text AS total FROM conversations c ${where}`,
         params
       );
       const result = await client.query<ConversationRow>(
