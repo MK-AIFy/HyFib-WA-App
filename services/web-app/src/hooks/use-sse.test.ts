@@ -101,4 +101,31 @@ describe("useSse", () => {
     expect(fetchMock).not.toHaveBeenCalled();
     unmount();
   });
+
+  it("invalidates conversations queries on a conversation.read event", async () => {
+    // Flat payload — { conversationId } directly as `data`, matching how
+    // api-gateway's sseHub.broadcast call for this route frames it (see the
+    // handleEvent comment in use-sse.ts), not the { occurredAt, payload }
+    // shape used for bus-forwarded topics.
+    const frame = 'event: conversation.read\ndata: {"conversationId":"c1"}\n\n';
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(frame));
+        controller.close();
+      }
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(stream, { status: 200 })));
+
+    const client = new QueryClient();
+    const invalidateSpy = vi.spyOn(client, "invalidateQueries");
+    function wrapper({ children }: { children: ReactNode }) {
+      return createElement(QueryClientProvider, { client }, children);
+    }
+
+    const { unmount } = renderHook(() => useSse(true), { wrapper });
+
+    await waitFor(() => expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] }));
+
+    unmount();
+  });
 });

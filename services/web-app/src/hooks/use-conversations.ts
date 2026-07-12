@@ -55,6 +55,28 @@ export function useSetConversationState(conversationId: string) {
   });
 }
 
+/**
+ * Marks a conversation read. Optimistically zeroes `unreadCount` in every
+ * cached `["conversations", ...]` list query (badges clear the instant the
+ * user opens the thread) and, on settle (success OR error alike), invalidates
+ * those same queries so the next refetch restores backend truth — a failed
+ * markRead is harmless (the row just goes back to its real unread count), so
+ * there's nothing to roll back beyond that refetch.
+ */
+export function useMarkRead() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (conversationId: string) => api.post(`/api/v1/conversations/${conversationId}/read`, {}),
+    onMutate: (conversationId: string) => {
+      qc.setQueriesData<ListResponse<Conversation>>({ queryKey: ["conversations"] }, (old) => {
+        if (!old) return old;
+        return { ...old, items: old.items.map((c) => (c.id === conversationId ? { ...c, unreadCount: 0 } : c)) };
+      });
+    },
+    onSettled: () => void qc.invalidateQueries({ queryKey: ["conversations"] })
+  });
+}
+
 /** Text shown for a message, mirroring the portal's payload precedence. */
 export function messageText(m: Message): string {
   const p = m.payload as { text?: string; media?: { caption?: string }; kind?: string };

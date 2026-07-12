@@ -1,12 +1,12 @@
 import { useMemo, useState } from "react";
 import type { Conversation } from "@hyfib/shared-core";
+import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 import { initials, timeAgo } from "@/lib/format";
 import { useConversations, type ConvStateFilter } from "@/hooks/use-conversations";
-import { isUnread } from "./unread";
 
 interface Props {
   activeId?: string;
@@ -58,7 +58,7 @@ export function ConversationList({ activeId, onSelect }: Props) {
           <li className="p-6 text-center text-sm text-muted-foreground">No conversations</li>
         ) : (
           items.map((c) => {
-            const unread = isUnread(c);
+            const unread = c.unreadCount > 0;
             return (
               <li key={c.id} role="option" aria-selected={c.id === activeId}>
                 <button
@@ -80,7 +80,14 @@ export function ConversationList({ activeId, onSelect }: Props) {
                     </span>
                     <span className="flex items-center gap-1.5">
                       <span className="truncate text-xs text-muted-foreground">{c.lastMessage || "—"}</span>
-                      {unread ? <span className="ml-auto size-2 shrink-0 rounded-full bg-primary" aria-label="Unread" /> : null}
+                      {unread ? (
+                        <span className="ml-auto flex shrink-0 items-center gap-1.5">
+                          <span className="size-2 rounded-full bg-primary" aria-label="Unread" />
+                          <Badge variant="gray" className="h-4 min-w-4 justify-center rounded-full px-1 text-[10px] leading-none">
+                            {c.unreadCount}
+                          </Badge>
+                        </span>
+                      ) : null}
                     </span>
                   </span>
                 </button>

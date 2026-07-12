@@ -75,6 +75,17 @@ function handleEvent(evt: SseEvent, queryClient: QueryClient): void {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       return;
     }
+    case "conversation.read": {
+      // Broadcast directly via sseHub.broadcast(tenantId, "conversation.read", id,
+      // { conversationId }) in api-gateway/src/index.ts — a flat payload, same as
+      // conversation.assigned/team_assigned/state_changed above, NOT the nested
+      // { occurredAt, payload } shape forwardEventToSse wraps bus-forwarded topics
+      // (whatsapp.inbound.received, media.stored) in below. No per-id targeting is
+      // needed here since a full ["conversations"] invalidation already covers the
+      // multi-tab/agent sync this event exists for.
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      return;
+    }
     case "whatsapp.inbound.received":
     case "whatsapp.status.updated": {
       const data = evt.payload as { payload?: { conversationId?: string } };
