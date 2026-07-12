@@ -94,6 +94,13 @@ import { SseHub } from "./sse-hub.js";
 import { parseCsv, serializeContactsCsv, extractMultipartFile } from "./csv.js";
 import { resolveOrgTenant } from "./single-org.js";
 import { runOutboxRelayOnce } from "./outbox-relay.js";
+import {
+  SESSION_COOKIE,
+  parseCookies,
+  serializeSessionCookie,
+  clearSessionCookieValue,
+  csrfViolation
+} from "./cookies.js";
 
 // ─── Request body interfaces ───────────────────────────────────────────────────
 
@@ -458,21 +465,56 @@ async function isAuthRateLimited(scope: string): Promise<boolean> {
   return !allowed;
 }
 
-// ─── Auth resolution: Bearer token (session) → header fallback (dev) ──────────
+// ─── Session cookie helpers ─────────────────────────────────────────────────
+
+const SESSION_TTL = 30 * 24 * 60 * 60; // 30 days
+
+/** Marks the cookie Secure whenever the connection is (or terminates) TLS. */
+function isSecureRequest(req: IncomingMessage): boolean {
+  return config.nodeEnv === "production" || req.headers["x-forwarded-proto"] === "https";
+}
+
+function setSessionCookie(res: ServerResponse, token: string, req: IncomingMessage): void {
+  res.setHeader(
+    "Set-Cookie",
+    serializeSessionCookie(token, { secure: isSecureRequest(req), maxAgeSeconds: SESSION_TTL })
+  );
+}
+
+function clearSessionCookie(res: ServerResponse, req: IncomingMessage): void {
+  res.setHeader("Set-Cookie", clearSessionCookieValue(isSecureRequest(req)));
+}
+
+function cookieHeaderOf(req: IncomingMessage): string | undefined {
+  return req.headers["cookie"];
+}
+
+// ─── Auth resolution: Bearer token (session) → cookie (session) → Keycloak → dev fallback
+
+/** Resolves an opaque session token (Bearer or cookie) to an AuthContext, or undefined if unknown/expired. */
+async function resolveSessionToken(rawToken: string): Promise<AuthContext | undefined> {
+  const session = await sessionRepository.findByToken(tokenHash(rawToken));
+  if (!session) return undefined;
+  // Must resolve roles through a tenant-scoped read: users has FORCE RLS,
+  // so a bare pool query silently returns zero rows (empty roles → 403s).
+  const user = await userRepository.getById(session.tenantId, session.userId);
+  const roles = normalizeRoles(user?.roles ?? []);
+  return { subject: session.userId, tenantId: session.tenantId, roles };
+}
 
 async function resolveAuth(req: IncomingMessage): Promise<AuthContext> {
-  // 1. Bearer session token (works in all modes)
+  // 1. Bearer session token (works in all modes) — takes precedence over the cookie.
   const authHeader = req.headers["authorization"];
   if (authHeader?.startsWith("Bearer ")) {
-    const rawToken = authHeader.slice(7);
-    const session = await sessionRepository.findByToken(tokenHash(rawToken));
-    if (session) {
-      // Must resolve roles through a tenant-scoped read: users has FORCE RLS,
-      // so a bare pool query silently returns zero rows (empty roles → 403s).
-      const user = await userRepository.getById(session.tenantId, session.userId);
-      const roles = normalizeRoles(user?.roles ?? []);
-      return { subject: session.userId, tenantId: session.tenantId, roles };
-    }
+    const authCtx = await resolveSessionToken(authHeader.slice(7));
+    if (authCtx) return authCtx;
+  }
+
+  // 2. HttpOnly session cookie (browser clients that have switched off Bearer).
+  const cookieToken = parseCookies(cookieHeaderOf(req))[SESSION_COOKIE];
+  if (cookieToken) {
+    const authCtx = await resolveSessionToken(cookieToken);
+    if (authCtx) return authCtx;
   }
 
   if (config.authEnabled) {
@@ -1181,6 +1223,16 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   const ctx = requestContext(req);
   incCounter("http_requests_total", "Total HTTP requests received.", { service: "api-gateway" });
 
+  // ─── CSRF gate ────────────────────────────────────────────────────────────
+  // Runs before every route dispatch, including webhooks/login/register: the
+  // path-exemptions inside csrfViolation() guarantee those are unaffected.
+  // Only blocks mutating, cookie-authenticated requests with no Bearer header
+  // and no x-requested-with marker — see cookies.ts for the full rationale.
+  if (csrfViolation(method, path, req.headers)) {
+    sendJson(res, 403, { error: "csrf_header_required" });
+    return;
+  }
+
   if (path === "/metrics") {
     sendMetrics(res);
     return;
@@ -1338,8 +1390,6 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   }
 
   // ─── Auth routes (unauthenticated) ────────────────────────────────────────
-  const SESSION_TTL = 30 * 24 * 60 * 60; // 30 days
-
   // Retired: this deployment is single-organization (see single-org.ts /
   // bootstrapPlatformAdmin). The route is matched deliberately so callers get
   // an explicit 410 instead of a 404 fall-through.
@@ -1391,6 +1441,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       tokenHash: tokenHash(rawToken),
       ttlSeconds: SESSION_TTL
     });
+    setSessionCookie(res, rawToken, req);
     logger.info("user_login", { tenantId: found.tenantId, userId: found.id, email: body.email });
     sendJson(res, 200, {
       token: rawToken,
@@ -1407,21 +1458,32 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   }
 
   if (path === "/auth/logout" && method === "POST") {
+    // Bearer takes precedence, matching resolveAuth; either may be absent,
+    // and the cookie must be cleared unconditionally regardless of whether a
+    // matching session was found (stale/expired/already-revoked cookies must
+    // still be wiped from the browser).
     const authHeader = req.headers["authorization"];
-    if (authHeader?.startsWith("Bearer ")) {
-      await sessionRepository.deleteByToken(tokenHash(authHeader.slice(7)));
+    const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : undefined;
+    const cookieToken = parseCookies(cookieHeaderOf(req))[SESSION_COOKIE];
+    const rawToken = bearerToken ?? cookieToken;
+    if (rawToken) {
+      await sessionRepository.deleteByToken(tokenHash(rawToken));
     }
+    clearSessionCookie(res, req);
     sendJson(res, 200, { status: "logged_out" });
     return;
   }
 
   if (path === "/auth/me" && method === "GET") {
     const authHeader = req.headers["authorization"];
-    if (!authHeader?.startsWith("Bearer ")) {
+    const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : undefined;
+    const cookieToken = parseCookies(cookieHeaderOf(req))[SESSION_COOKIE];
+    const rawToken = bearerToken ?? cookieToken;
+    if (!rawToken) {
       sendJson(res, 401, { error: "Not authenticated" });
       return;
     }
-    const session = await sessionRepository.findByToken(tokenHash(authHeader.slice(7)));
+    const session = await sessionRepository.findByToken(tokenHash(rawToken));
     if (!session) {
       sendJson(res, 401, { error: "Session expired or invalid" });
       return;
@@ -1432,6 +1494,13 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return;
     }
     const tenant = await tenantRepository.getById(session.tenantId);
+    // Silent upgrade: an existing localStorage/Bearer session gets an
+    // HttpOnly cookie issued the first time it hits /auth/me without one
+    // already present. Cookie-authenticated calls (bearerToken absent) never
+    // re-set — nothing changed for them.
+    if (bearerToken && !cookieToken) {
+      setSessionCookie(res, bearerToken, req);
+    }
     sendJson(res, 200, {
       id: u.id,
       email: u.email,
