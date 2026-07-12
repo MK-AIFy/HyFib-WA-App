@@ -90,6 +90,7 @@ import { filterSendableContacts } from "./campaign.js";
 import { canCreateContact, canCreateOrder } from "./authorization.js";
 import { SseHub } from "./sse-hub.js";
 import { parseCsv, serializeContactsCsv, extractMultipartFile } from "./csv.js";
+import { resolveOrgTenant } from "./single-org.js";
 
 // ─── Request body interfaces ───────────────────────────────────────────────────
 
@@ -395,14 +396,40 @@ function tokenHash(token: string): string {
   return createHash("sha256").update(token).digest("hex");
 }
 
-const PLATFORM_TENANT_ID = "00000000-0000-0000-0000-000000000001";
+// Resolved once at boot by bootstrapPlatformAdmin() and reused by the
+// dev-mode auth header fallback (resolveAuth) as the default tenant.
+let orgTenantId: string | undefined;
 
-// Creates the platform_owner account from env vars on first boot only.
-// No password hash is ever committed to source control (see 013_auth.sql).
+// Resolves the single organization this deployment serves, then creates the
+// platform_owner account from env vars on first boot only. No password hash
+// is ever committed to source control (see 013_auth.sql).
 async function bootstrapPlatformAdmin(): Promise<void> {
+  const org = await resolveOrgTenant({
+    listTenants: tenantRepository.list,
+    getTenantById: tenantRepository.getById,
+    updateTenant: tenantRepository.update,
+    env: { orgTenantId: config.orgTenantId, orgName: config.orgName },
+    log: (msg, meta) => logger.info(msg, meta)
+  });
+  orgTenantId = org.id;
+
   const email = process.env.BOOTSTRAP_ADMIN_EMAIL;
   const password = process.env.BOOTSTRAP_ADMIN_PASSWORD;
-  if (!email || !password) return;
+  if (!email || !password) {
+    // Self-registration is disabled, so if the org has no users yet there is
+    // no way to create the first one — surface this loudly rather than fail
+    // silently at first login.
+    const userCount = await tenantRepository.getUserCount(org.id);
+    if (userCount === 0) {
+      logger.warn("no_admin_bootstrap_configured", {
+        tenantId: org.id,
+        detail:
+          "BOOTSTRAP_ADMIN_EMAIL/BOOTSTRAP_ADMIN_PASSWORD are not set and this org has no users. " +
+          "Registration is disabled, so there is no way to create the first user."
+      });
+    }
+    return;
+  }
   if (!EMAIL.test(email) || password.length < 8) {
     logger.warn("bootstrap_admin_invalid_credentials");
     return;
@@ -410,13 +437,13 @@ async function bootstrapPlatformAdmin(): Promise<void> {
   const existing = await userRepository.findByEmailForAuth(email);
   if (existing) return;
   const passwordHash = await hashPassword(password);
-  const user = await userRepository.create(PLATFORM_TENANT_ID, {
+  const user = await userRepository.create(org.id, {
     email,
     displayName: "Platform Admin",
     roles: ["platform_owner"],
     passwordHash
   });
-  logger.info("platform_admin_bootstrapped", { userId: user.id, email });
+  logger.info("platform_admin_bootstrapped", { userId: user.id, email, tenantId: org.id });
 }
 
 function getClientIp(req: IncomingMessage): string {
@@ -453,10 +480,13 @@ async function resolveAuth(req: IncomingMessage): Promise<AuthContext> {
     return authenticator.authenticate(authHeader);
   }
 
-  // Dev-mode header fallback
+  // Dev-mode header fallback. An explicit x-tenant-id still wins; otherwise
+  // default to the single resolved org (undefined until bootstrap has run).
   const roleHeader = req.headers["x-role"];
   const roles = normalizeRoles(typeof roleHeader === "string" ? roleHeader.split(",") : []);
-  const tenantId = typeof req.headers["x-tenant-id"] === "string" ? (req.headers["x-tenant-id"] as string) : undefined;
+  const headerTenantId =
+    typeof req.headers["x-tenant-id"] === "string" ? (req.headers["x-tenant-id"] as string) : undefined;
+  const tenantId = headerTenantId ?? orgTenantId;
   const actorId = typeof req.headers["x-actor-id"] === "string" ? (req.headers["x-actor-id"] as string) : undefined;
   return { subject: actorId ?? "dev-subject", tenantId, roles };
 }
@@ -1243,56 +1273,13 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   // ─── Auth routes (unauthenticated) ────────────────────────────────────────
   const SESSION_TTL = 30 * 24 * 60 * 60; // 30 days
 
+  // Retired: this deployment is single-organization (see single-org.ts /
+  // bootstrapPlatformAdmin). The route is matched deliberately so callers get
+  // an explicit 410 instead of a 404 fall-through.
   if (path === "/auth/register" && method === "POST") {
-    if (await isAuthRateLimited(`register:${getClientIp(req)}`)) {
-      sendJson(res, 429, { error: "Too many registration attempts. Try again later." });
-      return;
-    }
-    const body = await readJsonBody<{ orgName: string; email: string; password: string; displayName?: string }>(req);
-    if (!body.orgName || !body.email || !body.password) {
-      sendJson(res, 400, { error: "orgName, email and password are required" });
-      return;
-    }
-    if (!EMAIL.test(body.email)) {
-      sendJson(res, 400, { error: "Invalid email address" });
-      return;
-    }
-    if (body.password.length < 8) {
-      sendJson(res, 400, { error: "Password must be at least 8 characters" });
-      return;
-    }
-    // Check email not already taken
-    const existing = await userRepository.findByEmailForAuth(body.email);
-    if (existing) {
-      sendJson(res, 409, { error: "An account with this email already exists" });
-      return;
-    }
-    const tenant = await tenantRepository.create(body.orgName);
-    const pwHash = await hashPassword(body.password);
-    const user = await userRepository.create(tenant.id, {
-      email: body.email,
-      displayName: body.displayName ?? body.email.split("@")[0]!,
-      roles: ["tenant_admin"],
-      passwordHash: pwHash
-    });
-    const rawToken = randomUUID() + randomUUID();
-    await sessionRepository.create({
-      userId: user.id,
-      tenantId: tenant.id,
-      tokenHash: tokenHash(rawToken),
-      ttlSeconds: SESSION_TTL
-    });
-    logger.info("user_registered", { tenantId: tenant.id, userId: user.id, email: body.email });
-    sendJson(res, 201, {
-      token: rawToken,
-      user: {
-        id: user.id,
-        email: user.email,
-        displayName: user.displayName,
-        roles: user.roles,
-        tenantId: tenant.id,
-        tenant
-      }
+    sendJson(res, 410, {
+      error: "registration_disabled",
+      detail: "This deployment is single-organization; ask an admin to invite you."
     });
     return;
   }
