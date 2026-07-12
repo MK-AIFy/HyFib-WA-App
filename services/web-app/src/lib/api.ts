@@ -50,10 +50,45 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   return data as T;
 }
 
+async function requestBlob(path: string): Promise<Blob> {
+  const token = readStoredToken();
+  const headers: Record<string, string> = {};
+  if (token) {
+    headers["authorization"] = `Bearer ${token}`;
+  }
+
+  const res = await fetch(path, { headers });
+
+  if (res.status === 401) {
+    clearSession();
+    unauthorizedHandler?.();
+    throw new ApiError(401, "Not authenticated");
+  }
+
+  if (!res.ok) {
+    let message = `Request failed (${res.status})`;
+    let detail: string | undefined;
+    const text = await res.text();
+    if (text) {
+      try {
+        const errBody = JSON.parse(text) as { error?: string; detail?: string };
+        message = errBody.error ?? message;
+        detail = errBody.detail;
+      } catch {
+        // Non-JSON error body — fall back to the generic status message.
+      }
+    }
+    throw new ApiError(res.status, message, detail);
+  }
+
+  return res.blob();
+}
+
 export const api = {
   get: <T>(path: string): Promise<T> => request<T>("GET", path),
   post: <T>(path: string, body?: unknown): Promise<T> => request<T>("POST", path, body),
   patch: <T>(path: string, body?: unknown): Promise<T> => request<T>("PATCH", path, body),
   put: <T>(path: string, body?: unknown): Promise<T> => request<T>("PUT", path, body),
-  del: <T>(path: string): Promise<T> => request<T>("DELETE", path)
+  del: <T>(path: string): Promise<T> => request<T>("DELETE", path),
+  getBlob: (path: string): Promise<Blob> => requestBlob(path)
 };

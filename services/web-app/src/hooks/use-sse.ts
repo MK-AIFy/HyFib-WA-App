@@ -86,6 +86,17 @@ function handleEvent(evt: SseEvent, queryClient: QueryClient): void {
       }
       return;
     }
+    case "media.stored": {
+      // The blob query for this asset only mounts once payload.mediaAsset
+      // lands on the message, which this refetch brings — no separate
+      // ["media-blob", assetId] invalidation needed since it doesn't exist yet.
+      const data = evt.payload as { payload?: { conversationId?: string } };
+      const conversationId = data.payload?.conversationId;
+      if (conversationId) {
+        void queryClient.invalidateQueries({ queryKey: ["messages", conversationId] });
+      }
+      return;
+    }
     default:
       return;
   }

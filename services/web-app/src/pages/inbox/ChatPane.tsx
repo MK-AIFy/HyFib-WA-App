@@ -6,8 +6,10 @@ import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import { timeAgo } from "@/lib/format";
+import { mediaAssetOf } from "@/lib/media";
 import { messageText, useMessages, useSetConversationState } from "@/hooks/use-conversations";
 import { Composer } from "./Composer";
+import { MediaAttachment } from "./MediaAttachment";
 
 const STATE_BADGE = { open: "green", pending: "yellow", closed: "gray" } as const;
 
@@ -55,23 +57,27 @@ export function ChatPane({ conversation, onBack }: { conversation: Conversation;
           <p className="text-center text-sm text-muted-foreground">No messages yet</p>
         ) : (
           <div className="flex flex-col gap-2">
-            {messages.map((m) => (
-              <div
-                key={m.id}
-                className={cn(
-                  "max-w-[75%] rounded-lg px-3 py-2 text-sm",
-                  m.direction === "outbound"
-                    ? "self-end bg-primary/15 text-foreground"
-                    : "self-start bg-secondary"
-                )}
-              >
-                <p className="whitespace-pre-wrap break-words">{messageText(m)}</p>
-                <p className="mt-1 text-[10px] text-muted-foreground">
-                  {timeAgo(m.createdAt)}
-                  {m.direction === "outbound" ? ` · ${m.status}` : ""}
-                </p>
-              </div>
-            ))}
+            {messages.map((m) => {
+              const media = mediaAssetOf(m);
+              return (
+                <div
+                  key={m.id}
+                  className={cn(
+                    "max-w-[75%] rounded-lg px-3 py-2 text-sm",
+                    m.direction === "outbound"
+                      ? "self-end bg-primary/15 text-foreground"
+                      : "self-start bg-secondary"
+                  )}
+                >
+                  {media ? <MediaAttachment media={media} /> : null}
+                  <p className="whitespace-pre-wrap break-words">{messageText(m)}</p>
+                  <p className="mt-1 text-[10px] text-muted-foreground">
+                    {timeAgo(m.createdAt)}
+                    {m.direction === "outbound" ? ` · ${m.status}` : ""}
+                  </p>
+                </div>
+              );
+            })}
             <div ref={endRef} />
           </div>
         )}
