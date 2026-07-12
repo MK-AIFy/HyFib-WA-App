@@ -17,12 +17,37 @@ function fakeBus() {
 
 function fakeIdempotency() {
   const seen = new Set();
+  const releases = [];
   return {
+    releases,
     async isDuplicate(key) {
       if (seen.has(key)) return true;
       seen.add(key);
       return false;
+    },
+    async release(key) {
+      releases.push(key);
+      seen.delete(key);
     }
+  };
+}
+
+/** A bus whose publish() throws on its Nth call (1-indexed), succeeding otherwise. */
+function fakeBusFailingOnCall(failOnCall) {
+  const published = [];
+  let calls = 0;
+  return {
+    published,
+    async publish(topic, payload, tenantId) {
+      calls += 1;
+      if (calls === failOnCall) {
+        throw new Error("db down");
+      }
+      published.push({ topic, payload, tenantId });
+      return { topic, payload };
+    },
+    subscribe() {},
+    async close() {}
   };
 }
 
@@ -85,4 +110,45 @@ test("processForwardedWebhook rejects an invalid signature without publishing", 
   );
   assert.equal(result.verified, false);
   assert.equal(bus.published.length, 0);
+});
+
+test("a failed inbound publish releases exactly the inbound message's key and rethrows; retry reprocesses", async () => {
+  // First publish() call is the inbound message loop's publish for wamid.1.
+  const bus = fakeBusFailingOnCall(1);
+  const idem = fakeIdempotency();
+
+  await assert.rejects(
+    () => ingestMetaWebhook(payload, "tenant-1", { eventBus: bus, idempotency: idem }),
+    /db down/
+  );
+  // The status loop never runs because the inbound publish threw first.
+  assert.deepEqual(idem.releases, ["inbound:wamid.1"]);
+  assert.equal(bus.published.length, 0);
+
+  // Retry (Meta re-delivering the same webhook): the released key can be
+  // re-claimed, and since the bus only fails on its 1st call, this succeeds.
+  const summary = await ingestMetaWebhook(payload, "tenant-1", { eventBus: bus, idempotency: idem });
+  assert.deepEqual(summary, { inbound: 1, statuses: 1, duplicates: 0 });
+  assert.equal(bus.published.length, 2);
+});
+
+test("a failed status publish releases exactly the status's key and rethrows; retry reprocesses", async () => {
+  // Second publish() call is the status-updates loop's publish (inbound succeeds first).
+  const bus = fakeBusFailingOnCall(2);
+  const idem = fakeIdempotency();
+
+  await assert.rejects(
+    () => ingestMetaWebhook(payload, "tenant-1", { eventBus: bus, idempotency: idem }),
+    /db down/
+  );
+  assert.deepEqual(idem.releases, ["status:wamid.1:delivered"]);
+  // The inbound message's publish succeeded and was NOT released.
+  assert.equal(bus.published.length, 1);
+  assert.equal(bus.published[0].topic.toLowerCase().includes("status"), false);
+
+  // Retry: inbound is now a duplicate (its key is still claimed), but the
+  // released status key can be re-claimed and republished.
+  const summary = await ingestMetaWebhook(payload, "tenant-1", { eventBus: bus, idempotency: idem });
+  assert.deepEqual(summary, { inbound: 0, statuses: 1, duplicates: 1 });
+  assert.equal(bus.published.length, 2);
 });

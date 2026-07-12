@@ -14,6 +14,13 @@ export interface WebhookPayload {
 
 export interface IdempotencyStore {
   isDuplicate(key: string): Promise<boolean>;
+  /**
+   * Release a previously claimed key. Optional so third-party/legacy
+   * implementers of this interface without a release method remain
+   * compatible; when absent, a failed publish simply cannot release its
+   * claim (falls back to prior at-most-once-per-TTL behavior).
+   */
+  release?(key: string): Promise<void>;
 }
 
 export interface IngestDeps {
@@ -72,11 +79,19 @@ export async function ingestMetaWebhook(
         incCounter("events_published_total", "Events published to the bus.", {
           topic: EventTopics.WhatsAppInboundReceived
         });
-        await deps.eventBus.publish(
-          EventTopics.WhatsAppInboundReceived,
-          { ...normalizeInbound(value, message, entry.id) },
-          tenantId
-        );
+        try {
+          await deps.eventBus.publish(
+            EventTopics.WhatsAppInboundReceived,
+            { ...normalizeInbound(value, message, entry.id) },
+            tenantId
+          );
+        } catch (error) {
+          // Publish failed after the idempotency key was claimed — release it
+          // so a retry of the same webhook (e.g. Meta re-delivery) isn't
+          // swallowed as a duplicate.
+          await deps.idempotency.release?.(key);
+          throw error;
+        }
       }
 
       for (const status of value.statuses ?? []) {
@@ -90,11 +105,19 @@ export async function ingestMetaWebhook(
         incCounter("events_published_total", "Events published to the bus.", {
           topic: EventTopics.WhatsAppStatusUpdated
         });
-        await deps.eventBus.publish(
-          EventTopics.WhatsAppStatusUpdated,
-          { ...normalizeStatus(value, status, entry.id) },
-          tenantId
-        );
+        try {
+          await deps.eventBus.publish(
+            EventTopics.WhatsAppStatusUpdated,
+            { ...normalizeStatus(value, status, entry.id) },
+            tenantId
+          );
+        } catch (error) {
+          // Publish failed after the idempotency key was claimed — release it
+          // so a retry of the same webhook (e.g. Meta re-delivery) isn't
+          // swallowed as a duplicate.
+          await deps.idempotency.release?.(key);
+          throw error;
+        }
       }
     }
   }

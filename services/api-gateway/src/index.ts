@@ -1240,7 +1240,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 401, { error: "Invalid webhook signature" });
       return;
     }
-    if (await webhookIdempotency.isDuplicate(`webhook:${normalizedSignature}`)) {
+    const signatureKey = `webhook:${normalizedSignature}`;
+    if (await webhookIdempotency.isDuplicate(signatureKey)) {
       sendJson(res, 200, { status: "duplicate_ignored" });
       return;
     }
@@ -1267,8 +1268,18 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         }
       }
     }
-    const { ok, body: proxyBody } = await ingestWebhookProxy({ rawBody, signature: normalizedSignature });
-    sendJson(res, ok ? 200 : 502, { requestId: ctx.requestId, upstream: proxyBody });
+    try {
+      const { ok, body: proxyBody } = await ingestWebhookProxy({ rawBody, signature: normalizedSignature });
+      sendJson(res, ok ? 200 : 502, { requestId: ctx.requestId, upstream: proxyBody });
+    } catch (error) {
+      // The signature-level idempotency key was claimed before this call.
+      // Processing failed (e.g. outbox enqueue hit a DB outage) before the
+      // webhook was durably recorded, so release the key: Meta will retry
+      // the same delivery and it must not be swallowed as a duplicate.
+      await webhookIdempotency.release(signatureKey);
+      logger.error("webhook_ingest_failed", { error: error instanceof Error ? error.message : String(error) });
+      sendJson(res, 502, { error: "webhook_processing_unavailable" });
+    }
     return;
   }
 

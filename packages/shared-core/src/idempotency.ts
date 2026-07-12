@@ -20,6 +20,16 @@ export class IdempotencyStore {
     return true;
   }
 
+  /**
+   * Release a previously claimed key so a subsequent isDuplicate() call for
+   * the same key is treated as a fresh claim. Used when the caller claimed
+   * the key but then failed to process/publish the associated work, so a
+   * retry (e.g. Meta re-delivering a webhook) isn't swallowed as a duplicate.
+   */
+  async release(key: string): Promise<void> {
+    this.store.delete(key);
+  }
+
   private pruneExpired(now: number): void {
     this.lastPruneAt = now;
     for (const [key, expiry] of this.store.entries()) {
@@ -43,6 +53,7 @@ export interface RedisSetNx {
     time: number,
     setMode: string
   ): Promise<string | null>;
+  del(key: string): Promise<number>;
 }
 
 /**
@@ -69,5 +80,15 @@ export class RedisIdempotencyStore {
       "NX"
     );
     return result === null;
+  }
+
+  /**
+   * Release a previously claimed key so a subsequent isDuplicate() call for
+   * the same key is treated as a fresh claim. Used when the caller claimed
+   * the key but then failed to process/publish the associated work, so a
+   * retry (e.g. Meta re-delivering a webhook) isn't swallowed as a duplicate.
+   */
+  async release(key: string): Promise<void> {
+    await this.redis.del(`${this.keyPrefix}${key}`);
   }
 }
