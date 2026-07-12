@@ -22,7 +22,6 @@ interface AuthContextValue {
   user: SessionUser | null;
   isLoading: boolean;
   login: (email: string, password: string) => Promise<void>;
-  register: (orgName: string, email: string, password: string, displayName?: string) => Promise<void>;
   logout: () => Promise<void>;
 }
 
@@ -68,15 +67,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setUser(data.user);
   }, []);
 
-  const register = useCallback(
-    async (orgName: string, email: string, password: string, displayName?: string) => {
-      const data = await api.post<AuthResponse>("/auth/register", { orgName, email, password, displayName });
-      persist(data.user, data.token);
-      setUser(data.user);
-    },
-    []
-  );
-
   const logout = useCallback(async () => {
     try {
       await api.post("/auth/logout");
@@ -89,7 +79,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setUser(null);
   }, []);
 
-  const value = useMemo(() => ({ user, isLoading, login, register, logout }), [user, isLoading, login, register, logout]);
+  const value = useMemo(() => ({ user, isLoading, login, logout }), [user, isLoading, login, logout]);
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

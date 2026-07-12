@@ -27,10 +27,10 @@ describe("api client", () => {
   });
 
   it("throws ApiError with the server's error message on non-2xx", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(400, { error: "orgName is required" })));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(400, { error: "email is required" })));
 
-    await expect(api.post("/auth/register", {})).rejects.toMatchObject({
-      message: "orgName is required",
+    await expect(api.post("/auth/login", {})).rejects.toMatchObject({
+      message: "email is required",
       status: 400
     });
   });

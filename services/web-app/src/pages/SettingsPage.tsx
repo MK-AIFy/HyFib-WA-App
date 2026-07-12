@@ -31,7 +31,6 @@ export function SettingsPage() {
           </CardHeader>
           <CardContent>
             <Row label="Organization" value={user?.tenant?.name ?? "—"} />
-            <Row label="Tenant ID" value={user?.tenantId ?? "—"} />
             <Row label="Your role" value={titleCase(user?.roles[0] ?? "")} />
           </CardContent>
         </Card>
