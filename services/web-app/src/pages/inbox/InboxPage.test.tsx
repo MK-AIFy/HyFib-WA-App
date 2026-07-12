@@ -67,4 +67,52 @@ describe("InboxPage — mark-read on open", () => {
     expect(selected).toHaveTextContent("No Unread");
     expect(postMock).not.toHaveBeenCalled();
   });
+
+  it("re-fires mark-read on a fresh inbound for a conversation selected from a non-default (filtered) tab", async () => {
+    // Regression for review finding 1: the conversation below only exists in
+    // the "closed" tab's query results — the unfiltered "all" tab (server's
+    // default top-25 page) never contains it. Before the fix, InboxPage
+    // always read freshness off `useConversations("all")`, so this row would
+    // never be found there and the mark-read re-fire on a new inbound would
+    // silently never happen.
+    let closedItems = [conv({ id: "c-closed", unreadCount: 2, contactName: "Closed Unread", state: "closed" })];
+    vi.spyOn(api, "get").mockImplementation((path: string) => {
+      if (path.includes("/messages")) return Promise.resolve({ items: [] });
+      if (path === "/api/v1/saved-replies") return Promise.resolve({ items: [] });
+      if (path === "/api/v1/conversations?state=closed") return Promise.resolve({ items: closedItems });
+      if (path.startsWith("/api/v1/conversations")) return Promise.resolve({ items: [] }); // "all" tab: empty
+      return Promise.reject(new Error(`Unhandled GET ${path}`));
+    });
+    // Mock POST to actually persist the read, like the real backend would —
+    // otherwise a static GET mock would "bounce" unreadCount back up on the
+    // post-mutation refetch and produce a false-positive re-fire.
+    const postMock = vi.spyOn(api, "post").mockImplementation((path: string) => {
+      closedItems = closedItems.map((c) => (path.includes(c.id) ? { ...c, unreadCount: 0 } : c));
+      return Promise.resolve({ status: "read", conversationId: "" });
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <InboxPage />
+      </QueryClientProvider>
+    );
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole("tab", { name: "Closed" }));
+    await user.click(await screen.findByText("Closed Unread"));
+
+    await waitFor(() => expect(postMock).toHaveBeenCalledTimes(1));
+    expect(postMock).toHaveBeenCalledWith("/api/v1/conversations/c-closed/read", {});
+
+    // Simulate a new inbound bumping unreadCount back up — landing directly
+    // in the SAME `["conversations", { state: "closed" }]` cache entry
+    // ConversationList itself renders from (what an SSE-triggered
+    // invalidate+refetch would ultimately produce).
+    client.setQueryData(["conversations", { state: "closed" }], {
+      items: [{ ...closedItems[0], unreadCount: 1 }]
+    });
+
+    await waitFor(() => expect(postMock).toHaveBeenCalledTimes(2));
+    expect(postMock).toHaveBeenLastCalledWith("/api/v1/conversations/c-closed/read", {});
+  });
 });

@@ -11,10 +11,21 @@ import { useConversations, type ConvStateFilter } from "@/hooks/use-conversation
 interface Props {
   activeId?: string;
   onSelect: (c: Conversation) => void;
+  /**
+   * Tab/state filter is owned by the parent (InboxPage) rather than kept
+   * locally here: InboxPage needs to read live rows for whatever tab is
+   * currently displayed (to know when to re-fire mark-read on a fresh
+   * inbound), and that's only correct if it queries the SAME
+   * `["conversations", { state }]` cache entry this list renders from. A
+   * locally-owned `state` here + a separately-fixed `state` in InboxPage
+   * (e.g. always "all") would let the two diverge whenever the user is on a
+   * non-default tab — see Task 22 review finding 1.
+   */
+  state: ConvStateFilter;
+  onStateChange: (state: ConvStateFilter) => void;
 }
 
-export function ConversationList({ activeId, onSelect }: Props) {
-  const [state, setState] = useState<ConvStateFilter>("all");
+export function ConversationList({ activeId, onSelect, state, onStateChange }: Props) {
   const [search, setSearch] = useState("");
   const { data, isLoading } = useConversations(state);
 
@@ -38,7 +49,7 @@ export function ConversationList({ activeId, onSelect }: Props) {
           onChange={(e) => setSearch(e.target.value)}
           aria-label="Search conversations"
         />
-        <Tabs value={state} onValueChange={(v) => setState(v as ConvStateFilter)}>
+        <Tabs value={state} onValueChange={(v) => onStateChange(v as ConvStateFilter)}>
           <TabsList className="w-full">
             <TabsTrigger value="all">All</TabsTrigger>
             <TabsTrigger value="open">Open</TabsTrigger>
@@ -82,8 +93,13 @@ export function ConversationList({ activeId, onSelect }: Props) {
                       <span className="truncate text-xs text-muted-foreground">{c.lastMessage || "—"}</span>
                       {unread ? (
                         <span className="ml-auto flex shrink-0 items-center gap-1.5">
-                          <span className="size-2 rounded-full bg-primary" aria-label="Unread" />
-                          <Badge variant="gray" className="h-4 min-w-4 justify-center rounded-full px-1 text-[10px] leading-none">
+                          {/* Decorative — the count badge below carries the one accessible name for this indicator. */}
+                          <span className="size-2 rounded-full bg-primary" aria-hidden="true" />
+                          <Badge
+                            variant="gray"
+                            className="h-4 min-w-4 justify-center rounded-full px-1 text-[10px] leading-none"
+                            aria-label={`${c.unreadCount} unread messages`}
+                          >
                             {c.unreadCount}
                           </Badge>
                         </span>

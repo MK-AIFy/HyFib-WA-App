@@ -22,7 +22,7 @@ function renderList(items: Conversation[]) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={client}>
-      <ConversationList onSelect={() => {}} />
+      <ConversationList onSelect={() => {}} state="all" onStateChange={() => {}} />
     </QueryClientProvider>
   );
 }
@@ -32,19 +32,19 @@ describe("ConversationList", () => {
     vi.restoreAllMocks();
   });
 
-  it("renders the numeric unread badge for a conversation with unreadCount 3", async () => {
+  it("renders the numeric unread badge with an accessible name for a conversation with unreadCount 3", async () => {
     renderList([conv({ id: "c1", unreadCount: 3, contactName: "Has Unread" })]);
 
     await screen.findByText("Has Unread");
     expect(screen.getByText("3")).toBeInTheDocument();
-    expect(screen.getByLabelText("Unread")).toBeInTheDocument();
+    expect(screen.getByLabelText("3 unread messages")).toBeInTheDocument();
   });
 
   it("renders no badge for a conversation with unreadCount 0", async () => {
     renderList([conv({ id: "c1", unreadCount: 0, contactName: "No Unread" })]);
 
     await screen.findByText("No Unread");
-    expect(screen.queryByLabelText("Unread")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/unread messages/i)).not.toBeInTheDocument();
     expect(screen.queryByText("0")).not.toBeInTheDocument();
   });
 });
