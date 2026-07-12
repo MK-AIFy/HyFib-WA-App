@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { Role, Tenant } from "@hyfib/shared-core";
 import { api, ApiError, setUnauthorizedHandler } from "./api";
 import { clearSession, writeSession } from "./auth-storage";
@@ -47,6 +47,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // (HttpOnly), so the boot effect always awaits /auth/me — an anonymous
   // 401 resolves fast and is already handled below.
   const [isLoading, setIsLoading] = useState<boolean>(true);
+  const bootStartedRef = useRef(false);
 
   useEffect(() => {
     setUnauthorizedHandler(() => setUser(null));
@@ -58,6 +59,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // localStorage. Send it ONCE as an Authorization header on this boot
     // call so the server can mint the hf_session cookie, then drop the key
     // regardless of outcome so every later boot runs on pure cookie auth.
+    // React StrictMode double-invokes this effect in dev; the ref sentinel
+    // makes the second invocation a true no-op so we never double-fire it.
+    if (bootStartedRef.current) return;
+    bootStartedRef.current = true;
+
     const legacyToken = localStorage.getItem(LEGACY_TOKEN_KEY);
     const extraHeaders = legacyToken ? { authorization: `Bearer ${legacyToken}` } : undefined;
 

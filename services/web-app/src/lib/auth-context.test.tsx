@@ -1,3 +1,4 @@
+import { StrictMode } from "react";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -80,6 +81,26 @@ describe("AuthProvider", () => {
       <AuthProvider>
         <Probe />
       </AuthProvider>
+    );
+
+    await waitFor(() => expect(screen.getByText("ready")).toBeInTheDocument());
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect((init.headers as Record<string, string>).authorization).toBe("Bearer legacy-tok");
+    expect(localStorage.getItem("hf_tok")).toBeNull();
+  });
+
+  it("under StrictMode, sends a stored legacy hf_tok exactly once despite the double-invoked boot effect", async () => {
+    localStorage.setItem("hf_tok", "legacy-tok");
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, meUser()));
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(
+      <StrictMode>
+        <AuthProvider>
+          <Probe />
+        </AuthProvider>
+      </StrictMode>
     );
 
     await waitFor(() => expect(screen.getByText("ready")).toBeInTheDocument());
