@@ -277,3 +277,103 @@ function renderInboxWithFakeGet() {
   );
   return { getMock };
 }
+
+describe("InboxPage — message search result selection (Task 26)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it("selecting a message search result whose conversation IS in the currently loaded list opens it directly", async () => {
+    const searchResult = {
+      id: "sm1",
+      conversationId: "c-unread",
+      direction: "inbound" as const,
+      status: "delivered" as const,
+      createdAt: "2026-07-12T00:00:00.000Z",
+      text: "urgent: please call back",
+      contactName: "Has Unread"
+    };
+    const postMock = vi.spyOn(api, "post").mockResolvedValue({ status: "read", conversationId: "" });
+    vi.spyOn(api, "get").mockImplementation((path: string) => {
+      if (path.startsWith("/api/v1/messages/search")) {
+        return Promise.resolve({ items: [searchResult], total: 1, limit: 20, offset: 0 });
+      }
+      if (path.includes("/messages")) return Promise.resolve({ items: [] });
+      if (path === "/api/v1/saved-replies") return Promise.resolve({ items: [] });
+      if (path.startsWith("/api/v1/conversations")) return Promise.resolve({ items: CONVERSATIONS });
+      return Promise.reject(new Error(`Unhandled GET ${path}`));
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <InboxPage />
+      </QueryClientProvider>
+    );
+    const user = userEvent.setup();
+
+    await user.type(await screen.findByLabelText("Search conversations"), "urgent");
+    await user.click(await screen.findByRole("tab", { name: "Messages" }));
+    // Click the result's visible text (a descendant of the row's <button>), not the
+    // <li role="option"> wrapper itself — the onClick handler lives on the <button>,
+    // and a click on an ancestor element never bubbles DOWN into a descendant.
+    await user.click(await screen.findByText("Has Unread"));
+
+    // c-unread has unreadCount 3 in CONVERSATIONS — mark-read firing for it is the
+    // observable proof InboxPage resolved the search result's conversationId against
+    // the already-loaded list and made it `active`, without any extra id-lookup fetch.
+    await waitFor(() => expect(postMock).toHaveBeenCalledWith("/api/v1/conversations/c-unread/read", {}), {
+      timeout: 3000
+    });
+  });
+
+  it("selecting a message search result NOT in the current (filtered) list resets filters and selects it once the broadened list contains it — the documented fallback for the missing GET /api/v1/conversations/:id endpoint", async () => {
+    const hidden = conv({ id: "c-hidden", unreadCount: 1, contactName: "Hidden Contact", state: "closed" });
+    const searchResult = {
+      id: "sm1",
+      conversationId: "c-hidden",
+      direction: "inbound" as const,
+      status: "delivered" as const,
+      createdAt: "2026-07-12T00:00:00.000Z",
+      text: "a message only findable by content search",
+      contactName: "Hidden Contact"
+    };
+    const postMock = vi.spyOn(api, "post").mockResolvedValue({ status: "read", conversationId: "" });
+    const getMock = vi.spyOn(api, "get").mockImplementation((path: string) => {
+      if (path.startsWith("/api/v1/messages/search")) {
+        return Promise.resolve({ items: [searchResult], total: 1, limit: 20, offset: 0 });
+      }
+      if (path.includes("/messages")) return Promise.resolve({ items: [] });
+      if (path === "/api/v1/saved-replies") return Promise.resolve({ items: [] });
+      // "closed" tab (filtered) view does NOT include the target conversation...
+      if (path === "/api/v1/conversations?state=closed") return Promise.resolve({ items: CONVERSATIONS });
+      // ...but the reset/default view (state=all, no q, not archived) does.
+      if (path === "/api/v1/conversations") return Promise.resolve({ items: [...CONVERSATIONS, hidden] });
+      if (path.startsWith("/api/v1/conversations")) return Promise.resolve({ items: CONVERSATIONS });
+      return Promise.reject(new Error(`Unhandled GET ${path}`));
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <InboxPage />
+      </QueryClientProvider>
+    );
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole("tab", { name: "Closed" }));
+    await waitFor(() => expect(getMock).toHaveBeenCalledWith("/api/v1/conversations?state=closed"));
+
+    const input = await screen.findByLabelText("Search conversations");
+    await user.type(input, "hidden");
+    await user.click(await screen.findByRole("tab", { name: "Messages" }));
+    await user.click(await screen.findByText("Hidden Contact"));
+
+    // Fallback fired: the search box was cleared as part of resetting filters.
+    await waitFor(() => expect(input).toHaveValue(""), { timeout: 3000 });
+    // Once the broadened default list lands with the target row, it's selected and
+    // mark-read fires for it — proof the id -> Conversation resolution completed.
+    await waitFor(() => expect(postMock).toHaveBeenCalledWith("/api/v1/conversations/c-hidden/read", {}), {
+      timeout: 3000
+    });
+  });
+});

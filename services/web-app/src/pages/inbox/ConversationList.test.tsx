@@ -33,6 +33,9 @@ function renderList(items: Conversation[]) {
         q=""
         archived={false}
         onArchivedChange={() => {}}
+        scope="conversations"
+        onScopeChange={() => {}}
+        onSelectConversation={() => {}}
       />
     </QueryClientProvider>
   );
@@ -55,6 +58,35 @@ function ArchivedToggleHarness() {
       q=""
       archived={archived}
       onArchivedChange={setArchived}
+      scope="conversations"
+      onScopeChange={() => {}}
+      onSelectConversation={() => {}}
+    />
+  );
+}
+
+/**
+ * Mirrors InboxPage's real lifted-state wiring for `search`/`scope`, needed
+ * for the scope-toggle tests below: a real `useState` (not a no-op
+ * callback) so typing into the search box and clicking the toggle actually
+ * re-render with the new values, like InboxPage does in production.
+ */
+function ScopeToggleHarness() {
+  const [search, setSearch] = useState("");
+  const [scope, setScope] = useState<"conversations" | "messages">("conversations");
+  return (
+    <ConversationList
+      onSelect={() => {}}
+      state="all"
+      onStateChange={() => {}}
+      search={search}
+      onSearchChange={setSearch}
+      q={search}
+      archived={false}
+      onArchivedChange={() => {}}
+      scope={scope}
+      onScopeChange={setScope}
+      onSelectConversation={() => {}}
     />
   );
 }
@@ -134,5 +166,48 @@ describe("ConversationList", () => {
     await user.click(screen.getByRole("button", { name: "Show archived conversations" }));
 
     await waitFor(() => expect(getMock).toHaveBeenCalledWith("/api/v1/conversations?archived=true"));
+  });
+});
+
+describe("ConversationList — scope toggle (Task 26)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("does not render the scope toggle while the search box is empty", async () => {
+    renderList([]);
+
+    await waitFor(() => expect(api.get).toHaveBeenCalled());
+    expect(screen.queryByRole("tab", { name: "Messages" })).not.toBeInTheDocument();
+  });
+
+  it("renders the scope toggle once the search box is non-empty, and switching to Messages swaps the panel", async () => {
+    const getMock = vi.spyOn(api, "get").mockImplementation((path: string) => {
+      if (path.startsWith("/api/v1/messages/search")) {
+        return Promise.resolve({ items: [], total: 0, limit: 20, offset: 0 });
+      }
+      return Promise.resolve({ items: [conv({ id: "c1", unreadCount: 0, contactName: "Jane Doe" })] });
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <ScopeToggleHarness />
+      </QueryClientProvider>
+    );
+    const user = userEvent.setup();
+
+    await waitFor(() => expect(getMock).toHaveBeenCalledWith("/api/v1/conversations"));
+    expect(screen.queryByRole("tab", { name: "Messages" })).not.toBeInTheDocument();
+
+    await user.type(screen.getByLabelText("Search conversations"), "jane");
+
+    expect(await screen.findByRole("tab", { name: "Messages" })).toBeInTheDocument();
+    // Default scope ("Conversations") still renders the plain conversation list.
+    expect(screen.getByRole("listbox", { name: "Conversations" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("tab", { name: "Messages" }));
+
+    expect(await screen.findByRole("listbox", { name: "Message search results" })).toBeInTheDocument();
+    expect(screen.queryByRole("listbox", { name: "Conversations" })).not.toBeInTheDocument();
   });
 });

@@ -8,6 +8,10 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 import { initials, timeAgo } from "@/lib/format";
 import { useConversations, type ConvStateFilter } from "@/hooks/use-conversations";
+import { MessageSearchResults } from "./MessageSearchResults";
+
+/** Which panel the search area renders while the search box is non-empty. */
+export type SearchScope = "conversations" | "messages";
 
 interface Props {
   activeId?: string;
@@ -33,6 +37,11 @@ interface Props {
   q: string;
   archived: boolean;
   onArchivedChange: (archived: boolean) => void;
+  /** "Conversations" (default) vs "Messages" scope — owned by InboxPage, same lifted-state pattern as state/q/archived. */
+  scope: SearchScope;
+  onScopeChange: (scope: SearchScope) => void;
+  /** Resolves a message-search result's conversationId and opens it — see MessageSearchResults' onSelectConversation. */
+  onSelectConversation: (conversationId: string) => void;
 }
 
 export function ConversationList({
@@ -44,13 +53,24 @@ export function ConversationList({
   onSearchChange,
   q,
   archived,
-  onArchivedChange
+  onArchivedChange,
+  scope,
+  onScopeChange,
+  onSelectConversation
 }: Props) {
   // Server now does the filtering/sorting (search on contact name/phone,
   // archived-folder membership, pinned-first ordering) — no client-side
   // useMemo filter or sort needed; `items` is rendered straight off the page.
   const { data, isLoading } = useConversations(state, q, archived);
   const items = data?.items ?? [];
+  // Gated on the RAW (immediate) search box value, not the debounced `q`: the
+  // toggle is a UI affordance, not a network trigger, so it should
+  // appear/disappear the instant the user types/clears rather than lagging
+  // behind the 300ms debounce. Same reasoning governs falling back to the
+  // conversation list below once `search` is cleared, regardless of
+  // whatever `scope` was last selected.
+  const isSearching = search.trim().length > 0;
+  const showMessageResults = isSearching && scope === "messages";
 
   return (
     <div className="flex h-full w-full flex-col border-r border-border md:w-80">
@@ -74,6 +94,14 @@ export function ConversationList({
             <Archive className="size-4" aria-hidden="true" />
           </Button>
         </div>
+        {isSearching ? (
+          <Tabs value={scope} onValueChange={(v) => onScopeChange(v as SearchScope)}>
+            <TabsList className="w-full">
+              <TabsTrigger value="conversations">Conversations</TabsTrigger>
+              <TabsTrigger value="messages">Messages</TabsTrigger>
+            </TabsList>
+          </Tabs>
+        ) : null}
         <Tabs value={state} onValueChange={(v) => onStateChange(v as ConvStateFilter)}>
           <TabsList className="w-full">
             <TabsTrigger value="all">All</TabsTrigger>
@@ -83,69 +111,69 @@ export function ConversationList({
           </TabsList>
         </Tabs>
       </div>
-      <ul className="flex-1 overflow-y-auto" role="listbox" aria-label="Conversations">
-        {isLoading ? (
-          <li className="space-y-3 p-3">
-            <Skeleton className="h-12 w-full" />
-            <Skeleton className="h-12 w-full" />
-            <Skeleton className="h-12 w-full" />
-          </li>
-        ) : items.length === 0 ? (
-          <li className="p-6 text-center text-sm text-muted-foreground">No conversations</li>
-        ) : (
-          items.map((c) => {
-            const unread = c.unreadCount > 0;
-            return (
-              <li key={c.id} role="option" aria-selected={c.id === activeId}>
-                <button
-                  onClick={() => onSelect(c)}
-                  className={cn(
-                    "flex w-full items-center gap-3 border-b border-border/50 px-3 py-2.5 text-left transition-colors hover:bg-accent",
-                    c.id === activeId && "bg-accent"
-                  )}
-                >
-                  <span className="flex size-9 shrink-0 items-center justify-center rounded-full bg-secondary text-xs font-medium">
-                    {initials(c.contactName, c.contactPhone)}
-                  </span>
-                  <span className="min-w-0 flex-1">
-                    <span className="flex items-center justify-between gap-2">
-                      <span className="flex min-w-0 items-center gap-1">
-                        {c.pinnedAt ? (
-                          <Pin
-                            className="size-3 shrink-0 text-muted-foreground"
-                            role="img"
-                            aria-label="Pinned"
-                          />
-                        ) : null}
-                        <span className="truncate text-sm font-medium">
-                          {c.contactName || c.contactPhone || "Unknown"}
+      {showMessageResults ? (
+        <MessageSearchResults q={q} onSelectConversation={onSelectConversation} />
+      ) : (
+        <ul className="flex-1 overflow-y-auto" role="listbox" aria-label="Conversations">
+          {isLoading ? (
+            <li className="space-y-3 p-3">
+              <Skeleton className="h-12 w-full" />
+              <Skeleton className="h-12 w-full" />
+              <Skeleton className="h-12 w-full" />
+            </li>
+          ) : items.length === 0 ? (
+            <li className="p-6 text-center text-sm text-muted-foreground">No conversations</li>
+          ) : (
+            items.map((c) => {
+              const unread = c.unreadCount > 0;
+              return (
+                <li key={c.id} role="option" aria-selected={c.id === activeId}>
+                  <button
+                    onClick={() => onSelect(c)}
+                    className={cn(
+                      "flex w-full items-center gap-3 border-b border-border/50 px-3 py-2.5 text-left transition-colors hover:bg-accent",
+                      c.id === activeId && "bg-accent"
+                    )}
+                  >
+                    <span className="flex size-9 shrink-0 items-center justify-center rounded-full bg-secondary text-xs font-medium">
+                      {initials(c.contactName, c.contactPhone)}
+                    </span>
+                    <span className="min-w-0 flex-1">
+                      <span className="flex items-center justify-between gap-2">
+                        <span className="flex min-w-0 items-center gap-1">
+                          {c.pinnedAt ? (
+                            <Pin className="size-3 shrink-0 text-muted-foreground" role="img" aria-label="Pinned" />
+                          ) : null}
+                          <span className="truncate text-sm font-medium">
+                            {c.contactName || c.contactPhone || "Unknown"}
+                          </span>
                         </span>
+                        <span className="shrink-0 text-xs text-muted-foreground">{timeAgo(c.lastMessageAt)}</span>
                       </span>
-                      <span className="shrink-0 text-xs text-muted-foreground">{timeAgo(c.lastMessageAt)}</span>
+                      <span className="flex items-center gap-1.5">
+                        <span className="truncate text-xs text-muted-foreground">{c.lastMessage || "—"}</span>
+                        {unread ? (
+                          <span className="ml-auto flex shrink-0 items-center gap-1.5">
+                            {/* Decorative — the count badge below carries the one accessible name for this indicator. */}
+                            <span className="size-2 rounded-full bg-primary" aria-hidden="true" />
+                            <Badge
+                              variant="gray"
+                              className="h-4 min-w-4 justify-center rounded-full px-1 text-[10px] leading-none"
+                              aria-label={`${c.unreadCount} unread messages`}
+                            >
+                              {c.unreadCount}
+                            </Badge>
+                          </span>
+                        ) : null}
+                      </span>
                     </span>
-                    <span className="flex items-center gap-1.5">
-                      <span className="truncate text-xs text-muted-foreground">{c.lastMessage || "—"}</span>
-                      {unread ? (
-                        <span className="ml-auto flex shrink-0 items-center gap-1.5">
-                          {/* Decorative — the count badge below carries the one accessible name for this indicator. */}
-                          <span className="size-2 rounded-full bg-primary" aria-hidden="true" />
-                          <Badge
-                            variant="gray"
-                            className="h-4 min-w-4 justify-center rounded-full px-1 text-[10px] leading-none"
-                            aria-label={`${c.unreadCount} unread messages`}
-                          >
-                            {c.unreadCount}
-                          </Badge>
-                        </span>
-                      ) : null}
-                    </span>
-                  </span>
-                </button>
-              </li>
-            );
-          })
-        )}
-      </ul>
+                  </button>
+                </li>
+              );
+            })
+          )}
+        </ul>
+      )}
     </div>
   );
 }
