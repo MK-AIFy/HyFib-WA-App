@@ -91,6 +91,7 @@ import { canCreateContact, canCreateOrder } from "./authorization.js";
 import { SseHub } from "./sse-hub.js";
 import { parseCsv, serializeContactsCsv, extractMultipartFile } from "./csv.js";
 import { resolveOrgTenant } from "./single-org.js";
+import { runOutboxRelayOnce } from "./outbox-relay.js";
 
 // ─── Request body interfaces ───────────────────────────────────────────────────
 
@@ -918,18 +919,28 @@ function startOutboxRelay(): NodeJS.Timeout {
     running = true;
     void (async () => {
       try {
-        const batch = await outboxRepository.claim(50);
-        for (const row of batch) {
-          await eventBus.publish(
-            row.topic as (typeof EventTopics)[keyof typeof EventTopics],
-            row.payload,
-            row.tenant_id ?? undefined
-          );
-          await outboxRepository.markProcessed(row.id);
-          incCounter("events_published_total", "Events published to the bus.", { topic: row.topic });
-        }
-      } catch (error) {
-        logger.error("outbox_relay_error", { error: error instanceof Error ? error.message : String(error) });
+        await runOutboxRelayOnce(
+          {
+            claim: (limit) => outboxRepository.claim(limit),
+            publish: (topic, payload, tenantId) =>
+              eventBus.publish(topic as (typeof EventTopics)[keyof typeof EventTopics], payload, tenantId),
+            markProcessed: (id) => outboxRepository.markProcessed(id),
+            markFailed: (id, error) => outboxRepository.markFailed(id, error),
+            counters: {
+              published: (topic) => incCounter("events_published_total", "Events published to the bus.", { topic }),
+              failed: (topic) =>
+                incCounter("outbox_publish_failures_total", "Outbox row publish attempts that failed.", { topic }),
+              dead: (topic) =>
+                incCounter(
+                  "outbox_events_dead_total",
+                  "Outbox rows moved to dead-letter status after exhausting retries.",
+                  { topic }
+                )
+            },
+            logger
+          },
+          50
+        );
       } finally {
         running = false;
       }
@@ -3017,6 +3028,45 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     const auditPage = parseListQuery(auditQuery, 50, 200);
     const items = await auditRepository.list(tenantId, auditPage);
     sendJson(res, 200, { items, limit: auditPage.limit, offset: auditPage.offset });
+    return;
+  }
+
+  // ─── Outbox dead-letters (admin) ──────────────────────────────────────────
+  if (path === "/api/v1/admin/dead-letters" && method === "GET") {
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin"])) {
+      sendJson(res, 403, { error: "Insufficient role" });
+      return;
+    }
+    const dlQuery = parseQuery(req.url);
+    const limit = clampInt(dlQuery.get("limit"), 1, 200, 50);
+    const items = await outboxRepository.listDead(tenantId, limit);
+    sendJson(res, 200, { items });
+    return;
+  }
+
+  if (path.startsWith("/api/v1/admin/dead-letters/") && path.endsWith("/replay") && method === "POST") {
+    const deadLetterId = extractPathSegment(path, "/api/v1/admin/dead-letters/");
+    if (!deadLetterId || !UUID.test(deadLetterId)) {
+      sendJson(res, 400, { error: "Invalid dead letter id" });
+      return;
+    }
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin"])) {
+      sendJson(res, 403, { error: "Insufficient role" });
+      return;
+    }
+    const replayed = await outboxRepository.replayDead(tenantId, deadLetterId);
+    if (!replayed) {
+      sendJson(res, 404, { error: "dead_letter_not_found" });
+      return;
+    }
+    incCounter("outbox_events_replayed_total", "Dead-lettered outbox events manually replayed.");
+    await audit(tenantId, auth, {
+      action: "outbox.dead_letter.replayed",
+      resourceType: "OutboxEvent",
+      resourceId: deadLetterId,
+      payload: { status: "replayed" }
+    });
+    sendJson(res, 200, { status: "replayed", id: deadLetterId });
     return;
   }
 
