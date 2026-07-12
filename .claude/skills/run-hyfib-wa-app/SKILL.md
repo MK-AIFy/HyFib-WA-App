@@ -3,7 +3,9 @@ name: run-hyfib-wa-app
 description: Build, run, and drive the HyFib WhatsApp Business platform locally. Use when asked to start or run the app/stack, smoke-test it, exercise the API (tenants, campaigns, webhooks, conversations), or verify a change against the running system.
 ---
 
-Multi-service WhatsApp Business platform (Node/TS monorepo) orchestrated by Docker Compose: nginx edge, api-gateway, web-portal, meta-adapter, webhook-ingestor, notification-worker, ai-intelligence-service, plus Postgres/Redis/RabbitMQ/Keycloak/MinIO/OpenSearch/Vault/Prometheus/Grafana. Drive it with the smoke driver at `.claude/skills/run-hyfib-wa-app/smoke.sh` — it bootstraps `.env`, brings the stack up, and exercises one full tenant→campaign→webhook→conversation flow with assertions. No real Meta credentials needed.
+Multi-service WhatsApp Business platform (Node/TS monorepo) orchestrated by Docker Compose: nginx edge, api-gateway, web-portal, meta-adapter, webhook-ingestor, notification-worker, ai-intelligence-service, plus Postgres/Redis/RabbitMQ/Keycloak/MinIO/OpenSearch/Vault/Prometheus/Grafana. Drive it with the smoke driver at `.claude/skills/run-hyfib-wa-app/smoke.sh` — it bootstraps `.env`, brings the stack up, and exercises one full org→campaign→webhook→conversation flow with assertions. No real Meta credentials needed.
+
+The backend serves a single fixed org (`POST /api/v1/tenants` and `/auth/register` are both retired — 404/410). The seeded org id on fresh installs is `00000000-0000-0000-0000-000000000001` (`infra/postgres/init/013_auth.sql`); pinned deployments may override it via `ORG_TENANT_ID`. The smoke driver and local runbook resolve this id instead of creating a tenant.
 
 All paths are relative to the repo root.
 
@@ -21,7 +23,7 @@ One command — builds images on first run (several minutes; warm runs ~30s), wa
 
 Ends with `SMOKE PASS — tenant <uuid>` and exit 0, or `SMOKE FAIL: <step>` and exit 1.
 
-What it asserts, in order: gateway `/health` reports `database: true`; portal and HTTPS edge health; tenant/user creation; channel registration with dummy ids; `analyst` role gets 403 on `POST /contacts` (role-gate check); contact+consent; template (auto-approved via direct DB update — see Gotchas); campaign dispatch returns `dispatch_enqueued`; an HMAC-signed inbound webhook is ingested (`inbound: 1`); a conversation appears with the inbound message in history; agent reply returns `message_enqueued`; analytics and audit reflect the run; `GET /api/v1/events/stream` serves `200 text/event-stream`.
+What it asserts, in order: gateway `/health` reports `database: true`; portal and HTTPS edge health; org resolution + user creation; channel registration with dummy ids; `analyst` role gets 403 on `POST /contacts` (role-gate check); contact+consent; template (auto-approved via direct DB update — see Gotchas); campaign dispatch returns `dispatch_enqueued`; an HMAC-signed inbound webhook is ingested (`inbound: 1`); a conversation appears with the inbound message in history; agent reply returns `message_enqueued`; analytics and audit reflect the run; `GET /api/v1/events/stream` serves `200 text/event-stream`.
 
 Variants:
 
