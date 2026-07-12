@@ -35,6 +35,20 @@ function downloadResponse(bytes, { status = 200, contentType, contentLength } = 
   return new Response(bytes, { status, headers });
 }
 
+/**
+ * A download Response that reports ok/headers normally but whose body-read
+ * (arrayBuffer) rejects — simulating the AbortSignal firing mid-stream or a
+ * network error surfacing only once the body is consumed.
+ */
+function downloadResponseWithFailingBody({ status = 200, contentType, contentLength } = {}) {
+  const headers = {};
+  if (contentType !== undefined) headers["content-type"] = contentType;
+  if (contentLength !== undefined) headers["content-length"] = String(contentLength);
+  const response = new Response(null, { status, headers });
+  response.arrayBuffer = () => Promise.reject(new Error("simulated body read failure"));
+  return response;
+}
+
 test("fetchMediaDirect: happy path returns buffer + mime + sha256, both calls carry the bearer token", async () => {
   const bytes = Buffer.from("fake-image-bytes");
   const { fetchImpl, calls } = queuedFetch([
@@ -114,8 +128,9 @@ test("fetchMediaDirect: missing token (no accessToken, no config default) errors
 
   const result = await fetchMediaDirect("media-4", undefined, { fetchImpl });
 
+  assert.equal(result.status, 503);
+  assert.equal(result.error, "meta_adapter_unavailable");
   assert.equal(result.media, undefined);
-  assert.ok(result.error);
   assert.equal(calls.length, 0, "no HTTP calls should be made without a token");
 });
 
@@ -128,4 +143,39 @@ test("fetchMediaDirect: non-OK resolve response maps to an error result without 
   assert.equal(result.error, "meta_media_failed");
   assert.equal(result.media, undefined);
   assert.equal(calls.length, 1, "no download call should be attempted after a failed resolve");
+});
+
+test("fetchMediaDirect: download 500 (non-retryable) maps to 502 with a single resolve/download pair", async () => {
+  const { fetchImpl, calls } = queuedFetch([
+    resolveResponse({ url: "https://lookaside.fbsbx.com/blob/server-error" }),
+    downloadResponse(Buffer.from(""), { status: 500 })
+  ]);
+
+  const result = await fetchMediaDirect("media-6", "test-token", { fetchImpl });
+
+  assert.equal(result.status, 502);
+  assert.equal(result.error, "meta_media_download_failed");
+  assert.equal(result.media, undefined);
+  assert.equal(calls.length, 2, "500 is non-retryable: only one resolve + one download call");
+  assert.equal(
+    calls.filter((call) => call.url.startsWith(RESOLVE_URL_PREFIX)).length,
+    1,
+    "no second resolve call for a non-retryable download failure"
+  );
+});
+
+test("fetchMediaDirect: download body-read failure (arrayBuffer rejects) resolves to a network outcome, not an unhandled rejection", async () => {
+  const { fetchImpl, calls } = queuedFetch([
+    resolveResponse({ url: "https://lookaside.fbsbx.com/blob/body-fail" }),
+    downloadResponseWithFailingBody()
+  ]);
+
+  // Awaiting here proves the rejection inside downloadMediaBytes/arrayBuffer()
+  // was caught and mapped to a result rather than escaping the promise chain.
+  const result = await fetchMediaDirect("media-7", "test-token", { fetchImpl });
+
+  assert.equal(result.status, 503);
+  assert.equal(result.error, "meta_adapter_unavailable");
+  assert.equal(result.media, undefined);
+  assert.equal(calls.length, 2, "network-kind failures during body read are not retried");
 });

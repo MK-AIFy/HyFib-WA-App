@@ -499,12 +499,36 @@ async function downloadMediaBytes(
   token: string,
   requestId?: string
 ): Promise<DownloadOutcome> {
-  let response: Response;
   try {
-    response = await fetchImpl(url, {
+    const response = await fetchImpl(url, {
       headers: { Authorization: `Bearer ${token}` },
       signal: AbortSignal.timeout(60_000)
     });
+
+    if (!response.ok) {
+      logger.warn("meta_media_download_failed", { requestId, statusCode: response.status });
+      return { ok: false, kind: "http", status: response.status, error: "meta_media_download_failed" };
+    }
+
+    const contentLengthHeader = response.headers.get("content-length");
+    const contentLength = contentLengthHeader ? Number(contentLengthHeader) : NaN;
+    if (Number.isFinite(contentLength) && contentLength > MEDIA_UPLOAD_MAX_BYTES) {
+      logger.warn("meta_media_too_large", { requestId, contentLength });
+      return { ok: false, kind: "cap", status: 413, error: "media_too_large" };
+    }
+
+    // Body consumption (arrayBuffer) stays inside this try: the 60s AbortSignal
+    // can fire mid-read, or the stream can error, after response.ok already
+    // resolved true — those failures must map to the same network outcome as
+    // a fetch()-level failure, not escape as an unhandled rejection.
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+    if (buffer.length > MEDIA_UPLOAD_MAX_BYTES) {
+      logger.warn("meta_media_too_large", { requestId, actualBytes: buffer.length });
+      return { ok: false, kind: "cap", status: 413, error: "media_too_large" };
+    }
+
+    return { ok: true, buffer, contentType: response.headers.get("content-type") ?? undefined };
   } catch (error) {
     logger.error("meta_media_download_exception", {
       requestId,
@@ -512,27 +536,6 @@ async function downloadMediaBytes(
     });
     return { ok: false, kind: "network", status: 503, error: "meta_adapter_unavailable" };
   }
-
-  if (!response.ok) {
-    logger.warn("meta_media_download_failed", { requestId, statusCode: response.status });
-    return { ok: false, kind: "http", status: response.status, error: "meta_media_download_failed" };
-  }
-
-  const contentLengthHeader = response.headers.get("content-length");
-  const contentLength = contentLengthHeader ? Number(contentLengthHeader) : NaN;
-  if (Number.isFinite(contentLength) && contentLength > MEDIA_UPLOAD_MAX_BYTES) {
-    logger.warn("meta_media_too_large", { requestId, contentLength });
-    return { ok: false, kind: "cap", status: 413, error: "media_too_large" };
-  }
-
-  const arrayBuffer = await response.arrayBuffer();
-  const buffer = Buffer.from(arrayBuffer);
-  if (buffer.length > MEDIA_UPLOAD_MAX_BYTES) {
-    logger.warn("meta_media_too_large", { requestId, actualBytes: buffer.length });
-    return { ok: false, kind: "cap", status: 413, error: "media_too_large" };
-  }
-
-  return { ok: true, buffer, contentType: response.headers.get("content-type") ?? undefined };
 }
 
 /**
@@ -553,6 +556,7 @@ export async function fetchMediaDirect(
 ): Promise<MediaFetchResult> {
   const fetchImpl = opts?.fetchImpl ?? fetch;
   const requestId = opts?.requestId;
+  // `||` (not `??`) is intentional: an empty-string accessToken is treated as absent so it falls through to the config default.
   const token = accessToken || config.whatsappAccessToken || undefined;
 
   if (!token) {
