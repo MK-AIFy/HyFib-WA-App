@@ -23,7 +23,7 @@ import {
 } from "@hyfib/api-gateway";
 import { processForwardedWebhook } from "@hyfib/webhook-ingestor";
 import { createDurableWebhookBus } from "./webhook-outbox-bus.js";
-import { metaDispatch } from "@hyfib/meta-adapter";
+import { fetchMediaDirect, metaDispatch } from "@hyfib/meta-adapter";
 import { registerWorkerConsumers, type WorkerMetaClient } from "@hyfib/notification-worker";
 import { getReportsOverview } from "@hyfib/reporting-service";
 import { getUsage } from "@hyfib/billing-usage-service";
@@ -150,6 +150,17 @@ async function main(): Promise<void> {
     },
     async markRead(phoneNumberId, messageId, _tenantId, accessToken) {
       await metaDispatch("/internal/v1/whatsapp/mark-read", { phoneNumberId, messageId, accessToken }, randomUUID());
+    },
+    async fetchMedia(mediaId, _tenantId, accessToken) {
+      const result = await fetchMediaDirect(mediaId, accessToken, { requestId: randomUUID() });
+      if (!result.media) {
+        throw new Error(`meta_adapter_media_fetch_failed_${result.status}${result.error ? `_${result.error}` : ""}`);
+      }
+      return {
+        buffer: result.media.buffer,
+        mimeType: result.media.mimeType,
+        fileSizeBytes: result.media.fileSizeBytes
+      };
     }
   };
   registerWorkerConsumers({ eventBus, metaClient: workerMetaClient });

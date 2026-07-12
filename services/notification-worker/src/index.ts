@@ -19,6 +19,7 @@ import {
   contactRepository,
   conversationRepository,
   healthCheck,
+  mediaRepository,
   messageRepository,
   outboxRepository,
   resolveChannelByPhoneNumberId,
@@ -43,6 +44,7 @@ import {
   type CampaignDispatchRequest,
   type CampaignRunRequest,
   type EventEnvelope,
+  type MediaFetchRequest,
   type Message,
   type MessageCategory,
   type WhatsAppOutboundRequest
@@ -57,6 +59,7 @@ import {
 import { resolveVariables } from "./personalize.js";
 import { matchAutoReply } from "./autoreply.js";
 import { evaluateAutomationRules } from "./automation.js";
+import { processMediaFetch } from "./media.js";
 
 const config = loadConfig();
 const logger = new Logger("notification-worker", config.logLevel as "debug" | "info" | "warn" | "error");
@@ -117,6 +120,12 @@ export interface WorkerMetaClient {
     tenantId: string,
     accessToken?: string
   ): Promise<void>;
+  /** Downloads inbound media bytes for a Graph media id. Throws on any non-success outcome. */
+  fetchMedia(
+    mediaId: string,
+    tenantId: string,
+    accessToken?: string
+  ): Promise<{ buffer: Buffer; mimeType?: string; fileSizeBytes?: number }>;
 }
 
 const defaultMetaClient: WorkerMetaClient = {
@@ -154,6 +163,37 @@ const defaultMetaClient: WorkerMetaClient = {
     } catch (error) {
       logger.warn("mark_read_failed", { error: error instanceof Error ? error.message : String(error) });
     }
+  },
+  async fetchMedia(mediaId, tenantId, accessToken) {
+    const url = new URL(`${config.metaAdapterUrl}/internal/v1/whatsapp/media/${encodeURIComponent(mediaId)}/download`);
+    if (accessToken) {
+      url.searchParams.set("accessToken", accessToken);
+    }
+    const response = await fetch(url, {
+      headers: {
+        "x-tenant-id": tenantId,
+        "x-request-id": randomUUID(),
+        "x-internal-secret": config.internalServiceSecret
+      },
+      signal: AbortSignal.timeout(60_000)
+    });
+    if (!response.ok) {
+      let detail = "";
+      try {
+        const body = (await response.json()) as { error?: string };
+        detail = body.error ? `_${body.error}` : "";
+      } catch {
+        // Non-JSON error body; fall back to the bare status.
+      }
+      throw new Error(`meta_adapter_media_fetch_failed_${response.status}${detail}`);
+    }
+    const buffer = Buffer.from(await response.arrayBuffer());
+    const contentLength = response.headers.get("content-length");
+    return {
+      buffer,
+      mimeType: response.headers.get("content-type") ?? undefined,
+      fileSizeBytes: contentLength ? Number(contentLength) : buffer.length
+    };
   }
 };
 
@@ -570,7 +610,7 @@ async function handleInbound(event: EventEnvelope): Promise<void> {
       payload[field] = inbound[field];
     }
   }
-  await messageRepository.create(channel.tenantId, {
+  const createdMessage = await messageRepository.create(channel.tenantId, {
     conversationId: conversation.id,
     direction: "inbound",
     status: "delivered",
@@ -578,6 +618,37 @@ async function handleInbound(event: EventEnvelope): Promise<void> {
     payload
   });
   logger.info("inbound_recorded", { tenantId: channel.tenantId, messageId: inbound.messageId, type: inbound.type });
+
+  // Inbound media (image/video/audio/document/sticker): enqueue an async fetch of the
+  // bytes via the outbox. Idempotent by media id (see media.ts's upsertPending
+  // short-circuit), so redelivery of this outbox row or a future replay is safe.
+  const media = inbound.media as
+    | { id?: string; mimeType?: string; sha256?: string; filename?: string }
+    | undefined;
+  const mediaId = media?.id;
+  if (mediaId) {
+    await withTenant(channel.tenantId, async (client) => {
+      await outboxRepository.enqueue(client, channel.tenantId, {
+        topic: EventTopics.MediaFetchRequested,
+        payload: {
+          tenantId: channel.tenantId,
+          channelId: channel.channelId,
+          phoneNumberId: inbound.phoneNumberId,
+          conversationId: conversation.id,
+          messageId: createdMessage.id,
+          mediaId,
+          mimeType: media?.mimeType,
+          filename: media?.filename,
+          sha256: media?.sha256
+        } satisfies MediaFetchRequest
+      });
+    });
+    logger.info("media_fetch_enqueued", {
+      tenantId: channel.tenantId,
+      conversationId: conversation.id,
+      mediaId
+    });
+  }
 
   // Send a read receipt (best-effort) using the resolved channel's credentials.
   const sendChannel = await resolveSendChannel(channel.tenantId, channel.channelId);
@@ -888,6 +959,31 @@ async function handleAutomationTemplate(event: EventEnvelope): Promise<void> {
   });
 }
 
+/**
+ * Downloads and stores an inbound media asset (see media.ts for the flow).
+ * No dispatchId/claim needed here — processMediaFetch is idempotent by media
+ * id, and failures rethrow so the outbox's backoff/dead-letter is the retry
+ * engine.
+ */
+async function handleMediaFetch(event: EventEnvelope): Promise<void> {
+  incCounter("events_consumed_total", "Events consumed from the bus.", { topic: EventTopics.MediaFetchRequested });
+  const req = event.payload as MediaFetchRequest;
+  if (!req.tenantId || !req.channelId || !req.conversationId || !req.messageId || !req.mediaId) {
+    logger.warn("media_fetch_invalid_request", { eventId: event.id });
+    return;
+  }
+  await processMediaFetch(req, {
+    media: mediaRepository,
+    messages: {
+      mergePayloadById: (tenantId, messageId, patch) => messageRepository.mergePayloadById(tenantId, messageId, patch)
+    },
+    resolveChannel: resolveSendChannel,
+    fetchMedia: (mediaId, tenantId, accessToken) => metaClient.fetchMedia(mediaId, tenantId, accessToken),
+    publish: (topic, payload, tenantId) => eventBus.publish(topic, payload, tenantId),
+    logger
+  });
+}
+
 export interface WorkerDeps {
   /** Shared in-process event bus (app-server). Falls back to the worker's own. */
   eventBus?: EventBus;
@@ -930,6 +1026,7 @@ export function registerWorkerConsumers(deps: WorkerDeps = {}): void {
   eventBus.subscribe(EventTopics.WhatsAppStatusUpdated, "status-updates", handleStatus);
   eventBus.subscribe(EventTopics.WhatsAppOutboundRequested, "outbound-messages", handleOutbound);
   eventBus.subscribe(EventTopics.AutomationTemplateRequested, "automation-templates", handleAutomationTemplate);
+  eventBus.subscribe(EventTopics.MediaFetchRequested, "media-fetch", handleMediaFetch);
 }
 
 const server = createServer(async (req, res) => {
