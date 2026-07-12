@@ -94,6 +94,7 @@ import { SseHub } from "./sse-hub.js";
 import { parseCsv, serializeContactsCsv, extractMultipartFile } from "./csv.js";
 import { resolveOrgTenant } from "./single-org.js";
 import { runOutboxRelayOnce } from "./outbox-relay.js";
+import { classifyRoute, API_RATE_LIMITS } from "./rate-limit.js";
 import {
   SESSION_COOKIE,
   parseCookies,
@@ -1458,16 +1459,23 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   }
 
   if (path === "/auth/logout" && method === "POST") {
-    // Bearer takes precedence, matching resolveAuth; either may be absent,
-    // and the cookie must be cleared unconditionally regardless of whether a
-    // matching session was found (stale/expired/already-revoked cookies must
-    // still be wiped from the browser).
+    // Task 19 Part 2: a plain `bearerToken ?? cookieToken` (the previous
+    // behavior) revokes only the FIRST token present — a stale/wrong bearer
+    // (e.g. leftover localStorage value from before Task 18's cookie
+    // migration) alongside a valid, live cookie session would leave that
+    // cookie session un-revoked while still reporting success. deleteByToken
+    // is a no-op DELETE when the hash matches no row, so attempting it for
+    // both distinct tokens (when present) is harmless and revokes whichever
+    // one(s) actually resolve to a live session. The cookie is always
+    // cleared regardless of what (if anything) was found server-side.
     const authHeader = req.headers["authorization"];
     const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : undefined;
     const cookieToken = parseCookies(cookieHeaderOf(req))[SESSION_COOKIE];
-    const rawToken = bearerToken ?? cookieToken;
-    if (rawToken) {
-      await sessionRepository.deleteByToken(tokenHash(rawToken));
+    if (bearerToken) {
+      await sessionRepository.deleteByToken(tokenHash(bearerToken));
+    }
+    if (cookieToken && cookieToken !== bearerToken) {
+      await sessionRepository.deleteByToken(tokenHash(cookieToken));
     }
     clearSessionCookie(res, req);
     sendJson(res, 200, { status: "logged_out" });
@@ -1475,15 +1483,27 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   }
 
   if (path === "/auth/me" && method === "GET") {
+    // Task 19 Part 2: bearer takes precedence (matches resolveAuth), but a
+    // stale/wrong bearer must not shadow a live cookie session — the
+    // previous `bearerToken ?? cookieToken` never looked at the cookie once
+    // *any* bearer header was present, so a leftover/invalid localStorage
+    // token (e.g. from before Task 18's cookie migration) 401'd callers who
+    // had a perfectly valid cookie session. Fall through to the cookie only
+    // when the bearer is present but doesn't resolve to a live session.
     const authHeader = req.headers["authorization"];
     const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : undefined;
     const cookieToken = parseCookies(cookieHeaderOf(req))[SESSION_COOKIE];
-    const rawToken = bearerToken ?? cookieToken;
+
+    let rawToken = bearerToken;
+    let session = rawToken ? await sessionRepository.findByToken(tokenHash(rawToken)) : undefined;
+    if (!session && cookieToken && cookieToken !== bearerToken) {
+      rawToken = cookieToken;
+      session = await sessionRepository.findByToken(tokenHash(rawToken));
+    }
     if (!rawToken) {
       sendJson(res, 401, { error: "Not authenticated" });
       return;
     }
-    const session = await sessionRepository.findByToken(tokenHash(rawToken));
     if (!session) {
       sendJson(res, 401, { error: "Session expired or invalid" });
       return;
@@ -1496,8 +1516,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     const tenant = await tenantRepository.getById(session.tenantId);
     // Silent upgrade: an existing localStorage/Bearer session gets an
     // HttpOnly cookie issued the first time it hits /auth/me without one
-    // already present. Cookie-authenticated calls (bearerToken absent) never
-    // re-set — nothing changed for them.
+    // already present. Cookie-authenticated calls (bearerToken absent, or a
+    // stale bearer that fell through to a cookie above) never re-set —
+    // `!cookieToken` is false in both those cases, so nothing changed for
+    // them.
     if (bearerToken && !cookieToken) {
       setSessionCookie(res, bearerToken, req);
     }
@@ -1526,6 +1548,32 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   if (auth.roles.length === 0) {
     sendJson(res, 403, { error: "no_roles_assigned" });
     return;
+  }
+
+  // ─── General API rate limiting ───────────────────────────────────────────
+  // Placed after auth resolves (subject is known) and before any route
+  // handler runs, so every /api/v1/* route below is covered. /auth/login,
+  // /auth/register, /auth/logout, and /auth/me are handled earlier in the
+  // auth-routes section above and all return before resolveAuth() runs, so
+  // this gate structurally never sees them — login/register already have
+  // their own 5/min limiter (isAuthRateLimited), and logout/me are cheap,
+  // session-guarded reads/writes that don't warrant a bolted-on IP-keyed
+  // check of their own (see classifyRoute's doc comment in rate-limit.ts,
+  // rule 5, for the full rationale — Task 19 Part 2).
+  const rlClass = classifyRoute(method, path);
+  if (rlClass !== "exempt") {
+    const subject = asActorUuid(auth.subject) ?? getClientIp(req);
+    const { allowed, waitMs } = await checkRateLimit(
+      getRedisClient(config),
+      `api:${rlClass}:${subject}`,
+      API_RATE_LIMITS[rlClass]
+    );
+    if (!allowed) {
+      incCounter("rate_limited_total", "Requests rejected by the general API rate limiter.", { class: rlClass });
+      res.setHeader("Retry-After", String(Math.ceil(waitMs / 1000)));
+      sendJson(res, 429, { error: "rate_limited", retryAfterSeconds: Math.ceil(waitMs / 1000) });
+      return;
+    }
   }
 
   // ─── Tenant-scoped routes ─────────────────────────────────────────────────
