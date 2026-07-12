@@ -2848,6 +2848,35 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
 
+  // Global message search: substring match over payload->>'text' via the
+  // pg_trgm expression index from migration 020. Exact path — must match
+  // the "/api/v1/messages/search" string classifyRoute lists as expensive
+  // (rate-limit.ts EXPENSIVE_EXACT) so this route gets the tighter 10/min
+  // budget instead of the general "read" class.
+  if (path === "/api/v1/messages/search" && method === "GET") {
+    const query = parseQuery(req.url);
+    const rawQ = (query.get("q") ?? "").trim();
+    if (rawQ.length < 2) {
+      sendJson(res, 400, { error: "q must be at least 2 characters" });
+      return;
+    }
+    const q = rawQ.slice(0, 200);
+    const conversationId = query.get("conversationId") ?? undefined;
+    if (conversationId && !UUID.test(conversationId)) {
+      sendJson(res, 400, { error: "conversationId must be a valid id" });
+      return;
+    }
+    const page = parseListQuery(query);
+    const { items, total } = await messageRepository.search(tenantId, {
+      q,
+      conversationId,
+      limit: page.limit,
+      offset: page.offset
+    });
+    sendJson(res, 200, { items, total, limit: page.limit, offset: page.offset });
+    return;
+  }
+
   if (path.startsWith("/api/v1/conversations/") && path.endsWith("/messages")) {
     const conversationId = extractPathSegment(path, "/api/v1/conversations/");
     if (!conversationId || !UUID.test(conversationId)) {

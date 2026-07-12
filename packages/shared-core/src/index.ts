@@ -282,6 +282,17 @@ export interface Message {
   createdAt: string;
 }
 
+export interface MessageSearchResult {
+  id: string;
+  conversationId: string;
+  direction: "inbound" | "outbound";
+  status: Message["status"];
+  createdAt: string;
+  text: string;
+  contactName?: string;
+  contactPhone?: string;
+}
+
 export interface Order {
   id: string;
   tenantId: string;

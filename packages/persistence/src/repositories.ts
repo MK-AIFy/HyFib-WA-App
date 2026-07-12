@@ -16,6 +16,7 @@ import type {
   FrequencyCapConfig,
   Message,
   MessageCategory,
+  MessageSearchResult,
   Order,
   QuietHoursConfig,
   Role,
@@ -1654,6 +1655,30 @@ function mapMessage(row: MessageRow): Message {
   };
 }
 
+interface MessageSearchRow {
+  id: string;
+  conversation_id: string;
+  direction: string;
+  status: string;
+  created_at: Date;
+  text: string | null;
+  contact_name: string | null;
+  contact_phone: string | null;
+}
+
+function mapMessageSearchResult(row: MessageSearchRow): MessageSearchResult {
+  return {
+    id: row.id,
+    conversationId: row.conversation_id,
+    direction: row.direction as MessageSearchResult["direction"],
+    status: row.status as MessageSearchResult["status"],
+    createdAt: row.created_at.toISOString(),
+    text: row.text ?? "",
+    contactName: row.contact_name ?? undefined,
+    contactPhone: row.contact_phone ?? undefined
+  };
+}
+
 export const messageRepository = {
   async create(
     tenantId: string,
@@ -1806,6 +1831,55 @@ export const messageRepository = {
         [contactIds, sinceISO]
       );
       return new Map(result.rows.map((r) => [r.contact_id, Number(r.count)]));
+    });
+  },
+  /**
+   * Global substring search across a tenant's message text (newest first),
+   * optionally scoped to a single conversation. Backed by the pg_trgm GIN
+   * expression index from migration 020_message_search.sql — the ILIKE
+   * expression below (`coalesce(m.payload->>'text','')`) must stay
+   * identical to the indexed expression (`coalesce(payload->>'text','')`;
+   * table aliases don't affect expression-index matching) or Postgres will
+   * silently fall back to a sequential scan.
+   */
+  async search(
+    tenantId: string,
+    options: { q: string; conversationId?: string; limit?: number; offset?: number }
+  ): Promise<{ items: MessageSearchResult[]; total: number }> {
+    const limit = options.limit ?? 25;
+    const offset = options.offset ?? 0;
+    return withTenant(tenantId, async (client) => {
+      const conditions: string[] = [`coalesce(m.payload->>'text','') ILIKE $1`];
+      const params: unknown[] = [`%${escapeLike(options.q)}%`];
+      if (options.conversationId) {
+        params.push(options.conversationId);
+        conditions.push(`m.conversation_id = $${params.length}`);
+      }
+      const where = `WHERE ${conditions.join(" AND ")}`;
+      // Every condition above references only messages-table columns
+      // (m.payload, m.conversation_id) — neither the conversations nor the
+      // contacts join contributes to the filter, so COUNT can skip both.
+      // messages carries tenant_id directly and this connection runs under
+      // FORCE ROW LEVEL SECURITY (see withTenant), so the plain filter is
+      // already tenant-scoped without a join.
+      const totalResult = await client.query<{ total: string }>(
+        `SELECT COUNT(*)::text AS total FROM messages m ${where}`,
+        params
+      );
+      const result = await client.query<MessageSearchRow>(
+        `SELECT m.id, m.conversation_id, m.direction, m.status, m.created_at,
+                m.payload->>'text' AS text,
+                NULLIF(TRIM(CONCAT_WS(' ', co.first_name, co.last_name)), '') AS contact_name,
+                co.phone_e164 AS contact_phone
+         FROM messages m
+         JOIN conversations c ON c.id = m.conversation_id
+         LEFT JOIN contacts co ON co.id = c.contact_id
+         ${where}
+         ORDER BY m.created_at DESC
+         LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+        [...params, limit, offset]
+      );
+      return { items: result.rows.map(mapMessageSearchResult), total: Number(totalResult.rows[0]?.total ?? "0") };
     });
   }
 };
