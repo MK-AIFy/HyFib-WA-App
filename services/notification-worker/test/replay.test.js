@@ -129,6 +129,82 @@ test("handleOutbound: send failure releases the dispatch claim and rethrows", as
   }
 });
 
+test("handleOutbound: pre-send failure (channel resolution) releases the dispatch claim and rethrows", async () => {
+  const bus = createFakeBus();
+  const redis = createFakeRedis();
+  const metaClient = createFakeMetaClient(async () => {
+    throw new Error("must not be called — failure happens before send");
+  });
+
+  const originalGetCredentials = channelRepository.getCredentials;
+  channelRepository.getCredentials = async () => {
+    throw new Error("channel_lookup_failed");
+  };
+
+  try {
+    registerWorkerConsumers({ eventBus: bus, redis, metaClient });
+    const handleOutbound = bus.handlers.get(EventTopics.WhatsAppOutboundRequested);
+
+    await assert.rejects(
+      () => handleOutbound(outboundEvent("env-1", "dispatch-presend-fail")),
+      /channel_lookup_failed/
+    );
+    assert.equal(
+      redis.store.has("outb:dispatch-presend-fail"),
+      false,
+      "claim key must be released on a pre-send failure, not just an adapter-call failure"
+    );
+  } finally {
+    channelRepository.getCredentials = originalGetCredentials;
+  }
+});
+
+test("handleOutbound: retry after a pre-send failure re-claims and sends (drop bug fixed)", async () => {
+  const bus = createFakeBus();
+  const redis = createFakeRedis();
+  let sendCalls = 0;
+  let createCalls = 0;
+  const metaClient = createFakeMetaClient(async () => {
+    sendCalls++;
+    return { messageId: `wamid.${sendCalls}`, accepted: true };
+  });
+
+  const originalGetCredentials = channelRepository.getCredentials;
+  const originalCreate = messageRepository.create;
+  let failChannelLookup = true;
+  channelRepository.getCredentials = async () => {
+    if (failChannelLookup) {
+      throw new Error("channel_lookup_failed");
+    }
+    return { id: "c-1", wabaId: "waba-1", phoneNumberId: "PN-1", accessToken: "tok" };
+  };
+  messageRepository.create = async () => {
+    createCalls++;
+    return { id: "m-1" };
+  };
+
+  try {
+    registerWorkerConsumers({ eventBus: bus, redis, metaClient });
+    const handleOutbound = bus.handlers.get(EventTopics.WhatsAppOutboundRequested);
+
+    // First attempt: pre-send failure releases the claim instead of leaking it.
+    await assert.rejects(() => handleOutbound(outboundEvent("env-1", "dispatch-retry")));
+    assert.equal(sendCalls, 0, "the pre-send failure must occur before any send attempt");
+    assert.equal(redis.store.has("outb:dispatch-retry"), false, "claim released after the pre-send failure");
+
+    // Retry: same dispatchId, new envelope id (as a re-published outbox row would carry),
+    // channel lookup now succeeds — this must NOT be skipped as an "already claimed" replay.
+    failChannelLookup = false;
+    await handleOutbound(outboundEvent("env-2", "dispatch-retry"));
+    assert.equal(sendCalls, 1, "retry with the same dispatchId must actually send — proves the drop bug is gone");
+    assert.equal(createCalls, 1, "retry must persist the outbound message");
+    assert.equal(redis.store.has("outb:dispatch-retry"), true, "the successful send re-establishes the claim");
+  } finally {
+    channelRepository.getCredentials = originalGetCredentials;
+    messageRepository.create = originalCreate;
+  }
+});
+
 test("handleOutbound: no dispatchId sends without touching the redis guard", async () => {
   const bus = createFakeBus();
   const redis = createFakeRedis();

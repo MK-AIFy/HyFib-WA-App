@@ -62,7 +62,7 @@ const config = loadConfig();
 const logger = new Logger("notification-worker", config.logLevel as "debug" | "info" | "warn" | "error");
 let eventBus = createEventBus(config);
 let redis = getRedisClient(config);
-/** Test-only override for the phone-number-id → tenant/channel lookup (defaults to the DB-backed resolver). */
+/** Phone-number-id → tenant/channel lookup (defaults to the DB-backed resolver; overridable via WorkerDeps). */
 let resolveChannel: typeof resolveChannelByPhoneNumberId = resolveChannelByPhoneNumberId;
 
 interface InboundEvent {
@@ -462,6 +462,8 @@ async function handleOutbound(event: EventEnvelope): Promise<void> {
   if (claimKey) {
     const claimed = await claimRedisKey(redis, claimKey, DISPATCH_CLAIM_TTL_SECONDS);
     if (!claimed) {
+      // Skip branch stays outside the try below: a skip must not release another
+      // in-flight attempt's claim.
       logger.info("outbound_replay_skipped", {
         conversationId: command.conversationId,
         dispatchId: command.dispatchId
@@ -470,16 +472,27 @@ async function handleOutbound(event: EventEnvelope): Promise<void> {
     }
   }
 
-  const channel = await resolveSendChannel(command.tenantId, command.channelId);
-
-  const call = buildOutboundAdapterCall(command, channel);
+  // Everything from the successful claim through a completed send is guarded: any
+  // exception here (channel resolution, payload building, or the adapter call itself)
+  // releases the claim so a retry with the same dispatchId can resend instead of being
+  // silently dropped as an "already claimed" replay. On success the claim is left in
+  // place — it's the 24h dedupe record.
   let result: { messageId?: string; accepted: boolean };
+  let persistedPayload: Record<string, unknown>;
   try {
+    const channel = await resolveSendChannel(command.tenantId, command.channelId);
+    const call = buildOutboundAdapterCall(command, channel);
+    persistedPayload = call.persistedPayload;
     result = await callMetaAdapter(call.endpoint, command.tenantId, call.payload);
   } catch (error) {
     if (claimKey) {
       // Release the claim so redelivery of this dispatchId can retry the send.
-      await releaseRedisKey(redis, claimKey).catch(() => undefined);
+      await releaseRedisKey(redis, claimKey).catch((releaseError) =>
+        logger.warn("dispatch_claim_release_failed", {
+          key: claimKey,
+          error: releaseError instanceof Error ? releaseError.message : String(releaseError)
+        })
+      );
     }
     logger.error("outbound_adapter_failed", {
       conversationId: command.conversationId,
@@ -494,7 +507,7 @@ async function handleOutbound(event: EventEnvelope): Promise<void> {
     status: result.accepted ? "sent" : "queued",
     category: "service" as MessageCategory,
     externalMessageId: result.messageId,
-    payload: call.persistedPayload
+    payload: persistedPayload
   });
   incCounter("whatsapp_messages_sent_total", "Outbound WhatsApp template sends.", {
     result: result.accepted ? "accepted" : "queued"
@@ -787,45 +800,57 @@ async function handleAutomationTemplate(event: EventEnvelope): Promise<void> {
   const claimKey = `atreq:${req.dispatchId ?? event.id}`;
   const claimed = await claimRedisKey(redis, claimKey, 3600);
   if (!claimed) {
+    // Skip branch stays outside the try below: a skip must not release another
+    // in-flight attempt's claim.
     logger.info("automation_template_duplicate_skipped", { eventId: event.id, dispatchId: req.dispatchId });
     return;
   }
 
-  // Resolve contact and enforce consent + policy before sending
-  const contact = await contactRepository.findOrCreateByPhone(req.tenantId, req.contactPhoneE164);
-  if (contact.optedOut) {
-    logger.warn("automation_template_opted_out", { tenantId: req.tenantId, contactId: contact.id });
-    return;
-  }
-  const hasConsent = await consentRepository.hasActiveConsent(req.tenantId, contact.id);
-  if (!hasConsent) {
-    logger.warn("automation_template_no_consent", { tenantId: req.tenantId, contactId: contact.id });
-    return;
-  }
-  const settings = await whatsappSettingsRepository.getByTenant(req.tenantId);
-  const policyCheck = evaluateOutboundPolicy({
-    hasActiveConsent: true,
-    isInside24hWindow: false,
-    template: { category: (req as any).templateCategory ?? "marketing", status: "approved" } as import("@hyfib/shared-core").Template,
-    requestedCategory: ((req as any).templateCategory ?? "marketing") as import("@hyfib/shared-core").MessageCategory,
-    isOptedOut: false,
-    currentHourLocal: getCurrentHourInTz(contact.timezone ?? "UTC"),
-    quietHours: (settings as unknown as { quietHours?: import("@hyfib/shared-core").QuietHoursConfig })?.quietHours,
-    frequencyCap: undefined
-  });
-  if (!policyCheck.allowed) {
-    logger.warn("automation_template_policy_blocked", { tenantId: req.tenantId, contactId: contact.id, reason: policyCheck.reason });
-    return;
-  }
-
-  const channelId = req.channelId ?? (await channelRepository.firstActive(req.tenantId))?.id;
-  if (!channelId) {
-    logger.warn("automation_template_no_channel", { tenantId: req.tenantId });
-    return;
-  }
-  const channel = await resolveSendChannel(req.tenantId, channelId);
+  // Everything from the successful claim through a completed send is guarded: any
+  // exception here (contact lookup, consent/policy checks, channel resolution, or the
+  // adapter call itself) releases the claim so a retry with the same dispatchId can
+  // resend instead of being silently dropped as an "already claimed" replay. Business
+  // declines (opted-out, no consent, policy-blocked, no channel) `return` rather than
+  // throw, so they fall through normally and the claim is kept: a replay would decline
+  // the same way deterministically, so keeping it is harmless and simpler than releasing.
   let result: { messageId?: string; accepted: boolean };
+  let contact: Awaited<ReturnType<typeof contactRepository.findOrCreateByPhone>>;
+  let channelId: string;
   try {
+    // Resolve contact and enforce consent + policy before sending
+    contact = await contactRepository.findOrCreateByPhone(req.tenantId, req.contactPhoneE164);
+    if (contact.optedOut) {
+      logger.warn("automation_template_opted_out", { tenantId: req.tenantId, contactId: contact.id });
+      return;
+    }
+    const hasConsent = await consentRepository.hasActiveConsent(req.tenantId, contact.id);
+    if (!hasConsent) {
+      logger.warn("automation_template_no_consent", { tenantId: req.tenantId, contactId: contact.id });
+      return;
+    }
+    const settings = await whatsappSettingsRepository.getByTenant(req.tenantId);
+    const policyCheck = evaluateOutboundPolicy({
+      hasActiveConsent: true,
+      isInside24hWindow: false,
+      template: { category: (req as any).templateCategory ?? "marketing", status: "approved" } as import("@hyfib/shared-core").Template,
+      requestedCategory: ((req as any).templateCategory ?? "marketing") as import("@hyfib/shared-core").MessageCategory,
+      isOptedOut: false,
+      currentHourLocal: getCurrentHourInTz(contact.timezone ?? "UTC"),
+      quietHours: (settings as unknown as { quietHours?: import("@hyfib/shared-core").QuietHoursConfig })?.quietHours,
+      frequencyCap: undefined
+    });
+    if (!policyCheck.allowed) {
+      logger.warn("automation_template_policy_blocked", { tenantId: req.tenantId, contactId: contact.id, reason: policyCheck.reason });
+      return;
+    }
+
+    const resolvedChannelId = req.channelId ?? (await channelRepository.firstActive(req.tenantId))?.id;
+    if (!resolvedChannelId) {
+      logger.warn("automation_template_no_channel", { tenantId: req.tenantId });
+      return;
+    }
+    channelId = resolvedChannelId;
+    const channel = await resolveSendChannel(req.tenantId, channelId);
     result = await callMetaAdapter("/internal/v1/whatsapp/send-template", req.tenantId, {
       phoneNumberId: channel.phoneNumberId,
       to: req.contactPhoneE164,
@@ -836,7 +861,12 @@ async function handleAutomationTemplate(event: EventEnvelope): Promise<void> {
     });
   } catch (error) {
     // Release the claim so redelivery of this dispatch can retry the send.
-    await releaseRedisKey(redis, claimKey).catch(() => undefined);
+    await releaseRedisKey(redis, claimKey).catch((releaseError) =>
+      logger.warn("dispatch_claim_release_failed", {
+        key: claimKey,
+        error: releaseError instanceof Error ? releaseError.message : String(releaseError)
+      })
+    );
     logger.error("automation_template_send_failed", {
       tenantId: req.tenantId,
       error: error instanceof Error ? error.message : String(error)
@@ -863,9 +893,9 @@ export interface WorkerDeps {
   eventBus?: EventBus;
   /** Direct in-process meta transport (app-server). Falls back to HTTP fetch. */
   metaClient?: WorkerMetaClient;
-  /** Test-only override for the Redis client used by replay-claim guards. Falls back to the shared client. */
+  /** Redis client used by replay-claim guards (app-server may share one client). Falls back to the shared client. */
   redis?: ReturnType<typeof getRedisClient>;
-  /** Test-only override for the phone-number-id → tenant/channel lookup. Falls back to the DB-backed resolver. */
+  /** Phone-number-id → tenant/channel lookup. Falls back to the DB-backed resolver. */
   resolveChannel?: typeof resolveChannelByPhoneNumberId;
 }
 

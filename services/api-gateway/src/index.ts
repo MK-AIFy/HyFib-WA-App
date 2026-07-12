@@ -558,7 +558,8 @@ async function runAutomation(
                 channelId,
                 contactPhoneE164: contact.phoneE164,
                 templateName: action.templateName,
-                templateLanguage: action.templateLanguage
+                templateLanguage: action.templateLanguage,
+                dispatchId: randomUUID()
               }
             });
           });
