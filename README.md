@@ -17,7 +17,6 @@ Production-grade on-prem multi-tenant WhatsApp Business Platform for marketing, 
 
 Implemented by the `app-server` gateway module (external contract unchanged):
 
-- `/api/v1/tenants`
 - `/api/v1/users`
 - `/api/v1/channels/whatsapp`
 - `/api/v1/templates`
@@ -38,6 +37,12 @@ Implemented by the `app-server` gateway module (external contract unchanged):
 Campaign dispatch is consent-gated: a contact must exist and have active,
 un-revoked consent (and not be opted out). Inbound **STOP** messages opt the
 contact out automatically; **START** re-subscribes.
+
+> This deployment is single-organization: self-registration (`/auth/register`)
+> and the tenants console (`/api/v1/tenants`) are retired (`410`/`404`
+> respectively). The first admin comes from `BOOTSTRAP_ADMIN_EMAIL`/
+> `BOOTSTRAP_ADMIN_PASSWORD`; see
+> [`docs/runbooks/single-org-deployment.md`](docs/runbooks/single-org-deployment.md).
 
 Web entrypoint:
 
@@ -144,6 +149,7 @@ curl http://localhost:18080/health      # app-server direct (DB-backed)
 
 - [Architecture](docs/architecture.md)
 - [Security and Compliance Controls](docs/security/compliance-controls.md)
+- [Single-Organization Deployment Runbook](docs/runbooks/single-org-deployment.md)
 - [WhatsApp Marketing Number Runbook](docs/runbooks/whatsapp-marketing-number-onboarding.md)
 - [Local Webhook Tunnel Runbook](docs/runbooks/local-webhook-tunnel.md)
 - [Implementation Roadmap](docs/implementation-roadmap.md)

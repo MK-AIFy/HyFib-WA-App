@@ -95,3 +95,19 @@ Used as the Phase-9 cutover diff (run each against the live app-server).
 | `index.ts:3059` | `aiIntelligenceUrl` | `POST/GET /internal/v1/ai/*` | ai-intelligence | 6 |
 
 **Note:** the notification-worker consumes events off the bus and calls `metaAdapterUrl` to send; that becomes a direct `metaClient` injection in Phase 5. After Phase 9 all `/internal/v1/*` paths must 404 from the edge.
+
+## 2026-07 single-org changes
+
+This deployment was frozen to serve a single organization. The following
+routes captured in the baseline above were retired after this document was
+written; they are no longer part of the live external contract:
+
+- `POST /auth/register` → now returns `410 registration_disabled` (self-registration
+  disabled; the org's first admin comes from `BOOTSTRAP_ADMIN_EMAIL`/`BOOTSTRAP_ADMIN_PASSWORD`,
+  subsequent users via `POST /api/v1/users`).
+- `/api/v1/tenants` (GET list / POST create), `PATCH /api/v1/tenants/{id}`,
+  `GET /api/v1/tenants/{id}/users` → removed; all four now fall through to the
+  edge's `404 route_not_found`.
+
+See `docs/runbooks/single-org-deployment.md` for how org resolution and admin
+bootstrap work now.

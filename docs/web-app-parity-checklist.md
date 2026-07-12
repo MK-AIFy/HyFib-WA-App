@@ -8,7 +8,7 @@ should only happen once every row below is checked and repo-wide
 | Area | Legacy capability | New app | Status |
 |------|-------------------|---------|--------|
 | Auth | Login (`/auth/login`) | `LoginPage` | ✅ |
-| Auth | Register org+admin (`/auth/register`) | `RegisterPage` | ✅ |
+| Auth | Register org+admin (`/auth/register`) | `RegisterPage` | 🚫 Retired 2026-07 — self-registration disabled (single-org); route now 410, page deleted. See [`docs/runbooks/single-org-deployment.md`](runbooks/single-org-deployment.md). |
 | Auth | Session bootstrap (`/auth/me`), logout | `AuthProvider` | ✅ |
 | Onboarding | Connect WhatsApp channel | `OnboardingPage` | ✅ |
 | Shell | Role-filtered sidebar, SSE Live/Offline dot | `AppLayout` + `useSse` | ✅ |
@@ -33,7 +33,7 @@ should only happen once every row below is checked and repo-wide
 | Settings | Workspace + channel + webhook | `SettingsPage` | ✅ |
 | Users | List, invite, suspend/reactivate | `UsersPage` | ✅ |
 | Teams | List | `TeamsPage` | ✅ |
-| Tenants | List (platform_owner) | `TenantsPage` | ✅ |
+| Tenants | List (platform_owner) | `TenantsPage` | 🚫 Retired 2026-07 — tenants console removed (single-org); routes now 404, page deleted. See [`docs/runbooks/single-org-deployment.md`](runbooks/single-org-deployment.md). |
 
 ## Accessibility upgrades over legacy (which had none)
 
