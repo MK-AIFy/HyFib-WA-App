@@ -94,10 +94,6 @@ import { resolveOrgTenant } from "./single-org.js";
 
 // ─── Request body interfaces ───────────────────────────────────────────────────
 
-interface CreateTenantRequest {
-  name: string;
-}
-
 interface CreateUserRequest {
   email: string;
   displayName: string;
@@ -1392,77 +1388,6 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
 
-  // ─── Tenants ──────────────────────────────────────────────────────────────
-  if (path === "/api/v1/tenants") {
-    if (method === "GET") {
-      if (!hasAnyRole(auth, ["platform_owner"])) {
-        sendJson(res, 403, { error: "Only platform_owner can list tenants" });
-        return;
-      }
-      sendJson(res, 200, { items: await tenantRepository.list() });
-      return;
-    }
-    if (method === "POST") {
-      if (!hasAnyRole(auth, ["platform_owner"])) {
-        sendJson(res, 403, { error: "Only platform_owner can create tenants" });
-        return;
-      }
-      const payload = await readJsonBody<CreateTenantRequest>(req);
-      if (!payload.name?.trim()) {
-        sendJson(res, 400, { error: "name is required" });
-        return;
-      }
-      const tenant = await tenantRepository.create(payload.name.trim());
-      await audit(tenant.id, auth, {
-        action: "tenant.created",
-        resourceType: "Tenant",
-        resourceId: tenant.id,
-        payload: { name: tenant.name }
-      });
-      sendJson(res, 201, { ...tenant });
-      return;
-    }
-    sendJson(res, 405, { error: "Method not allowed" });
-    return;
-  }
-
-  // PATCH /api/v1/tenants/:id — platform_owner updates limits / status / plan
-  if (path.startsWith("/api/v1/tenants/") && method === "PATCH") {
-    if (!hasAnyRole(auth, ["platform_owner"])) {
-      sendJson(res, 403, { error: "Only platform_owner can update tenant settings" });
-      return;
-    }
-    const tid = extractPathSegment(path, "/api/v1/tenants/");
-    if (!tid || !UUID.test(tid)) {
-      sendJson(res, 400, { error: "Invalid tenant id" });
-      return;
-    }
-    const body = await readJsonBody<{ name?: string; status?: string; maxUsers?: number; plan?: string }>(req);
-    const updated = await tenantRepository.update(tid, body);
-    if (!updated) {
-      sendJson(res, 404, { error: "Tenant not found" });
-      return;
-    }
-    sendJson(res, 200, updated as unknown as Record<string, unknown>);
-    return;
-  }
-
-  // GET /api/v1/tenants/:id/users — platform_owner lists users of any tenant
-  if (path.match(/^\/api\/v1\/tenants\/[^/]+\/users$/) && method === "GET") {
-    if (!hasAnyRole(auth, ["platform_owner"])) {
-      sendJson(res, 403, { error: "Insufficient role" });
-      return;
-    }
-    const tid = extractPathSegment(path, "/api/v1/tenants/");
-    if (!tid || !UUID.test(tid)) {
-      sendJson(res, 400, { error: "Invalid tenant id" });
-      return;
-    }
-    const users = await userRepository.list(tid);
-    sendJson(res, 200, { items: users });
-    return;
-  }
-
   // ─── Tenant-scoped routes ─────────────────────────────────────────────────
   const tenantId = auth.tenantId;
   if (!tenantId) {
@@ -1525,17 +1450,6 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       if (invalidRoles.length > 0) {
         sendJson(res, 400, { error: `Invalid roles: ${invalidRoles.join(", ")}` });
         return;
-      }
-      // Enforce per-tenant user limit
-      const tenant = await tenantRepository.getById(tenantId);
-      if (tenant) {
-        const currentCount = await tenantRepository.getUserCount(tenantId);
-        if (currentCount >= tenant.maxUsers) {
-          sendJson(res, 422, {
-            error: `User limit reached (${tenant.maxUsers}). Contact HyFib support to increase your plan.`
-          });
-          return;
-        }
       }
       const existingUser = await userRepository.findByEmailForAuth(emailTrimmed);
       if (existingUser) {
