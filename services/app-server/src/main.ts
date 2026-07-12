@@ -5,7 +5,12 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig } from "@hyfib/config";
 import { waitForReady, closePool as closeDbPool } from "@hyfib/db";
-import { closePool as closePersistencePool } from "@hyfib/persistence";
+import {
+  closePool as closePersistencePool,
+  outboxRepository,
+  resolveChannelByPhoneNumberId,
+  withTenant
+} from "@hyfib/persistence";
 import { closeRedis, getRedisClient } from "@hyfib/ratelimit";
 import { createEventBus, type EventBus } from "@hyfib/event-bus";
 import {
@@ -17,6 +22,7 @@ import {
   type AiProxy
 } from "@hyfib/api-gateway";
 import { processForwardedWebhook } from "@hyfib/webhook-ingestor";
+import { createDurableWebhookBus } from "./webhook-outbox-bus.js";
 import { metaDispatch } from "@hyfib/meta-adapter";
 import { registerWorkerConsumers, type WorkerMetaClient } from "@hyfib/notification-worker";
 import { getReportsOverview } from "@hyfib/reporting-service";
@@ -95,11 +101,24 @@ async function main(): Promise<void> {
   const eventBus = createEventBus(config);
 
   // Direct in-process webhook ingestion: the gateway calls this instead of
-  // proxying to the webhook-ingestor over HTTP. Publishes on the shared bus.
+  // proxying to the webhook-ingestor over HTTP. Publishes route through the
+  // durable DB outbox (crash-safe, retried with backoff, dead-letterable via
+  // the gateway's relay) instead of straight onto the shared bus — a
+  // composition-only decorator; webhook-ingestor's own EventBus interface is
+  // untouched. Worker registration and gateway/SSE fan-out below keep using
+  // the raw shared bus.
   const webhookIdempotency = new RedisIdempotencyStore(getRedisClient(config), 24 * 60 * 60);
+  const durableWebhookBus = createDurableWebhookBus(eventBus, {
+    resolveTenant: async (phoneNumberId) => (await resolveChannelByPhoneNumberId(phoneNumberId))?.tenantId,
+    enqueue: (tenantId, topic, payload) =>
+      withTenant(tenantId, (client) =>
+        outboxRepository.enqueue(client, tenantId, { topic, payload: payload as Record<string, unknown> })
+      ),
+    logger
+  });
   const proxyWebhookToIngestor: IngestWebhookProxy = async (forwarded) => {
     const { verified, summary } = await processForwardedWebhook(forwarded, {
-      eventBus,
+      eventBus: durableWebhookBus,
       idempotency: webhookIdempotency,
       metaAppSecret: config.metaAppSecret
     });
