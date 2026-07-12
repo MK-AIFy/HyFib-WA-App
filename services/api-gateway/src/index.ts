@@ -24,6 +24,7 @@ import {
   conversationRepository,
   healthCheck,
   linkClickRepository,
+  mediaRepository,
   messageRepository,
   orderRepository,
   outboxRepository,
@@ -88,6 +89,7 @@ import {
 } from "./validation.js";
 import { filterSendableContacts } from "./campaign.js";
 import { canCreateContact, canCreateOrder } from "./authorization.js";
+import { buildMediaHeaders } from "./media-headers.js";
 import { SseHub } from "./sse-hub.js";
 import { parseCsv, serializeContactsCsv, extractMultipartFile } from "./csv.js";
 import { resolveOrgTenant } from "./single-org.js";
@@ -1163,6 +1165,9 @@ function registerSseForwarding(): void {
     ephemeral: true
   });
   eventBus.subscribe(EventTopics.WhatsAppStatusUpdated, `${sseQueuePrefix}.status`, forwardEventToSse, {
+    ephemeral: true
+  });
+  eventBus.subscribe(EventTopics.MediaStored, `${sseQueuePrefix}.media`, forwardEventToSse, {
     ephemeral: true
   });
   sseHub.startKeepAlive();
@@ -2705,6 +2710,44 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return;
     }
     sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+
+  // ─── Media serving ────────────────────────────────────────────────────────
+  if (path.startsWith("/api/v1/media/") && method === "GET") {
+    const assetId = extractPathSegment(path, "/api/v1/media/");
+    if (!assetId || !UUID.test(assetId)) {
+      sendJson(res, 400, { error: "Invalid media id" });
+      return;
+    }
+    const asset = await mediaRepository.getForServing(tenantId, assetId);
+    if (!asset) {
+      sendJson(res, 404, { error: "media_not_found" });
+      return;
+    }
+    if (asset.status !== "stored") {
+      sendJson(res, 409, { error: "media_not_ready", status: asset.status });
+      return;
+    }
+    if (!asset.bytes) {
+      // Data invariant violation: a `stored` row should always carry bytes.
+      logger.error("media_stored_without_bytes", { tenantId, assetId });
+      sendJson(res, 500, { error: "media_corrupt" });
+      return;
+    }
+    const headers = buildMediaHeaders({
+      mimeType: asset.mimeType,
+      filename: asset.filename,
+      byteLength: asset.bytes.length
+    });
+    res.statusCode = 200;
+    for (const [key, value] of Object.entries(headers)) {
+      res.setHeader(key, value);
+    }
+    incCounter("media_served_total", "Media assets served via the authenticated media route.", {
+      service: "api-gateway"
+    });
+    res.end(asset.bytes);
     return;
   }
 
