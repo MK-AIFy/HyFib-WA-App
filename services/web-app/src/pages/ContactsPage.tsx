@@ -17,7 +17,6 @@ import { Label } from "@/components/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { PageHeader } from "@/components/PageHeader";
 import { EmptyState } from "@/components/EmptyState";
-import { readStoredToken } from "@/lib/auth-storage";
 import { useCreate, useList } from "@/hooks/use-resource";
 
 interface NewContact {
@@ -103,7 +102,7 @@ function ExportButton() {
   async function download() {
     try {
       const res = await fetch("/api/v1/contacts/export", {
-        headers: { authorization: `Bearer ${readStoredToken() ?? ""}` }
+        headers: { "x-requested-with": "fetch" }
       });
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);

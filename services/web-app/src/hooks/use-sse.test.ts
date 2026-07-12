@@ -1,5 +1,8 @@
-import { describe, expect, it } from "vitest";
-import { createSseFrameParser, type SseEvent } from "./use-sse";
+import { createElement, type ReactNode } from "react";
+import { renderHook, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { createSseFrameParser, useSse, type SseEvent } from "./use-sse";
 
 describe("createSseFrameParser", () => {
   it("parses a complete frame delivered in one push", () => {
@@ -57,5 +60,45 @@ describe("createSseFrameParser", () => {
     parser.push("event: a\ndata: {}\n\nevent: b\ndata: {}\n\n");
 
     expect(events.map((e) => e.topic)).toEqual(["a", "b"]);
+  });
+});
+
+function queryClientWrapper({ children }: { children: ReactNode }) {
+  const client = new QueryClient();
+  return createElement(QueryClientProvider, { client }, children);
+}
+
+describe("useSse", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("connects with no authorization header — cookie auth carries the session", async () => {
+    const emptyStream = new ReadableStream({
+      start(controller) {
+        controller.close();
+      }
+    });
+    const fetchMock = vi.fn().mockResolvedValue(new Response(emptyStream, { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { unmount } = renderHook(() => useSse(true), { wrapper: queryClientWrapper });
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit | undefined];
+    expect(url).toBe("/api/v1/events/stream");
+    expect((init?.headers as Record<string, string> | undefined)?.authorization).toBeUndefined();
+
+    unmount();
+  });
+
+  it("does not connect while disabled (no authenticated user)", () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { unmount } = renderHook(() => useSse(false), { wrapper: queryClientWrapper });
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    unmount();
   });
 });

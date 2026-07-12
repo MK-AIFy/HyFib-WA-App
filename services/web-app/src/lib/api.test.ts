@@ -15,15 +15,52 @@ describe("api client", () => {
     vi.unstubAllGlobals();
   });
 
-  it("sends the stored bearer token on every request", async () => {
-    writeSession({ token: "tok-123", tenantId: "t1", tenantName: "Acme", role: "tenant_admin" });
+  it("sends x-requested-with and no authorization header on every request (cookie auth)", async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, { ok: true }));
     vi.stubGlobal("fetch", fetchMock);
 
     await api.get("/api/v1/contacts");
 
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect((init.headers as Record<string, string>).authorization).toBe("Bearer tok-123");
+    const headers = init.headers as Record<string, string>;
+    expect(headers["x-requested-with"]).toBe("fetch");
+    expect(headers.authorization).toBeUndefined();
+  });
+
+  it("sends x-requested-with and no authorization header on mutating requests", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, { ok: true }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.post("/api/v1/contacts", { phoneE164: "+15555550123" });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const headers = init.headers as Record<string, string>;
+    expect(headers["x-requested-with"]).toBe("fetch");
+    expect(headers.authorization).toBeUndefined();
+  });
+
+  it("getBlob sends x-requested-with and no authorization header", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(new Blob(["csv"]), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.getBlob("/api/v1/contacts/export");
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const headers = init.headers as Record<string, string>;
+    expect(headers["x-requested-with"]).toBe("fetch");
+    expect(headers.authorization).toBeUndefined();
+  });
+
+  it("get() attaches an explicit extraHeaders authorization header when supplied (legacy upgrade hook)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, { ok: true }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.get("/auth/me", { authorization: "Bearer legacy-tok" });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const headers = init.headers as Record<string, string>;
+    expect(headers.authorization).toBe("Bearer legacy-tok");
+    expect(headers["x-requested-with"]).toBe("fetch");
   });
 
   it("throws ApiError with the server's error message on non-2xx", async () => {
@@ -36,7 +73,7 @@ describe("api client", () => {
   });
 
   it("clears the session and notifies the unauthorized handler on 401", async () => {
-    writeSession({ token: "tok-123", tenantId: "t1", tenantName: "Acme", role: "tenant_admin" });
+    writeSession({ tenantId: "t1", tenantName: "Acme", role: "tenant_admin" });
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(401, { error: "Not authenticated" })));
     const handler = vi.fn();
     setUnauthorizedHandler(handler);
@@ -44,7 +81,7 @@ describe("api client", () => {
     await expect(api.get("/auth/me")).rejects.toBeInstanceOf(ApiError);
 
     expect(handler).toHaveBeenCalledOnce();
-    expect(localStorage.getItem("hf_tok")).toBeNull();
+    expect(localStorage.getItem("hf_tname")).toBeNull();
     clearSession();
   });
 });

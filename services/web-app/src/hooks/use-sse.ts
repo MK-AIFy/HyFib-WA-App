@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
 import { useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { readStoredToken } from "@/lib/auth-storage";
 
 export type SseStatus = "live" | "offline" | "connecting";
 
@@ -119,14 +118,12 @@ export function useSse(enabled: boolean): SseStatus {
     let attempt = 0;
 
     async function connect() {
-      const token = readStoredToken();
-      if (!token) {
-        return;
-      }
       setStatus("connecting");
       try {
+        // Cookie auth: the browser attaches hf_session automatically
+        // (same-origin default) — the connect guard above (`enabled`) is
+        // what tracks whether there's an authenticated user to stream for.
         const res = await fetch("/api/v1/events/stream", {
-          headers: { authorization: `Bearer ${token}` },
           signal: controller.signal
         });
         if (!res.body) {

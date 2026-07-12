@@ -1,7 +1,13 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import type { Role, Tenant } from "@hyfib/shared-core";
 import { api, ApiError, setUnauthorizedHandler } from "./api";
-import { clearSession, readStoredToken, writeSession } from "./auth-storage";
+import { clearSession, writeSession } from "./auth-storage";
+
+// 2026-07-12 (Task 18): legacy localStorage key for the Bearer token, kept
+// here only so the boot effect can do a one-shot upgrade for clients that
+// logged in before the cookie-session cutover. See auth-storage.ts's own
+// LEGACY_TOKEN_KEY comment for the storage-cleanup side of this.
+const LEGACY_TOKEN_KEY = "hf_tok";
 
 export interface SessionUser {
   id: string;
@@ -27,9 +33,8 @@ interface AuthContextValue {
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
-function persist(user: SessionUser, token: string): void {
+function persist(user: SessionUser): void {
   writeSession({
-    token,
     tenantId: user.tenantId,
     tenantName: user.tenant?.name ?? user.tenantId,
     role: user.roles[0] ?? ""
@@ -38,32 +43,42 @@ function persist(user: SessionUser, token: string): void {
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<SessionUser | null>(null);
-  // Only worth showing a loading state when there's a stored token to
-  // validate; otherwise there's nothing to await and no synchronous
-  // setState is needed inside the effect below.
-  const [isLoading, setIsLoading] = useState<boolean>(() => Boolean(readStoredToken()));
+  // Auth now runs on the hf_session cookie, which this module can't inspect
+  // (HttpOnly), so the boot effect always awaits /auth/me — an anonymous
+  // 401 resolves fast and is already handled below.
+  const [isLoading, setIsLoading] = useState<boolean>(true);
 
   useEffect(() => {
     setUnauthorizedHandler(() => setUser(null));
   }, []);
 
   useEffect(() => {
-    const token = readStoredToken();
-    if (!token) {
-      return;
-    }
+    // 2026-07-12 (Task 18) legacy upgrade: a client that authenticated
+    // before the cookie-session cutover still has a Bearer token sitting in
+    // localStorage. Send it ONCE as an Authorization header on this boot
+    // call so the server can mint the hf_session cookie, then drop the key
+    // regardless of outcome so every later boot runs on pure cookie auth.
+    const legacyToken = localStorage.getItem(LEGACY_TOKEN_KEY);
+    const extraHeaders = legacyToken ? { authorization: `Bearer ${legacyToken}` } : undefined;
+
     api
-      .get<SessionUser>("/auth/me")
+      .get<SessionUser>("/auth/me", extraHeaders)
       .then((me) => setUser(me))
       .catch(() => {
-        // 401 already clears storage via the unauthorized handler.
+        // Anonymous or expired session — 401 already clears storage via the
+        // unauthorized handler.
       })
-      .finally(() => setIsLoading(false));
+      .finally(() => {
+        if (legacyToken) {
+          localStorage.removeItem(LEGACY_TOKEN_KEY);
+        }
+        setIsLoading(false);
+      });
   }, []);
 
   const login = useCallback(async (email: string, password: string) => {
     const data = await api.post<AuthResponse>("/auth/login", { email, password });
-    persist(data.user, data.token);
+    persist(data.user);
     setUser(data.user);
   }, []);
 
