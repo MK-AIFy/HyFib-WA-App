@@ -1740,6 +1740,17 @@ export interface OutboxRow {
   payload: Record<string, unknown>;
   status: string;
   created_at: Date;
+  attempts: number;
+  next_attempt_at: Date;
+  last_error: string | null;
+}
+
+export interface OutboxDeadRow {
+  id: string;
+  topic: string;
+  attempts: number;
+  last_error: string | null;
+  created_at: Date;
 }
 
 export const outboxRepository = {
@@ -1769,6 +1780,37 @@ export const outboxRepository = {
   },
   async markProcessed(id: string): Promise<void> {
     await query("SELECT outbox_mark_processed($1)", [id]);
+  },
+  /**
+   * Record a failed dispatch attempt (bypasses RLS via SECURITY DEFINER fn, like claim/markProcessed —
+   * the relay operates without a tenant context). Backs off exponentially and moves the row to 'dead'
+   * once it has been attempted p_max_attempts times; see outbox_mark_failed in 015_outbox_durability.sql.
+   */
+  async markFailed(id: string, error: string): Promise<void> {
+    await query("SELECT outbox_mark_failed($1, $2, $3)", [id, error, 8]);
+  },
+  /** List dead-lettered events for a tenant (RLS-scoped). */
+  async listDead(tenantId: string, limit: number): Promise<OutboxDeadRow[]> {
+    const clampedLimit = Math.min(Math.max(limit, 1), 200);
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<OutboxDeadRow>(
+        `SELECT id, topic, attempts, last_error, created_at
+         FROM outbox_events WHERE status = 'dead' ORDER BY created_at DESC LIMIT $1`,
+        [clampedLimit]
+      );
+      return result.rows;
+    });
+  },
+  /** Reset a dead-lettered event back to pending for redelivery (RLS-scoped; returns false if not found/not dead). */
+  async replayDead(tenantId: string, id: string): Promise<boolean> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query(
+        `UPDATE outbox_events SET status = 'pending', attempts = 0, next_attempt_at = now(), last_error = NULL
+         WHERE id = $1 AND status = 'dead'`,
+        [id]
+      );
+      return (result.rowCount ?? 0) > 0;
+    });
   }
 };
 
