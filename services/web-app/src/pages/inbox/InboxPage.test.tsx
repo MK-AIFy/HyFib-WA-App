@@ -480,9 +480,17 @@ describe("InboxPage — bounded archived-aware fallback for message search selec
     await waitFor(() => expect(toastErrorSpy).toHaveBeenCalledTimes(1));
     expect(toastErrorSpy).toHaveBeenCalledWith(expect.stringContaining("Couldn't open that conversation"));
 
+    // Round-2 review finding 2: archived resets back to false alongside the
+    // toast, so the user lands back where they started instead of being
+    // parked in an archived view they never asked for.
+    expect(await screen.findByRole("button", { name: "Show archived conversations" })).toBeInTheDocument();
+
     // No lingering scan: once pendingSelect is disarmed, a LATER data change
     // that would satisfy the old target id must NOT retroactively select it.
-    client.setQueryData(["conversations", { state: "all", archived: true }], {
+    // Injected under the now-active `{state:"all"}` key (archived having
+    // just reset to false above) — not `{state:"all", archived:true}`,
+    // which is no longer what's on screen.
+    client.setQueryData(["conversations", { state: "all" }], {
       items: [{ ...CONVERSATIONS[0], id: "c-ghost", contactName: "Ghost Contact", unreadCount: 5 }]
     });
 
@@ -491,6 +499,205 @@ describe("InboxPage — bounded archived-aware fallback for message search selec
     // re-render with the new data happened — then assert it was never
     // auto-selected/mark-read despite now being resolvable by id.
     await waitFor(() => expect(screen.getByText("Ghost Contact")).toBeInTheDocument());
+    expect(postMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("InboxPage — pendingSelect cancellation on competing user actions (review finding 1, round 2)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it("cancels a pending search-hit selection when the user clicks a different conversation before it resolves", async () => {
+    // Reproduction from the reviewer: click an archived-only search hit
+    // (arms pendingSelect, clears search) -> before the debounce+archived
+    // fetch settle, click a DIFFERENT conversation in the visible list.
+    // Without cancellation, the late-resolving fallback would flip
+    // archived=true and select() the stale archived-only target out from
+    // under the user's own choice, re-firing mark-read for a conversation
+    // they never picked.
+    const archivedConv = conv({ id: "c-archived", unreadCount: 1, contactName: "Archived Contact" });
+    const searchResult = {
+      id: "sm4",
+      conversationId: "c-archived",
+      direction: "inbound" as const,
+      status: "delivered" as const,
+      createdAt: "2026-07-12T00:00:00.000Z",
+      text: "a message whose conversation lives only in the archived folder",
+      contactName: "Archived Contact"
+    };
+    // Mock POST to actually persist the read (mirrors the "closed tab" and
+    // debounce-regression tests above) — otherwise a static GET mock
+    // "bounces" unreadCount back up to 3 on useMarkRead's post-mutation
+    // invalidate+refetch, re-firing the effect a SECOND, unrelated time and
+    // producing a false-positive on the exactly-once assertion below.
+    let items = CONVERSATIONS;
+    const postMock = vi.spyOn(api, "post").mockImplementation((path: string) => {
+      items = items.map((c) => (path.includes(c.id) ? { ...c, unreadCount: 0 } : c));
+      return Promise.resolve({ status: "read", conversationId: "" });
+    });
+    const getMock = vi.spyOn(api, "get").mockImplementation((path: string) => {
+      if (path.startsWith("/api/v1/messages/search")) {
+        return Promise.resolve({ items: [searchResult], total: 1, limit: 20, offset: 0 });
+      }
+      if (path.includes("/messages")) return Promise.resolve({ items: [] });
+      if (path === "/api/v1/saved-replies") return Promise.resolve({ items: [] });
+      if (path === "/api/v1/conversations?archived=true") return Promise.resolve({ items: [archivedConv] });
+      if (path.startsWith("/api/v1/conversations")) return Promise.resolve({ items });
+      return Promise.reject(new Error(`Unhandled GET ${path}`));
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <InboxPage />
+      </QueryClientProvider>
+    );
+
+    // Settle the initial mount fetch on real timers first — faking globals
+    // during React's initial mount/effect flush is what causes hangs (see
+    // the debounce tests above).
+    await waitFor(() => expect(getMock).toHaveBeenCalledWith("/api/v1/conversations"));
+    const input = await screen.findByLabelText("Search conversations");
+    const user = userEvent.setup();
+
+    // Type the search and let the debounce land on real timers. This also
+    // warms the cache for `{state:"all", q:"archived folder", archived:false}`
+    // — ConversationList's OWN useConversations call runs unconditionally
+    // regardless of which scope panel is showing — which is what lets the
+    // conversation list render actual (not loading) rows the instant the
+    // search-hit click below resets `rawQuery` back to "".
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      fireEvent.change(input, { target: { value: "archived folder" } });
+      act(() => {
+        vi.advanceTimersByTime(300);
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+
+    // Radix's Tabs.Trigger needs a real pointer-event sequence to register a
+    // value change — a raw `fireEvent.click` doesn't activate it.
+    await user.click(await screen.findByRole("tab", { name: "Messages" }));
+    const hit = await screen.findByText("Archived Contact");
+
+    // Everything from here happens inside ONE fake-timer window so the
+    // debounce timer the click below schedules is captured by the fake
+    // clock — a setTimeout scheduled under real timers keeps running in
+    // real time even after switching to fake timers afterward, so it has to
+    // be scheduled AFTER faking is already active to stay controllable.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      // Arms pendingSelect (stage "default") and resets rawQuery/state/archived.
+      fireEvent.click(hit);
+
+      // The reset makes `isSearching` false immediately, so ConversationList
+      // swaps back to the plain listbox — sourced from the SAME (already
+      // warmed, settled) cache entry, so "Has Unread" is already in the DOM
+      // synchronously here, no waiting required. Click it — a normal,
+      // USER-originated row click — BEFORE the frozen debounce (or any
+      // archived escalation) can run.
+      fireEvent.click(screen.getByText("Has Unread"));
+
+      // Now let the frozen debounce — and anything it would have triggered —
+      // run all the way out. Without the fix, THIS is where the stale
+      // fallback would flip archived=true and select() the archived-only
+      // target.
+      act(() => {
+        vi.advanceTimersByTime(2000);
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+
+    // The user's own selection wins.
+    await waitFor(() => expect(postMock).toHaveBeenCalledWith("/api/v1/conversations/c-unread/read", {}));
+    // Archived is never flipped on by the (cancelled) fallback...
+    expect(await screen.findByRole("button", { name: "Show archived conversations" })).toBeInTheDocument();
+    expect(getMock).not.toHaveBeenCalledWith("/api/v1/conversations?archived=true");
+    // ...and the stale target is never selected / mark-read.
+    expect(postMock).not.toHaveBeenCalledWith("/api/v1/conversations/c-archived/read", {});
+    expect(postMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels a pending search-hit selection when the user switches the state tab before it resolves — no retroactive navigation once filters realign", async () => {
+    // Mid-flight tab-switch variant of the interference test above: arming
+    // pendingSelect and then switching the state tab must disarm it outright
+    // (not just gate it behind state !== "all") — otherwise switching back
+    // to "All" later, once the target legitimately becomes fetchable, would
+    // resolve the stale fallback retroactively.
+    const searchResult = {
+      id: "sm5",
+      conversationId: "c-tabswitch",
+      direction: "inbound" as const,
+      status: "delivered" as const,
+      createdAt: "2026-07-12T00:00:00.000Z",
+      text: "a message pointing at a conversation not yet loaded",
+      contactName: "Tab Switch Contact"
+    };
+    let allItems = CONVERSATIONS;
+    const postMock = vi.spyOn(api, "post").mockResolvedValue({ status: "read", conversationId: "" });
+    const getMock = vi.spyOn(api, "get").mockImplementation((path: string) => {
+      if (path.startsWith("/api/v1/messages/search")) {
+        return Promise.resolve({ items: [searchResult], total: 1, limit: 20, offset: 0 });
+      }
+      if (path.includes("/messages")) return Promise.resolve({ items: [] });
+      if (path === "/api/v1/saved-replies") return Promise.resolve({ items: [] });
+      if (path === "/api/v1/conversations") return Promise.resolve({ items: allItems });
+      if (path.startsWith("/api/v1/conversations")) return Promise.resolve({ items: CONVERSATIONS });
+      return Promise.reject(new Error(`Unhandled GET ${path}`));
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <InboxPage />
+      </QueryClientProvider>
+    );
+
+    await waitFor(() => expect(getMock).toHaveBeenCalledWith("/api/v1/conversations"));
+    const input = await screen.findByLabelText("Search conversations");
+    const user = userEvent.setup();
+
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      fireEvent.change(input, { target: { value: "tab switch" } });
+      act(() => {
+        vi.advanceTimersByTime(300);
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+
+    // Radix's Tabs.Trigger needs a real pointer-event sequence to register a
+    // value change — a raw `fireEvent.click` doesn't activate it, and
+    // `userEvent` in turn needs REAL timers (its internal event sequencing
+    // awaits a real `setTimeout` even at `delay: 0`, which would hang
+    // against a frozen fake clock). So this whole interference window runs
+    // on real timers instead of a frozen debounce: click the search hit
+    // (arms pendingSelect) and click the "Open" tab (the competing
+    // USER-originated action) back-to-back, with no `await` for anything
+    // else in between — both resolve in low single-digit milliseconds in
+    // practice, comfortably inside the 300ms debounce window this needs to
+    // land within.
+    await user.click(await screen.findByRole("tab", { name: "Messages" }));
+    const hit = await screen.findByText("Tab Switch Contact");
+
+    await user.click(hit); // arms pendingSelect (stage "default")
+    await user.click(screen.getByRole("tab", { name: "Open" })); // competing user action
+
+    await waitFor(() => expect(getMock).toHaveBeenCalledWith("/api/v1/conversations?state=open"));
+
+    // The target now legitimately exists in the "All" tab's data (e.g. a
+    // background sync landed it) — the exact condition `stageFiltersSettled`
+    // would have required. If pendingSelect had merely been GATED by
+    // state !== "all" instead of genuinely disarmed, switching back to "All"
+    // would resolve it retroactively.
+    allItems = [...CONVERSATIONS, conv({ id: "c-tabswitch", unreadCount: 4, contactName: "Tab Switch Contact" })];
+
+    await user.click(await screen.findByRole("tab", { name: "All" }));
+
+    await waitFor(() => expect(screen.getByText("Tab Switch Contact")).toBeInTheDocument());
     expect(postMock).not.toHaveBeenCalled();
   });
 });

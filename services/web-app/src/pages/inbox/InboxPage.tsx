@@ -137,8 +137,12 @@ export function InboxPage() {
       // Both the default and archived views settled without the target —
       // it's genuinely unreachable (deleted, wrong tenant, etc). Disarm so
       // this stops re-scanning every future render, and tell the user
-      // instead of silently no-op'ing.
+      // instead of silently no-op'ing. Also reset `archived` back to false
+      // (round-2 review finding 2) so the user lands where they started —
+      // the toast already explains the failure; an unexplained archived
+      // view on top of that is just confusing.
       setPendingSelect(undefined);
+      setArchived(false);
       toast.error("Couldn't open that conversation — it may no longer be available.");
     }
   }
@@ -156,7 +160,39 @@ export function InboxPage() {
   }, [selectedId, selectedUnreadCount]);
 
   function select(c: Conversation) {
+    // Round-2 review finding 1: any USER-originated selection — including a
+    // normal row click while a search-hit fallback is still armed — must
+    // cancel that fallback outright, not just get raced by it. Without this,
+    // clicking a different conversation while `pendingSelect` is resolving
+    // (e.g. still waiting on the debounce+archived-escalation ladder above)
+    // doesn't stop that ladder from later finding its stale target and
+    // calling `select()` on it out from under the user's own choice — re-
+    // firing mark-read for a conversation they never picked. Safe to call
+    // unconditionally here even for the resolver's OWN internal `select(found)`
+    // call above: that call is immediately followed by an explicit
+    // `setPendingSelect(undefined)` anyway, so this is a harmless no-op in
+    // that path and the real effect only lands on the user-click path.
+    setPendingSelect(undefined);
     setActive(c);
+  }
+
+  // Wrap the state/archived setters passed to ConversationList so a
+  // USER-originated tab switch or archived toggle also disarms an in-flight
+  // `pendingSelect` fallback (round-2 review finding 1) — mirroring `select`
+  // above for the other two ways the user can compete with it. Deliberately
+  // NOT used by the resolver's own internal `setArchived(true)` escalation
+  // call above, nor by `selectConversationById`'s own filter reset when
+  // arming `pendingSelect` in the first place — both of those are the
+  // fallback's OWN bookkeeping, not a competing user action, and must not
+  // cancel the very selection they're driving.
+  function handleUserStateChange(next: ConvStateFilter) {
+    setPendingSelect(undefined);
+    setState(next);
+  }
+
+  function handleUserArchivedChange(next: boolean) {
+    setPendingSelect(undefined);
+    setArchived(next);
   }
 
   return (
@@ -167,12 +203,12 @@ export function InboxPage() {
           activeId={active?.id}
           onSelect={select}
           state={state}
-          onStateChange={setState}
+          onStateChange={handleUserStateChange}
           search={rawQuery}
           onSearchChange={setRawQuery}
           q={query}
           archived={archived}
-          onArchivedChange={setArchived}
+          onArchivedChange={handleUserArchivedChange}
           scope={scope}
           onScopeChange={setScope}
           onSelectConversation={selectConversationById}
