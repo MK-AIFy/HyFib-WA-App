@@ -176,15 +176,16 @@ export function InboxPage() {
     setActive(c);
   }
 
-  // Wrap the state/archived setters passed to ConversationList so a
-  // USER-originated tab switch or archived toggle also disarms an in-flight
-  // `pendingSelect` fallback (round-2 review finding 1) — mirroring `select`
-  // above for the other two ways the user can compete with it. Deliberately
-  // NOT used by the resolver's own internal `setArchived(true)` escalation
-  // call above, nor by `selectConversationById`'s own filter reset when
-  // arming `pendingSelect` in the first place — both of those are the
-  // fallback's OWN bookkeeping, not a competing user action, and must not
-  // cancel the very selection they're driving.
+  // Wrap the state/archived/search setters passed to ConversationList so a
+  // USER-originated tab switch, archived toggle, or search-box retype also
+  // disarms an in-flight `pendingSelect` fallback (round-2 review finding 1;
+  // search retype added round-3 review finding 2) — mirroring `select` above
+  // for the other ways the user can compete with it. Deliberately NOT used
+  // by the resolver's own internal `setArchived(true)` escalation call
+  // above, nor by `selectConversationById`'s own filter reset (including its
+  // own `setRawQuery("")`) when arming `pendingSelect` in the first place —
+  // both of those are the fallback's OWN bookkeeping, not a competing user
+  // action, and must not cancel the very selection they're driving.
   function handleUserStateChange(next: ConvStateFilter) {
     setPendingSelect(undefined);
     setState(next);
@@ -193,6 +194,11 @@ export function InboxPage() {
   function handleUserArchivedChange(next: boolean) {
     setPendingSelect(undefined);
     setArchived(next);
+  }
+
+  function handleUserSearchChange(value: string) {
+    setPendingSelect(undefined);
+    setRawQuery(value);
   }
 
   return (
@@ -205,7 +211,7 @@ export function InboxPage() {
           state={state}
           onStateChange={handleUserStateChange}
           search={rawQuery}
-          onSearchChange={setRawQuery}
+          onSearchChange={handleUserSearchChange}
           q={query}
           archived={archived}
           onArchivedChange={handleUserArchivedChange}

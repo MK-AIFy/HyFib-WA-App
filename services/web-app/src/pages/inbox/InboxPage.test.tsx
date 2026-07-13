@@ -698,6 +698,96 @@ describe("InboxPage — pendingSelect cancellation on competing user actions (re
     await user.click(await screen.findByRole("tab", { name: "All" }));
 
     await waitFor(() => expect(screen.getByText("Tab Switch Contact")).toBeInTheDocument());
+
+    // Force the debounce armed at the hit-click to actually land before asserting,
+    // so this doesn't pass merely because query hasn't settled to "" yet.
+    await new Promise((resolve) => setTimeout(resolve, 350));
+
     expect(postMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("InboxPage — pendingSelect cancellation on search-box retype (review finding 2, round 3)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it("cancels a pending search-hit selection when the user retypes into the search box before it resolves", async () => {
+    // Round-3 review finding 2: `onSearchChange={setRawQuery}` bypassed the
+    // disarm pattern applied to the state/archived handlers above — typing
+    // into the search box is a THIRD way the user can compete with an
+    // in-flight `pendingSelect` fallback, and it must cancel it exactly like
+    // a row click or tab switch does. Reproduction: click an archived-only
+    // search hit (arms pendingSelect, resets the search box to "" as part of
+    // its OWN bookkeeping) -> before that reset's debounce settles, the user
+    // retypes into the box and then clears it again, landing back on "" —
+    // the exact value `stageFiltersSettled` is waiting for. Without the fix,
+    // that retype-then-clear doesn't cancel anything, so once the box empties
+    // back out the still-armed fallback is free to resume right where it left
+    // off: flip archived=true and select() the stale archived-only target out
+    // from under the user, re-firing mark-read for a conversation they never
+    // picked. (A retype that's simply left non-empty would never trigger this
+    // particular symptom — `stageFiltersSettled` requires an empty query —
+    // but the handler must disarm on EVERY search-box change, not only ones
+    // that happen to end on a value the ladder is watching for; the
+    // type-then-clear sequence is what makes that observable end-to-end.)
+    const archivedConv = conv({ id: "c-archived-retype", unreadCount: 1, contactName: "Archived Retype Contact" });
+    const searchResult = {
+      id: "sm6",
+      conversationId: "c-archived-retype",
+      direction: "inbound" as const,
+      status: "delivered" as const,
+      createdAt: "2026-07-12T00:00:00.000Z",
+      text: "a message whose conversation lives only in the archived folder",
+      contactName: "Archived Retype Contact"
+    };
+    const postMock = vi.spyOn(api, "post").mockResolvedValue({ status: "read", conversationId: "" });
+    const getMock = vi.spyOn(api, "get").mockImplementation((path: string) => {
+      if (path.startsWith("/api/v1/messages/search")) {
+        return Promise.resolve({ items: [searchResult], total: 1, limit: 20, offset: 0 });
+      }
+      if (path.includes("/messages")) return Promise.resolve({ items: [] });
+      if (path === "/api/v1/saved-replies") return Promise.resolve({ items: [] });
+      if (path === "/api/v1/conversations?archived=true") return Promise.resolve({ items: [archivedConv] });
+      if (path.startsWith("/api/v1/conversations")) return Promise.resolve({ items: CONVERSATIONS });
+      return Promise.reject(new Error(`Unhandled GET ${path}`));
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <InboxPage />
+      </QueryClientProvider>
+    );
+
+    await waitFor(() => expect(getMock).toHaveBeenCalledWith("/api/v1/conversations"));
+    const input = await screen.findByLabelText("Search conversations");
+    const user = userEvent.setup();
+
+    await user.type(input, "archived retype");
+    await user.click(await screen.findByRole("tab", { name: "Messages" }));
+    const hit = await screen.findByText("Archived Retype Contact");
+
+    fireEvent.click(hit); // arms pendingSelect (stage "default"), resets rawQuery to "" internally
+
+    // Competing USER action, fired back-to-back with no `await` in between so
+    // both land well inside the 300ms debounce window the hit-click's own
+    // reset just armed: retype into the (now-cleared) search box, then clear
+    // it again — ending back on "", the value `stageFiltersSettled` needs to
+    // resume the (still-armed, if unfixed) fallback's ladder.
+    fireEvent.change(input, { target: { value: "x" } });
+    fireEvent.change(input, { target: { value: "" } });
+
+    // Let the debounce armed above — and the archived-escalation fetch it
+    // would trigger if the fallback were still armed — actually land in real
+    // time before asserting, so this doesn't pass merely because nothing has
+    // settled yet.
+    await new Promise((resolve) => setTimeout(resolve, 350));
+
+    // The stale archived-only target is never selected / mark-read...
+    expect(postMock).not.toHaveBeenCalled();
+    // ...and archived is never flipped on by the (cancelled) fallback.
+    expect(await screen.findByRole("button", { name: "Show archived conversations" })).toBeInTheDocument();
+    expect(getMock).not.toHaveBeenCalledWith("/api/v1/conversations?archived=true");
   });
 });
