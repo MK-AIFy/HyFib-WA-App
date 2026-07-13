@@ -563,6 +563,41 @@ async function markRead(channel: ChannelCredentials, messageId: string | undefin
   await metaClient.markRead(channel.phoneNumberId, messageId, tenantId, channel.accessToken);
 }
 
+/**
+ * Builds and enqueues a MediaFetchRequested outbox row for inbound media. Idempotent
+ * downstream (media.ts's upsertPending short-circuits by media id), so calling this more
+ * than once for the same media is always safe. Shared by handleInbound's main path and its
+ * replay-guard skip branch, which re-enqueues when a prior run committed the message but
+ * then failed to enqueue the media fetch (self-healing an otherwise-permanent orphaned-media
+ * window — see the skip branch for details).
+ */
+async function defaultEnqueueMediaFetch(
+  channel: { tenantId: string; channelId: string },
+  phoneNumberId: string | undefined,
+  conversationId: string,
+  messageId: string,
+  media: { id: string; mimeType?: string; sha256?: string; filename?: string }
+): Promise<void> {
+  await withTenant(channel.tenantId, async (client) => {
+    await outboxRepository.enqueue(client, channel.tenantId, {
+      topic: EventTopics.MediaFetchRequested,
+      payload: {
+        tenantId: channel.tenantId,
+        channelId: channel.channelId,
+        phoneNumberId,
+        conversationId,
+        messageId,
+        mediaId: media.id,
+        mimeType: media.mimeType,
+        filename: media.filename,
+        sha256: media.sha256
+      } satisfies MediaFetchRequest
+    });
+  });
+}
+/** Overridable via WorkerDeps (see registerWorkerConsumers) so tests can avoid touching Postgres. */
+let enqueueMediaFetch: typeof defaultEnqueueMediaFetch = defaultEnqueueMediaFetch;
+
 async function handleInbound(event: EventEnvelope): Promise<void> {
   incCounter("events_consumed_total", "Events consumed from the bus.", { topic: EventTopics.WhatsAppInboundReceived });
   const inbound = event.payload as InboundEvent;
@@ -582,6 +617,29 @@ async function handleInbound(event: EventEnvelope): Promise<void> {
     const existing = await messageRepository.findByExternalId(channel.tenantId, inbound.messageId);
     if (existing) {
       logger.info("inbound_replay_skipped", { tenantId: channel.tenantId, messageId: inbound.messageId });
+      // Self-healing: a prior run may have committed the message row but then failed to
+      // enqueue the media fetch (separate transaction; a transient DB error between the two
+      // leaves the media permanently orphaned, since replays never reach the main path below).
+      // Re-enqueue unless it's already linked — idempotent downstream, so this is harmless even
+      // if the original enqueue actually succeeded. No extra DB reads when there's no media.
+      const replayMedia = inbound.media as
+        | { id?: string; mimeType?: string; sha256?: string; filename?: string }
+        | undefined;
+      const replayMediaId = replayMedia?.id;
+      if (replayMediaId && !existing.payload?.mediaAsset) {
+        await enqueueMediaFetch(channel, inbound.phoneNumberId, existing.conversationId, existing.id, {
+          id: replayMediaId,
+          mimeType: replayMedia?.mimeType,
+          filename: replayMedia?.filename,
+          sha256: replayMedia?.sha256
+        });
+        logger.info("media_fetch_reenqueued_on_replay", {
+          tenantId: channel.tenantId,
+          conversationId: existing.conversationId,
+          messageId: existing.id,
+          mediaId: replayMediaId
+        });
+      }
       return;
     }
   }
@@ -627,21 +685,11 @@ async function handleInbound(event: EventEnvelope): Promise<void> {
     | undefined;
   const mediaId = media?.id;
   if (mediaId) {
-    await withTenant(channel.tenantId, async (client) => {
-      await outboxRepository.enqueue(client, channel.tenantId, {
-        topic: EventTopics.MediaFetchRequested,
-        payload: {
-          tenantId: channel.tenantId,
-          channelId: channel.channelId,
-          phoneNumberId: inbound.phoneNumberId,
-          conversationId: conversation.id,
-          messageId: createdMessage.id,
-          mediaId,
-          mimeType: media?.mimeType,
-          filename: media?.filename,
-          sha256: media?.sha256
-        } satisfies MediaFetchRequest
-      });
+    await enqueueMediaFetch(channel, inbound.phoneNumberId, conversation.id, createdMessage.id, {
+      id: mediaId,
+      mimeType: media?.mimeType,
+      filename: media?.filename,
+      sha256: media?.sha256
     });
     logger.info("media_fetch_enqueued", {
       tenantId: channel.tenantId,
@@ -993,6 +1041,8 @@ export interface WorkerDeps {
   redis?: ReturnType<typeof getRedisClient>;
   /** Phone-number-id → tenant/channel lookup. Falls back to the DB-backed resolver. */
   resolveChannel?: typeof resolveChannelByPhoneNumberId;
+  /** Media-fetch outbox enqueue. Falls back to the DB-backed withTenant/outboxRepository path. */
+  enqueueMediaFetch?: typeof defaultEnqueueMediaFetch;
 }
 
 /**
@@ -1018,6 +1068,9 @@ export function registerWorkerConsumers(deps: WorkerDeps = {}): void {
   }
   if (deps.resolveChannel) {
     resolveChannel = deps.resolveChannel;
+  }
+  if (deps.enqueueMediaFetch) {
+    enqueueMediaFetch = deps.enqueueMediaFetch;
   }
   eventBus.subscribe(EventTopics.CampaignDispatchRequested, "campaign-dispatch", handleDispatch);
   eventBus.subscribe(EventTopics.CampaignDispatchResult, "campaign-results", handleDispatchResult);

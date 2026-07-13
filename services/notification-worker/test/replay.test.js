@@ -299,3 +299,162 @@ test("handleInbound: replayed external message id skips message insert and auto-
     contactRepository.findOrCreateByPhone = originalFindOrCreateByPhone;
   }
 });
+
+/**
+ * Self-healing media re-enqueue on the replay-guard skip branch: if a prior run committed
+ * the message row but then failed to enqueue MediaFetchRequested (separate transaction; a
+ * transient DB error between the two), the media would otherwise be permanently orphaned
+ * since replays never reach the main (non-skip) path. These three tests exercise the skip
+ * branch's re-enqueue decision via the enqueueMediaFetch WorkerDeps seam, which stands in
+ * for the real withTenant/outboxRepository.enqueue write (untestable here without Postgres).
+ */
+function replayedInboundEvent(overrides = {}) {
+  return {
+    id: "env-replay",
+    topic: EventTopics.WhatsAppInboundReceived,
+    occurredAt: new Date().toISOString(),
+    payload: {
+      phoneNumberId: "PN-1",
+      from: "+15559998888",
+      messageId: "wamid.replayed-media",
+      type: "image",
+      ...overrides
+    }
+  };
+}
+
+test("handleInbound replay: media present, no existing mediaAsset link — re-enqueues (heals the orphan)", async () => {
+  const bus = createFakeBus();
+  const resolveChannel = async () => ({ tenantId: "t-1", channelId: "c-1" });
+
+  const originalFindByExternalId = messageRepository.findByExternalId;
+  const originalCreate = messageRepository.create;
+  const originalFindOrCreateByPhone = contactRepository.findOrCreateByPhone;
+
+  const enqueueCalls = [];
+  const enqueueMediaFetch = async (channel, phoneNumberId, conversationId, messageId, media) => {
+    enqueueCalls.push({ channel, phoneNumberId, conversationId, messageId, media });
+  };
+
+  messageRepository.findByExternalId = async () => ({
+    id: "existing-msg-1",
+    conversationId: "conv-existing-1",
+    payload: { type: "image" } // no mediaAsset link — the fetch never completed
+  });
+  messageRepository.create = async () => {
+    throw new Error("must not be called on replay");
+  };
+  contactRepository.findOrCreateByPhone = async () => {
+    throw new Error("must not be called on replay");
+  };
+
+  try {
+    registerWorkerConsumers({ eventBus: bus, resolveChannel, enqueueMediaFetch });
+    const handleInbound = bus.handlers.get(EventTopics.WhatsAppInboundReceived);
+
+    await handleInbound(
+      replayedInboundEvent({
+        media: { id: "wamid.media-orphan", mimeType: "image/jpeg", sha256: "abc123", filename: "photo.jpg" }
+      })
+    );
+
+    assert.equal(enqueueCalls.length, 1, "the orphaned media fetch must be re-enqueued");
+    assert.deepEqual(enqueueCalls[0].channel, { tenantId: "t-1", channelId: "c-1" });
+    assert.equal(enqueueCalls[0].phoneNumberId, "PN-1");
+    assert.equal(enqueueCalls[0].conversationId, "conv-existing-1", "must use the existing message's conversation");
+    assert.equal(enqueueCalls[0].messageId, "existing-msg-1", "must use the existing message's DB id");
+    assert.deepEqual(enqueueCalls[0].media, {
+      id: "wamid.media-orphan",
+      mimeType: "image/jpeg",
+      filename: "photo.jpg",
+      sha256: "abc123"
+    });
+  } finally {
+    messageRepository.findByExternalId = originalFindByExternalId;
+    messageRepository.create = originalCreate;
+    contactRepository.findOrCreateByPhone = originalFindOrCreateByPhone;
+  }
+});
+
+test("handleInbound replay: media present, existing mediaAsset link — does not re-enqueue", async () => {
+  const bus = createFakeBus();
+  const resolveChannel = async () => ({ tenantId: "t-1", channelId: "c-1" });
+
+  const originalFindByExternalId = messageRepository.findByExternalId;
+  const originalCreate = messageRepository.create;
+  const originalFindOrCreateByPhone = contactRepository.findOrCreateByPhone;
+
+  const enqueueCalls = [];
+  const enqueueMediaFetch = async (...args) => {
+    enqueueCalls.push(args);
+  };
+
+  messageRepository.findByExternalId = async () => ({
+    id: "existing-msg-2",
+    conversationId: "conv-existing-2",
+    payload: { type: "image", mediaAsset: { assetId: "asset-1", status: "stored" } }
+  });
+  messageRepository.create = async () => {
+    throw new Error("must not be called on replay");
+  };
+  contactRepository.findOrCreateByPhone = async () => {
+    throw new Error("must not be called on replay");
+  };
+
+  try {
+    registerWorkerConsumers({ eventBus: bus, resolveChannel, enqueueMediaFetch });
+    const handleInbound = bus.handlers.get(EventTopics.WhatsAppInboundReceived);
+
+    await handleInbound(
+      replayedInboundEvent({
+        media: { id: "wamid.media-linked", mimeType: "image/jpeg", sha256: "abc123", filename: "photo.jpg" }
+      })
+    );
+
+    assert.equal(enqueueCalls.length, 0, "an already-linked media asset must not be re-enqueued");
+  } finally {
+    messageRepository.findByExternalId = originalFindByExternalId;
+    messageRepository.create = originalCreate;
+    contactRepository.findOrCreateByPhone = originalFindOrCreateByPhone;
+  }
+});
+
+test("handleInbound replay: no media on the event — fast path, no enqueue and no extra repo reads", async () => {
+  const bus = createFakeBus();
+  const resolveChannel = async () => ({ tenantId: "t-1", channelId: "c-1" });
+
+  const originalFindByExternalId = messageRepository.findByExternalId;
+  const originalCreate = messageRepository.create;
+  const originalFindOrCreateByPhone = contactRepository.findOrCreateByPhone;
+
+  const enqueueCalls = [];
+  const enqueueMediaFetch = async (...args) => {
+    enqueueCalls.push(args);
+  };
+
+  let findByExternalIdCalls = 0;
+  messageRepository.findByExternalId = async () => {
+    findByExternalIdCalls++;
+    return { id: "existing-msg-3", conversationId: "conv-existing-3", payload: { type: "text" } };
+  };
+  messageRepository.create = async () => {
+    throw new Error("must not be called on replay");
+  };
+  contactRepository.findOrCreateByPhone = async () => {
+    throw new Error("must not be called on replay");
+  };
+
+  try {
+    registerWorkerConsumers({ eventBus: bus, resolveChannel, enqueueMediaFetch });
+    const handleInbound = bus.handlers.get(EventTopics.WhatsAppInboundReceived);
+
+    await handleInbound(replayedInboundEvent({ type: "text", text: "hi again" }));
+
+    assert.equal(enqueueCalls.length, 0, "no media on the event means nothing to re-enqueue");
+    assert.equal(findByExternalIdCalls, 1, "the guard's single lookup must not be followed by extra reads");
+  } finally {
+    messageRepository.findByExternalId = originalFindByExternalId;
+    messageRepository.create = originalCreate;
+    contactRepository.findOrCreateByPhone = originalFindOrCreateByPhone;
+  }
+});
