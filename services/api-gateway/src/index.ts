@@ -90,8 +90,7 @@ import {
   validateCampaignBody,
   validateTemplatePayload,
   validateLocationPayload,
-  validateContactsPayload,
-  findLastInboundExternalId
+  validateContactsPayload
 } from "./validation.js";
 import { filterSendableContacts } from "./campaign.js";
 import { canCreateContact, canCreateOrder } from "./authorization.js";
@@ -1054,14 +1053,12 @@ async function sendConversationMessage(
   return { status: 202, body: { status: "message_enqueued", kind } };
 }
 
-const TYPING_INDICATOR_LOOKBACK = 50;
-
 /**
  * Sends a best-effort typing indicator, bypassing the outbox entirely: an
  * ephemeral signal has no meaning once delayed by a retry/backoff cycle.
  * Meta's API only exposes this as an extension of the read-receipt call and
- * requires a real inbound message id, so this scans the conversation's
- * recent history (not persisted) for the most recent inbound message.
+ * requires a real inbound message id, so this resolves the conversation's
+ * most recent inbound message id directly (not persisted itself).
  */
 async function sendTypingIndicator(
   tenantId: string,
@@ -1071,15 +1068,19 @@ async function sendTypingIndicator(
   if (!conversation) {
     return { status: 404, body: { error: "Conversation not found" } };
   }
+  const contact = await contactRepository.getById(tenantId, conversation.contactId);
+  if (!contact) {
+    return { status: 409, body: { error: "Conversation has no contact" } };
+  }
+  if (contact.optedOut) {
+    return { status: 422, body: { error: "contact_opted_out" } };
+  }
   const channel = await channelRepository.getCredentials(tenantId, conversation.channelId);
   if (!channel) {
     return { status: 409, body: { error: "No active WhatsApp channel for this conversation" } };
   }
 
-  const recent = await messageRepository.listByConversation(tenantId, conversationId, {
-    limit: TYPING_INDICATOR_LOOKBACK
-  });
-  const lastInboundExternalId = findLastInboundExternalId(recent);
+  const lastInboundExternalId = await messageRepository.lastInboundExternalId(tenantId, conversationId);
   if (!lastInboundExternalId) {
     return { status: 409, body: { error: "no_recent_inbound_message" } };
   }

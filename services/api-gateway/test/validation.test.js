@@ -10,8 +10,7 @@ import {
   validateInteractivePayload,
   validateTemplatePayload,
   validateLocationPayload,
-  validateContactsPayload,
-  findLastInboundExternalId
+  validateContactsPayload
 } from "../dist/validation.js";
 
 test("parseListQuery clamps limit and defaults offset", () => {
@@ -374,6 +373,173 @@ test("validateTemplatePayload rejects a parameter entry longer than 1024 charact
   assert.match(result.error, /1024/);
 });
 
+test("validateTemplatePayload accepts a fully-populated components array and strips unknown fields", () => {
+  const result = validateTemplatePayload({
+    templateName: "shipping_update",
+    templateLanguage: "en_US",
+    components: [
+      {
+        type: "header",
+        parameters: [{ type: "image", image: { link: "https://example.com/img.png" } }],
+        extraField: "dropped"
+      },
+      {
+        type: "body",
+        parameters: [
+          { type: "text", text: "12345" },
+          { type: "currency", currency: { fallback_value: "$10.00", code: "USD", amount_1000: 10000 } },
+          { type: "date_time", date_time: { fallback_value: "2026-01-01" } },
+          { type: "payload", payload: "TRACK-1" }
+        ]
+      },
+      {
+        type: "button",
+        sub_type: "url",
+        index: 0,
+        parameters: [{ type: "text", text: "TRACK-1" }]
+      }
+    ]
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.value.components, [
+    { type: "header", parameters: [{ type: "image", image: { link: "https://example.com/img.png" } }] },
+    {
+      type: "body",
+      parameters: [
+        { type: "text", text: "12345" },
+        { type: "currency", currency: { fallback_value: "$10.00", code: "USD", amount_1000: 10000 } },
+        { type: "date_time", date_time: { fallback_value: "2026-01-01" } },
+        { type: "payload", payload: "TRACK-1" }
+      ]
+    },
+    { type: "button", sub_type: "url", index: 0, parameters: [{ type: "text", text: "TRACK-1" }] }
+  ]);
+});
+
+test("validateTemplatePayload rejects a non-array components field", () => {
+  const result = validateTemplatePayload({ templateName: "x", templateLanguage: "en_US", components: "not-an-array" });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /components/);
+});
+
+test("validateTemplatePayload rejects more than 10 components", () => {
+  const components = Array.from({ length: 11 }, () => ({ type: "body", parameters: [] }));
+  const result = validateTemplatePayload({ templateName: "x", templateLanguage: "en_US", components });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /components/);
+});
+
+test("validateTemplatePayload rejects an unknown component type", () => {
+  const result = validateTemplatePayload({
+    templateName: "x",
+    templateLanguage: "en_US",
+    components: [{ type: "footer", parameters: [] }]
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /type/);
+});
+
+test("validateTemplatePayload rejects an unknown component sub_type", () => {
+  const result = validateTemplatePayload({
+    templateName: "x",
+    templateLanguage: "en_US",
+    components: [{ type: "button", sub_type: "carousel", parameters: [] }]
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /sub_type/);
+});
+
+test("validateTemplatePayload rejects a negative or non-integer component index", () => {
+  const negative = validateTemplatePayload({
+    templateName: "x",
+    templateLanguage: "en_US",
+    components: [{ type: "button", index: -1, parameters: [] }]
+  });
+  assert.equal(negative.ok, false);
+  assert.match(negative.error, /index/);
+
+  const fractional = validateTemplatePayload({
+    templateName: "x",
+    templateLanguage: "en_US",
+    components: [{ type: "button", index: 1.5, parameters: [] }]
+  });
+  assert.equal(fractional.ok, false);
+  assert.match(fractional.error, /index/);
+});
+
+test("validateTemplatePayload rejects more than 20 parameters within a single component", () => {
+  const parameters = Array.from({ length: 21 }, () => ({ type: "text", text: "x" }));
+  const result = validateTemplatePayload({
+    templateName: "x",
+    templateLanguage: "en_US",
+    components: [{ type: "body", parameters }]
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /parameters/);
+});
+
+test("validateTemplatePayload rejects an unknown parameter type", () => {
+  const result = validateTemplatePayload({
+    templateName: "x",
+    templateLanguage: "en_US",
+    components: [{ type: "body", parameters: [{ type: "video_call" }] }]
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /type/);
+});
+
+test("validateTemplatePayload rejects a text parameter with no text field", () => {
+  const result = validateTemplatePayload({
+    templateName: "x",
+    templateLanguage: "en_US",
+    components: [{ type: "body", parameters: [{ type: "text" }] }]
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /text/);
+});
+
+test("validateTemplatePayload rejects a text parameter longer than 1024 characters", () => {
+  const result = validateTemplatePayload({
+    templateName: "x",
+    templateLanguage: "en_US",
+    components: [{ type: "body", parameters: [{ type: "text", text: "a".repeat(1025) }] }]
+  });
+  assert.equal(result.ok, false);
+});
+
+test("validateTemplatePayload rejects a currency parameter with a non-finite amount_1000", () => {
+  const result = validateTemplatePayload({
+    templateName: "x",
+    templateLanguage: "en_US",
+    components: [{ type: "body", parameters: [{ type: "currency", currency: { fallback_value: "$1", code: "USD" } }] }]
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /amount_1000/);
+});
+
+test("validateTemplatePayload rejects an image parameter with neither link nor id", () => {
+  const result = validateTemplatePayload({
+    templateName: "x",
+    templateLanguage: "en_US",
+    components: [{ type: "header", parameters: [{ type: "image", image: {} }] }]
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /image/);
+});
+
+test("validateTemplatePayload accepts a document parameter with id and filename, no link", () => {
+  const result = validateTemplatePayload({
+    templateName: "x",
+    templateLanguage: "en_US",
+    components: [{ type: "header", parameters: [{ type: "document", document: { id: "MID-1", filename: "f.pdf" } }] }]
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.value.components[0].parameters[0], {
+    type: "document",
+    document: { id: "MID-1", filename: "f.pdf" }
+  });
+});
+
 test("validateLocationPayload accepts a minimal valid payload", () => {
   const result = validateLocationPayload({ latitude: 37.4, longitude: -122.1 });
   assert.equal(result.ok, true);
@@ -500,30 +666,4 @@ test("validateContactsPayload omits empty phones/emails arrays from the cleaned 
   const result = validateContactsPayload([{ name: { formattedName: "Jane Doe" }, phones: [], emails: [] }]);
   assert.equal(result.ok, true);
   assert.deepEqual(result.value, [{ name: { formattedName: "Jane Doe" } }]);
-});
-
-test("findLastInboundExternalId returns the most recent inbound message's external id", () => {
-  const messages = [
-    { direction: "inbound", externalMessageId: "wamid.old" },
-    { direction: "outbound", externalMessageId: "wamid.reply" },
-    { direction: "inbound", externalMessageId: "wamid.newest" }
-  ];
-  assert.equal(findLastInboundExternalId(messages), "wamid.newest");
-});
-
-test("findLastInboundExternalId skips inbound messages with no externalMessageId", () => {
-  const messages = [{ direction: "inbound", externalMessageId: "wamid.old" }, { direction: "inbound" }];
-  assert.equal(findLastInboundExternalId(messages), "wamid.old");
-});
-
-test("findLastInboundExternalId returns undefined when there is no inbound message", () => {
-  const messages = [
-    { direction: "outbound", externalMessageId: "wamid.a" },
-    { direction: "outbound", externalMessageId: "wamid.b" }
-  ];
-  assert.equal(findLastInboundExternalId(messages), undefined);
-});
-
-test("findLastInboundExternalId returns undefined for an empty list", () => {
-  assert.equal(findLastInboundExternalId([]), undefined);
 });

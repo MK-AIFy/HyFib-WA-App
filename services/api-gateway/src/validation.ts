@@ -323,12 +323,158 @@ export interface TemplateSendPayload {
   components?: TemplateComponent[];
 }
 
+const TEMPLATE_COMPONENTS_MAX = 10;
+const TEMPLATE_COMPONENT_PARAMETERS_MAX = 20;
+const TEMPLATE_PARAMETER_TEXT_MAX = 1024;
+const TEMPLATE_CURRENCY_CODE_MAX = 10;
+const TEMPLATE_MEDIA_LINK_MAX = 2048;
+const TEMPLATE_MEDIA_ID_MAX = 256;
+const TEMPLATE_MEDIA_FILENAME_MAX = 256;
+const TEMPLATE_COMPONENT_TYPES = new Set(["header", "body", "button"]);
+const TEMPLATE_COMPONENT_SUB_TYPES = new Set(["url", "quick_reply"]);
+const TEMPLATE_PARAMETER_TYPES = new Set(["text", "currency", "date_time", "image", "document", "video", "payload"]);
+
+function validateTemplateParameter(input: unknown): ValidationResult<TemplateComponent["parameters"][number]> {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return { ok: false, error: "template.components[].parameters[] must be an object" };
+  }
+  const candidate = input as Record<string, unknown>;
+  if (typeof candidate.type !== "string" || !TEMPLATE_PARAMETER_TYPES.has(candidate.type)) {
+    return { ok: false, error: "template.components[].parameters[].type is invalid" };
+  }
+  const type = candidate.type as TemplateComponent["parameters"][number]["type"];
+
+  switch (type) {
+    case "text": {
+      const text = optionalString(candidate.text, TEMPLATE_PARAMETER_TEXT_MAX, "template parameter text");
+      if (text.error || text.value === undefined) {
+        return { ok: false, error: text.error ?? "template.components[].parameters[].text is required for type text" };
+      }
+      return { ok: true, value: { type, text: text.value } };
+    }
+    case "payload": {
+      const payload = optionalString(candidate.payload, TEMPLATE_PARAMETER_TEXT_MAX, "template parameter payload");
+      if (payload.error || payload.value === undefined) {
+        return {
+          ok: false,
+          error: payload.error ?? "template.components[].parameters[].payload is required for type payload"
+        };
+      }
+      return { ok: true, value: { type, payload: payload.value } };
+    }
+    case "currency": {
+      const currency = candidate.currency as Record<string, unknown> | undefined;
+      const fallback = optionalString(currency?.fallback_value, TEMPLATE_PARAMETER_TEXT_MAX, "currency.fallback_value");
+      const code = optionalString(currency?.code, TEMPLATE_CURRENCY_CODE_MAX, "currency.code");
+      if (!currency || fallback.error || fallback.value === undefined || code.error || code.value === undefined) {
+        return { ok: false, error: fallback.error ?? code.error ?? "template parameter currency is malformed" };
+      }
+      const amount = currency.amount_1000;
+      if (typeof amount !== "number" || !Number.isFinite(amount)) {
+        return { ok: false, error: "template parameter currency.amount_1000 must be a finite number" };
+      }
+      return {
+        ok: true,
+        value: { type, currency: { fallback_value: fallback.value, code: code.value, amount_1000: amount } }
+      };
+    }
+    case "date_time": {
+      const dateTime = candidate.date_time as Record<string, unknown> | undefined;
+      const fallback = optionalString(
+        dateTime?.fallback_value,
+        TEMPLATE_PARAMETER_TEXT_MAX,
+        "date_time.fallback_value"
+      );
+      if (!dateTime || fallback.error || fallback.value === undefined) {
+        return { ok: false, error: fallback.error ?? "template parameter date_time.fallback_value is required" };
+      }
+      return { ok: true, value: { type, date_time: { fallback_value: fallback.value } } };
+    }
+    case "image":
+    case "video": {
+      const media = candidate[type] as Record<string, unknown> | undefined;
+      const link = optionalString(media?.link, TEMPLATE_MEDIA_LINK_MAX, `${type}.link`);
+      const id = optionalString(media?.id, TEMPLATE_MEDIA_ID_MAX, `${type}.id`);
+      if (link.error || id.error || (link.value === undefined && id.value === undefined)) {
+        return { ok: false, error: link.error ?? id.error ?? `template parameter ${type} requires a link or id` };
+      }
+      return {
+        ok: true,
+        value: { type, [type]: { ...(link.value ? { link: link.value } : {}), ...(id.value ? { id: id.value } : {}) } }
+      };
+    }
+    case "document": {
+      const media = candidate.document as Record<string, unknown> | undefined;
+      const link = optionalString(media?.link, TEMPLATE_MEDIA_LINK_MAX, "document.link");
+      const id = optionalString(media?.id, TEMPLATE_MEDIA_ID_MAX, "document.id");
+      const filename = optionalString(media?.filename, TEMPLATE_MEDIA_FILENAME_MAX, "document.filename");
+      if (link.error || id.error || filename.error || (link.value === undefined && id.value === undefined)) {
+        return {
+          ok: false,
+          error: link.error ?? id.error ?? filename.error ?? "template parameter document requires a link or id"
+        };
+      }
+      return {
+        ok: true,
+        value: {
+          type,
+          document: {
+            ...(link.value ? { link: link.value } : {}),
+            ...(id.value ? { id: id.value } : {}),
+            ...(filename.value ? { filename: filename.value } : {})
+          }
+        }
+      };
+    }
+  }
+}
+
+function validateTemplateComponents(input: unknown): ValidationResult<TemplateComponent[]> {
+  if (!Array.isArray(input) || input.length > TEMPLATE_COMPONENTS_MAX) {
+    return { ok: false, error: `template.components must be an array of at most ${TEMPLATE_COMPONENTS_MAX} entries` };
+  }
+  const cleanComponents: TemplateComponent[] = [];
+  for (const entry of input) {
+    const candidate = entry as Record<string, unknown>;
+    if (typeof candidate?.type !== "string" || !TEMPLATE_COMPONENT_TYPES.has(candidate.type)) {
+      return { ok: false, error: 'template.components[].type must be "header", "body" or "button"' };
+    }
+    if (candidate.sub_type !== undefined && !TEMPLATE_COMPONENT_SUB_TYPES.has(candidate.sub_type as string)) {
+      return { ok: false, error: 'template.components[].sub_type must be "url" or "quick_reply"' };
+    }
+    if (candidate.index !== undefined && (!Number.isInteger(candidate.index) || (candidate.index as number) < 0)) {
+      return { ok: false, error: "template.components[].index must be a non-negative integer" };
+    }
+    const parametersRaw = candidate.parameters;
+    if (!Array.isArray(parametersRaw) || parametersRaw.length > TEMPLATE_COMPONENT_PARAMETERS_MAX) {
+      return {
+        ok: false,
+        error: `template.components[].parameters must be an array of at most ${TEMPLATE_COMPONENT_PARAMETERS_MAX} entries`
+      };
+    }
+    const cleanParameters = [];
+    for (const param of parametersRaw) {
+      const validated = validateTemplateParameter(param);
+      if (!validated.ok) {
+        return validated;
+      }
+      cleanParameters.push(validated.value);
+    }
+    cleanComponents.push({
+      type: candidate.type as TemplateComponent["type"],
+      ...(candidate.sub_type !== undefined ? { sub_type: candidate.sub_type as TemplateComponent["sub_type"] } : {}),
+      ...(candidate.index !== undefined ? { index: candidate.index as number } : {}),
+      parameters: cleanParameters
+    });
+  }
+  return { ok: true, value: cleanComponents };
+}
+
 /**
  * Validates a template-send request for the agent conversation-send route.
- * Trims templateName/templateLanguage; `parameters`/`components` pass through
- * unmodified when present (`components`, if malformed, is caught downstream
- * by the meta-adapter's Graph call — this route only bounds the caller input
- * enough to prevent abuse, mirroring validateInteractivePayload).
+ * Trims templateName/templateLanguage; `components`, when present, is
+ * deeply validated and stripped of unknown fields the same way
+ * validateInteractivePayload strips its own caller input.
  */
 export function validateTemplatePayload(input: unknown): ValidationResult<TemplateSendPayload> {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
@@ -366,7 +512,11 @@ export function validateTemplatePayload(input: unknown): ValidationResult<Templa
   }
 
   if (candidate.components !== undefined) {
-    value.components = candidate.components as TemplateComponent[];
+    const componentsCheck = validateTemplateComponents(candidate.components);
+    if (!componentsCheck.ok) {
+      return { ok: false, error: componentsCheck.error };
+    }
+    value.components = componentsCheck.value;
   }
 
   return { ok: true, value };
@@ -522,23 +672,4 @@ export function validateContactsPayload(input: unknown): ValidationResult<WhatsA
   }
 
   return { ok: true, value: cleanContacts };
-}
-
-/**
- * Scans a chronologically-ordered (oldest-first) message list, as returned
- * by messageRepository.listByConversation, for the external id of the most
- * recent inbound message. Used to resolve the message id a typing indicator
- * must reference (Meta only exposes typing indicators as read-receipt
- * extensions, which require a real inbound message id).
- */
-export function findLastInboundExternalId(
-  messages: Array<{ direction: string; externalMessageId?: string }>
-): string | undefined {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const candidate = messages[i]!;
-    if (candidate.direction === "inbound" && candidate.externalMessageId) {
-      return candidate.externalMessageId;
-    }
-  }
-  return undefined;
 }
