@@ -36,6 +36,7 @@ import {
   buildProductMessage,
   buildTemplateBody,
   buildTextBody,
+  buildTypingIndicatorBody,
   extractTemplateBody,
   mapMetaTemplateStatus
 } from "./graph-messages.js";
@@ -285,6 +286,38 @@ export async function markReadDirect(
 }
 
 /**
+ * Direct in-process typing indicator. Mirrors `markReadDirect`'s shape —
+ * best-effort, never routed through the outbox since a typing indicator has
+ * no meaning once delayed.
+ */
+export async function sendTypingIndicatorDirect(
+  payload: WhatsAppMarkReadRequest,
+  _requestId: string
+): Promise<MetaDispatchResult> {
+  if (!payload.phoneNumberId || !payload.messageId) {
+    return { status: 400, body: { error: "phoneNumberId and messageId are required" } };
+  }
+  try {
+    const response = await graphRequest(
+      `/${payload.phoneNumberId}/messages`,
+      "POST",
+      buildTypingIndicatorBody(payload.messageId),
+      payload.accessToken
+    );
+    if (!response.ok) {
+      const graphError = await parseGraphError(response);
+      return { status: 502, body: { error: "meta_typing_indicator_failed", details: graphError } };
+    }
+    return { status: 200, body: { status: "typing_indicator_sent", messageId: payload.messageId } };
+  } catch (error) {
+    return {
+      status: 503,
+      body: { error: "meta_adapter_unavailable", details: error instanceof Error ? error.message : String(error) }
+    };
+  }
+}
+
+/**
  * Route an internal `/internal/v1/whatsapp/*` send/mark-read request to the
  * matching Graph builder + send, returning the same status/body the HTTP
  * endpoint produces. The worker calls this in-process in the monolith instead
@@ -459,6 +492,9 @@ export async function metaDispatch(
 
     case "/internal/v1/whatsapp/mark-read":
       return markReadDirect(payload as unknown as WhatsAppMarkReadRequest, requestId);
+
+    case "/internal/v1/whatsapp/send-typing":
+      return sendTypingIndicatorDirect(payload as unknown as WhatsAppMarkReadRequest, requestId);
 
     default:
       return { status: 404, body: { error: "unknown_meta_endpoint", endpoint } };
@@ -856,6 +892,17 @@ const server = createServer(async (req, res) => {
       }
       const payload = await readJsonBody<WhatsAppMarkReadRequest>(req);
       const { status, body } = await markReadDirect(payload, ctx.requestId);
+      sendJson(res, status, body);
+      return;
+    }
+
+    if (path === "/internal/v1/whatsapp/send-typing") {
+      if (method !== "POST") {
+        methodNotAllowed(res);
+        return;
+      }
+      const payload = await readJsonBody<WhatsAppMarkReadRequest>(req);
+      const { status, body } = await sendTypingIndicatorDirect(payload, ctx.requestId);
       sendJson(res, status, body);
       return;
     }

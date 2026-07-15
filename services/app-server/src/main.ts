@@ -19,7 +19,8 @@ import {
   type IngestWebhookProxy,
   type ReportsOverviewProxy,
   type UsageProxy,
-  type AiProxy
+  type AiProxy,
+  type SendTypingIndicatorProxy
 } from "@hyfib/api-gateway";
 import { processForwardedWebhook } from "@hyfib/webhook-ingestor";
 import { createDurableWebhookBus } from "./webhook-outbox-bus.js";
@@ -40,6 +41,8 @@ export interface AppServerDeps {
   proxyReportsOverview?: ReportsOverviewProxy;
   proxyUsage?: UsageProxy;
   proxyAi?: AiProxy;
+  /** Direct in-process typing-indicator send; when omitted the gateway proxies over HTTP. */
+  proxySendTypingIndicator?: SendTypingIndicatorProxy;
 }
 
 export interface AppServer {
@@ -61,7 +64,8 @@ export function createAppServer(deps: AppServerDeps): AppServer {
     proxyWebhookToIngestor: deps.proxyWebhookToIngestor,
     proxyReportsOverview: deps.proxyReportsOverview,
     proxyUsage: deps.proxyUsage,
-    proxyAi: deps.proxyAi
+    proxyAi: deps.proxyAi,
+    proxySendTypingIndicator: deps.proxySendTypingIndicator
   });
 
   const server = createServer((req, res) => {
@@ -133,7 +137,11 @@ async function main(): Promise<void> {
     // Direct in-process calls to the former read/AI services (no HTTP hop).
     proxyReportsOverview: async (ctx) => ({ status: 200, body: await getReportsOverview(ctx.tenantId) }),
     proxyUsage: async (ctx, days) => ({ status: 200, body: await getUsage(ctx.tenantId, days) }),
-    proxyAi: async (ctx, aiPath, method, rawBody) => dispatchAi(aiPath, method, rawBody, ctx.requestId)
+    proxyAi: async (ctx, aiPath, method, rawBody) => dispatchAi(aiPath, method, rawBody, ctx.requestId),
+    proxySendTypingIndicator: async (params) => {
+      const { status, body } = await metaDispatch("/internal/v1/whatsapp/send-typing", params, randomUUID());
+      return { status, body: body as Record<string, unknown> };
+    }
   });
 
   // Register worker consumers on the shared bus with a direct in-process meta

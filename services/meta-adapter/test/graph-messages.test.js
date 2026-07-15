@@ -8,6 +8,7 @@ import {
   buildLocationBody,
   buildContactsBody,
   buildMarkReadBody,
+  buildTypingIndicatorBody,
   buildMediaUploadForm,
   mapMetaTemplateStatus,
   extractTemplateBody,
@@ -171,6 +172,15 @@ test("mark-read body", () => {
     messaging_product: "whatsapp",
     status: "read",
     message_id: "wamid.1"
+  });
+});
+
+test("typing indicator body sets status read and typing_indicator type", () => {
+  assert.deepEqual(buildTypingIndicatorBody("wamid.1"), {
+    messaging_product: "whatsapp",
+    status: "read",
+    message_id: "wamid.1",
+    typing_indicator: { type: "text" }
   });
 });
 

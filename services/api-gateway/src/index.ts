@@ -90,7 +90,8 @@ import {
   validateCampaignBody,
   validateTemplatePayload,
   validateLocationPayload,
-  validateContactsPayload
+  validateContactsPayload,
+  findLastInboundExternalId
 } from "./validation.js";
 import { filterSendableContacts } from "./campaign.js";
 import { canCreateContact, canCreateOrder } from "./authorization.js";
@@ -359,6 +360,44 @@ async function defaultAiProxy(
 let reportsOverviewProxy: ReportsOverviewProxy = defaultReportsOverviewProxy;
 let usageProxy: UsageProxy = defaultUsageProxy;
 let aiProxy: AiProxy = defaultAiProxy;
+
+/**
+ * Direct proxy to meta-adapter's typing-indicator send, bypassing the
+ * outbox: a typing indicator is ephemeral and has no meaning once delayed
+ * by a retry/backoff cycle, so it is sent best-effort and never durably
+ * queued. Injectable so the monolith swaps in an in-process metaDispatch
+ * call instead of an HTTP hop.
+ */
+export type SendTypingIndicatorProxy = (params: {
+  phoneNumberId: string;
+  messageId: string;
+  accessToken?: string;
+}) => Promise<{ status: number; body: Record<string, unknown> }>;
+
+async function defaultSendTypingIndicatorProxy(params: {
+  phoneNumberId: string;
+  messageId: string;
+  accessToken?: string;
+}): Promise<{ status: number; body: Record<string, unknown> }> {
+  const upstream = await fetch(`${config.metaAdapterUrl}/internal/v1/whatsapp/send-typing`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-request-id": randomUUID(),
+      "x-internal-secret": config.internalServiceSecret
+    },
+    body: JSON.stringify({
+      phoneNumberId: params.phoneNumberId,
+      messageId: params.messageId,
+      accessToken: params.accessToken
+    }),
+    signal: AbortSignal.timeout(10_000)
+  });
+  const body = (await upstream.json()) as Record<string, unknown>;
+  return { status: upstream.status, body };
+}
+
+let sendTypingIndicatorProxy: SendTypingIndicatorProxy = defaultSendTypingIndicatorProxy;
 
 const E164 = /^\+[1-9]\d{7,14}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -1013,6 +1052,47 @@ async function sendConversationMessage(
     });
   });
   return { status: 202, body: { status: "message_enqueued", kind } };
+}
+
+const TYPING_INDICATOR_LOOKBACK = 50;
+
+/**
+ * Sends a best-effort typing indicator, bypassing the outbox entirely: an
+ * ephemeral signal has no meaning once delayed by a retry/backoff cycle.
+ * Meta's API only exposes this as an extension of the read-receipt call and
+ * requires a real inbound message id, so this scans the conversation's
+ * recent history (not persisted) for the most recent inbound message.
+ */
+async function sendTypingIndicator(
+  tenantId: string,
+  conversationId: string
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const conversation = await conversationRepository.getById(tenantId, conversationId);
+  if (!conversation) {
+    return { status: 404, body: { error: "Conversation not found" } };
+  }
+  const channel = await channelRepository.getCredentials(tenantId, conversation.channelId);
+  if (!channel) {
+    return { status: 409, body: { error: "No active WhatsApp channel for this conversation" } };
+  }
+
+  const recent = await messageRepository.listByConversation(tenantId, conversationId, {
+    limit: TYPING_INDICATOR_LOOKBACK
+  });
+  const lastInboundExternalId = findLastInboundExternalId(recent);
+  if (!lastInboundExternalId) {
+    return { status: 409, body: { error: "no_recent_inbound_message" } };
+  }
+
+  const { status, body } = await sendTypingIndicatorProxy({
+    phoneNumberId: channel.phoneNumberId,
+    messageId: lastInboundExternalId,
+    accessToken: channel.accessToken
+  });
+  if (status !== 200) {
+    return { status: 502, body: { error: "typing_indicator_failed", detail: body } };
+  }
+  return { status: 202, body: { status: "typing_indicator_sent" } };
 }
 
 // ─── Outbox relay ──────────────────────────────────────────────────────────────
@@ -2987,6 +3067,25 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
 
+  if (path.startsWith("/api/v1/conversations/") && path.endsWith("/typing")) {
+    const conversationId = extractPathSegment(path, "/api/v1/conversations/");
+    if (!conversationId || !UUID.test(conversationId)) {
+      sendJson(res, 400, { error: "Invalid conversation id" });
+      return;
+    }
+    if (method !== "POST") {
+      sendJson(res, 405, { error: "Method not allowed" });
+      return;
+    }
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager", "sales_agent", "support_agent"])) {
+      sendJson(res, 403, { error: "Insufficient role to send a typing indicator" });
+      return;
+    }
+    const result = await sendTypingIndicator(tenantId, conversationId);
+    sendJson(res, result.status, result.body);
+    return;
+  }
+
   // ─── Media serving ────────────────────────────────────────────────────────
   if (path.startsWith("/api/v1/media/") && method === "GET") {
     const assetId = extractPathSegment(path, "/api/v1/media/");
@@ -3494,6 +3593,8 @@ export interface GatewayDeps {
   proxyUsage?: UsageProxy;
   /** Direct in-process AI intelligence (Phase 6). */
   proxyAi?: AiProxy;
+  /** Direct in-process typing-indicator send (no HTTP hop to meta-adapter). */
+  proxySendTypingIndicator?: SendTypingIndicatorProxy;
 }
 
 export interface GatewayModule {
@@ -3525,6 +3626,9 @@ export function createGatewayHandler(deps: GatewayDeps = {}): GatewayModule {
   }
   if (deps.proxyAi) {
     aiProxy = deps.proxyAi;
+  }
+  if (deps.proxySendTypingIndicator) {
+    sendTypingIndicatorProxy = deps.proxySendTypingIndicator;
   }
   registerSseForwarding();
   return {

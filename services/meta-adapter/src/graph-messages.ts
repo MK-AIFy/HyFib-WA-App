@@ -316,6 +316,20 @@ export function buildMarkReadBody(messageId: string): Record<string, unknown> {
   };
 }
 
+/**
+ * Marks the referenced inbound message read and shows the typing indicator
+ * to the customer. Meta only exposes typing indicators as an extension of
+ * the read-receipt call — there is no standalone "start typing" endpoint.
+ */
+export function buildTypingIndicatorBody(messageId: string): Record<string, unknown> {
+  return {
+    messaging_product: "whatsapp",
+    status: "read",
+    message_id: messageId,
+    typing_indicator: { type: "text" }
+  };
+}
+
 /** Maps Meta's template status strings onto our local enum. */
 export function mapMetaTemplateStatus(status: string | undefined): "approved" | "rejected" | "pending" | "paused" {
   switch ((status ?? "").toUpperCase()) {

@@ -10,7 +10,8 @@ import {
   validateInteractivePayload,
   validateTemplatePayload,
   validateLocationPayload,
-  validateContactsPayload
+  validateContactsPayload,
+  findLastInboundExternalId
 } from "../dist/validation.js";
 
 test("parseListQuery clamps limit and defaults offset", () => {
@@ -499,4 +500,30 @@ test("validateContactsPayload omits empty phones/emails arrays from the cleaned 
   const result = validateContactsPayload([{ name: { formattedName: "Jane Doe" }, phones: [], emails: [] }]);
   assert.equal(result.ok, true);
   assert.deepEqual(result.value, [{ name: { formattedName: "Jane Doe" } }]);
+});
+
+test("findLastInboundExternalId returns the most recent inbound message's external id", () => {
+  const messages = [
+    { direction: "inbound", externalMessageId: "wamid.old" },
+    { direction: "outbound", externalMessageId: "wamid.reply" },
+    { direction: "inbound", externalMessageId: "wamid.newest" }
+  ];
+  assert.equal(findLastInboundExternalId(messages), "wamid.newest");
+});
+
+test("findLastInboundExternalId skips inbound messages with no externalMessageId", () => {
+  const messages = [{ direction: "inbound", externalMessageId: "wamid.old" }, { direction: "inbound" }];
+  assert.equal(findLastInboundExternalId(messages), "wamid.old");
+});
+
+test("findLastInboundExternalId returns undefined when there is no inbound message", () => {
+  const messages = [
+    { direction: "outbound", externalMessageId: "wamid.a" },
+    { direction: "outbound", externalMessageId: "wamid.b" }
+  ];
+  assert.equal(findLastInboundExternalId(messages), undefined);
+});
+
+test("findLastInboundExternalId returns undefined for an empty list", () => {
+  assert.equal(findLastInboundExternalId([]), undefined);
 });

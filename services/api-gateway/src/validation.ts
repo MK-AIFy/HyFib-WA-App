@@ -523,3 +523,22 @@ export function validateContactsPayload(input: unknown): ValidationResult<WhatsA
 
   return { ok: true, value: cleanContacts };
 }
+
+/**
+ * Scans a chronologically-ordered (oldest-first) message list, as returned
+ * by messageRepository.listByConversation, for the external id of the most
+ * recent inbound message. Used to resolve the message id a typing indicator
+ * must reference (Meta only exposes typing indicators as read-receipt
+ * extensions, which require a real inbound message id).
+ */
+export function findLastInboundExternalId(
+  messages: Array<{ direction: string; externalMessageId?: string }>
+): string | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const candidate = messages[i]!;
+    if (candidate.direction === "inbound" && candidate.externalMessageId) {
+      return candidate.externalMessageId;
+    }
+  }
+  return undefined;
+}
