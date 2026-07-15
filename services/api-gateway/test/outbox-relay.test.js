@@ -128,6 +128,27 @@ test("dead transition: a row at attempts=7 (max 8) takes the dead counter/log pa
   assert.equal(logger.error_calls[0].message, "outbox_row_dead");
   assert.equal(logger.error_calls[0].metadata.attempts, 8);
   assert.equal(logger.error_calls[0].metadata.id, "poison");
+  assert.equal(logger.error_calls[0].metadata.published, false, "publish threw, so the dead row was never on the bus");
+});
+
+test("dead transition after a successful publish (markProcessed failed) reports published:true", async () => {
+  // The operationally critical distinction: this row IS on the bus (the
+  // duplicate will be absorbed by idempotent consumers), it is not lost.
+  const logger = fakeLogger();
+  await runOutboxRelayOnce({
+    claim: async () => [row({ id: "mp-dead", attempts: 7 })],
+    publish: async () => {},
+    markProcessed: async () => {
+      throw new Error("db_write_failed");
+    },
+    markFailed: async () => {},
+    logger
+  });
+
+  assert.equal(logger.warn_calls.length, 0);
+  assert.equal(logger.error_calls.length, 1);
+  assert.equal(logger.error_calls[0].message, "outbox_row_dead");
+  assert.equal(logger.error_calls[0].metadata.published, true, "the message reached the bus before the row died");
 });
 
 test("markFailed throwing does not prevent processing of subsequent rows", async () => {
@@ -175,4 +196,48 @@ test("claim() throwing resolves without an unhandled rejection", async () => {
   assert.equal(logger.error_calls.length, 1);
   assert.equal(logger.error_calls[0].message, "outbox_relay_error");
   assert.equal(logger.error_calls[0].metadata.error, "connection refused");
+});
+
+test("publish failure logs outbox_publish_failed, not the mark-processed label", async () => {
+  const logger = fakeLogger();
+  await runOutboxRelayOnce({
+    claim: async () => [row({ id: "pub-fail" })],
+    publish: async () => {
+      throw new Error("bus_down");
+    },
+    markProcessed: async () => {
+      throw new Error("must not be called when publish failed");
+    },
+    markFailed: async () => {},
+    logger
+  });
+
+  assert.equal(logger.warn_calls.length, 1);
+  assert.equal(logger.warn_calls[0].message, "outbox_publish_failed");
+  assert.equal(logger.warn_calls[0].metadata.error, "bus_down");
+});
+
+test("markProcessed failure after a successful publish logs outbox_mark_processed_failed and still walks the markFailed retry path", async () => {
+  const logger = fakeLogger();
+  const markFailedIds = [];
+  let publishCount = 0;
+  await runOutboxRelayOnce({
+    claim: async () => [row({ id: "mp-fail" })],
+    publish: async () => {
+      publishCount += 1;
+    },
+    markProcessed: async () => {
+      throw new Error("db_write_failed");
+    },
+    markFailed: async (id) => {
+      markFailedIds.push(id);
+    },
+    logger
+  });
+
+  assert.equal(publishCount, 1);
+  assert.deepEqual(markFailedIds, ["mp-fail"]);
+  assert.equal(logger.warn_calls.length, 1);
+  assert.equal(logger.warn_calls[0].message, "outbox_mark_processed_failed");
+  assert.equal(logger.warn_calls[0].metadata.error, "db_write_failed");
 });

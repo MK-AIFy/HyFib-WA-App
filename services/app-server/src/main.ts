@@ -23,6 +23,7 @@ import {
 } from "@hyfib/api-gateway";
 import { processForwardedWebhook } from "@hyfib/webhook-ingestor";
 import { createDurableWebhookBus } from "./webhook-outbox-bus.js";
+import { createIngestWebhookProxy } from "./ingest-proxy.js";
 import { fetchMediaDirect, metaDispatch } from "@hyfib/meta-adapter";
 import { registerWorkerConsumers, type WorkerMetaClient } from "@hyfib/notification-worker";
 import { getReportsOverview } from "@hyfib/reporting-service";
@@ -116,15 +117,14 @@ async function main(): Promise<void> {
       ),
     logger
   });
-  const proxyWebhookToIngestor: IngestWebhookProxy = async (forwarded) => {
-    const { verified, summary } = await processForwardedWebhook(forwarded, {
+  const proxyWebhookToIngestor: IngestWebhookProxy = createIngestWebhookProxy((forwarded) =>
+    processForwardedWebhook(forwarded, {
       eventBus: durableWebhookBus,
       idempotency: webhookIdempotency,
       metaAppSecret: config.metaAppSecret,
       logger
-    });
-    return { ok: verified, body: { status: verified ? "accepted" : "invalid_signature", ...summary } };
-  };
+    })
+  );
 
   const { server, gateway, shutdown } = createAppServer({
     logger,

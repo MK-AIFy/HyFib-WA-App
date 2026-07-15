@@ -87,12 +87,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build api-gateway image
-        run: docker build -f services/api-gateway/Dockerfile -t hyfib/api-gateway:ci .
+      # app-server is the shipped production artifact (modular monolith);
+      # scanning api-gateway's image covered a container we no longer deploy.
+      - name: Build app-server image
+        run: docker build -f services/app-server/Dockerfile -t hyfib/app-server:ci .
       - name: Trivy scan
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: hyfib/api-gateway:ci
+          image-ref: hyfib/app-server:ci
           severity: CRITICAL
           ignore-unfixed: true
           exit-code: "1"

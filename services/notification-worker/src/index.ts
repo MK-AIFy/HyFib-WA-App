@@ -514,10 +514,15 @@ async function handleOutbound(event: EventEnvelope): Promise<void> {
   // place — it's the 24h dedupe record.
   let result: { messageId?: string; accepted: boolean };
   let persistedPayload: Record<string, unknown>;
+  // Distinguishes pre-send failures (channel resolution, payload building →
+  // outbound_send_failed) from the adapter call itself (outbound_adapter_failed)
+  // so dashboards don't blame the meta-adapter for local preparation errors.
+  let adapterCallStarted = false;
   try {
     const channel = await resolveSendChannel(command.tenantId, command.channelId);
     const call = buildOutboundAdapterCall(command, channel);
     persistedPayload = call.persistedPayload;
+    adapterCallStarted = true;
     result = await callMetaAdapter(call.endpoint, command.tenantId, call.payload);
   } catch (error) {
     if (claimKey) {
@@ -529,7 +534,7 @@ async function handleOutbound(event: EventEnvelope): Promise<void> {
         })
       );
     }
-    logger.error("outbound_adapter_failed", {
+    logger.error(adapterCallStarted ? "outbound_adapter_failed" : "outbound_send_failed", {
       conversationId: command.conversationId,
       error: error instanceof Error ? error.message : String(error)
     });

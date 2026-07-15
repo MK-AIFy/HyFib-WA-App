@@ -117,6 +117,54 @@ test("orgName set and different calls updateTenant once and returns renamed tena
   assert.equal(result.name, "New Name");
 });
 
+test("empty-string ORG_TENANT_ID falls through to active scan, never getTenantById", async () => {
+  const active = tenant({ id: "active-1" });
+  let getByIdCalled = false;
+  const deps = makeDeps({
+    env: { orgTenantId: "" },
+    getTenantById: async () => {
+      getByIdCalled = true;
+      return undefined;
+    },
+    listTenants: async () => [active]
+  });
+
+  const result = await resolveOrgTenant(deps);
+
+  assert.deepEqual(result, active);
+  assert.equal(getByIdCalled, false);
+});
+
+test("whitespace-only ORG_TENANT_ID falls through to active scan, never getTenantById", async () => {
+  const active = tenant({ id: "active-1" });
+  let getByIdCalled = false;
+  const deps = makeDeps({
+    env: { orgTenantId: "   " },
+    getTenantById: async () => {
+      getByIdCalled = true;
+      return undefined;
+    },
+    listTenants: async () => [active]
+  });
+
+  const result = await resolveOrgTenant(deps);
+
+  assert.deepEqual(result, active);
+  assert.equal(getByIdCalled, false);
+});
+
+test("whitespace-only ORG_NAME is treated as unset and never calls updateTenant", async () => {
+  const original = tenant({ id: "org-1", name: "Keep Me" });
+  const deps = makeDeps({
+    env: { orgTenantId: original.id, orgName: "   " },
+    getTenantById: async () => original
+  });
+
+  const result = await resolveOrgTenant(deps);
+
+  assert.deepEqual(result, original);
+});
+
 test("orgName equal to current name does not call updateTenant", async () => {
   const original = tenant({ id: "org-1", name: "Same Name" });
   const deps = makeDeps({

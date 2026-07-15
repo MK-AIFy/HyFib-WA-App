@@ -2965,10 +2965,12 @@ function mapMediaAssetMeta(row: MediaAssetMetaRow): MediaAssetMeta {
  */
 export const mediaRepository = {
   /**
-   * Creates the pending row for a newly-seen (tenant, metaMediaId), or is a
-   * no-op re-affirmation if it already exists. `message_id` is COALESCEd so
-   * a later webhook referencing the same media id never clobbers the
-   * message that first introduced it.
+   * Creates the pending row for a newly-seen (tenant, metaMediaId), or
+   * re-affirms it if it already exists. All conflict updates are
+   * fill-if-null (COALESCE with the existing value first): `message_id`
+   * keeps the message that first introduced the media, and later-arriving
+   * `mime_type`/`filename`/`sha256` metadata enriches a row that was first
+   * seen without it but never overwrites values already present.
    */
   async upsertPending(
     tenantId: string,
@@ -2986,7 +2988,10 @@ export const mediaRepository = {
         `INSERT INTO media_assets (tenant_id, meta_media_id, message_id, conversation_id, mime_type, filename, sha256)
          VALUES ($1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT (tenant_id, meta_media_id) DO UPDATE
-           SET message_id = COALESCE(media_assets.message_id, EXCLUDED.message_id)
+           SET message_id = COALESCE(media_assets.message_id, EXCLUDED.message_id),
+               mime_type = COALESCE(media_assets.mime_type, EXCLUDED.mime_type),
+               filename = COALESCE(media_assets.filename, EXCLUDED.filename),
+               sha256 = COALESCE(media_assets.sha256, EXCLUDED.sha256)
          RETURNING id, status`,
         [
           tenantId,
@@ -3041,7 +3046,21 @@ export const mediaRepository = {
       return result.rows[0] ? mapMediaAssetMeta(result.rows[0]) : undefined;
     });
   },
-  /** Fetches the bytes + serving metadata for the gateway serve route (later task). Null-safe when still `pending`. */
+  /**
+   * Fetches the bytes + serving metadata for the gateway serve route.
+   * Null-safe when still `pending`.
+   *
+   * Storage seam: bytes live inline in Postgres (media_assets.bytes BYTEA)
+   * and this method materializes the whole asset in memory in one query —
+   * fine at current volumes (WhatsApp media caps at ~100MB, typical assets
+   * are far smaller), but there is no streaming and no HTTP Range support.
+   * If media volume grows, swap the substrate behind THIS method (and
+   * markStored above): store bytes in object storage (e.g. S3), keep the
+   * media_assets row as metadata + object key, and have getForServing
+   * return a stream/presigned locator instead of a Buffer. Callers only
+   * touch mediaRepository — no gateway route changes needed beyond the
+   * response plumbing.
+   */
   async getForServing(tenantId: string, id: string): Promise<MediaAssetForServing | undefined> {
     return withTenant(tenantId, async (client) => {
       const result = await client.query<{

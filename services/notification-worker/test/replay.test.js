@@ -470,3 +470,92 @@ test("handleInbound replay: no media on the event — fast path, no enqueue and 
     contactRepository.findOrCreateByPhone = originalFindOrCreateByPhone;
   }
 });
+
+/**
+ * Captures structured log lines (shared-core Logger writes JSON to
+ * process.stdout) so tests can assert on log labels. Restores the original
+ * sink in restore(); keep the captured window as narrow as possible so test
+ * reporter output is not swallowed.
+ */
+function captureStdout() {
+  const lines = [];
+  const original = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk) => {
+    lines.push(String(chunk));
+    return true;
+  };
+  return {
+    labels: () =>
+      lines
+        .map((line) => {
+          try {
+            return JSON.parse(line).message;
+          } catch {
+            return undefined;
+          }
+        })
+        .filter(Boolean),
+    restore: () => {
+      process.stdout.write = original;
+    }
+  };
+}
+
+test("handleOutbound: adapter-call failure logs outbound_adapter_failed, not outbound_send_failed", async () => {
+  const bus = createFakeBus();
+  const redis = createFakeRedis();
+  const metaClient = createFakeMetaClient(async () => {
+    throw new Error("meta_adapter_rejected_500");
+  });
+
+  const originalGetCredentials = channelRepository.getCredentials;
+  channelRepository.getCredentials = async () => ({
+    id: "c-1",
+    wabaId: "waba-1",
+    phoneNumberId: "PN-1",
+    accessToken: "tok"
+  });
+
+  registerWorkerConsumers({ eventBus: bus, redis, metaClient });
+  const handleOutbound = bus.handlers.get(EventTopics.WhatsAppOutboundRequested);
+
+  const capture = captureStdout();
+  try {
+    await assert.rejects(() => handleOutbound(outboundEvent("env-1", "dispatch-label-adapter")));
+  } finally {
+    capture.restore();
+    channelRepository.getCredentials = originalGetCredentials;
+  }
+
+  const labels = capture.labels();
+  assert.ok(labels.includes("outbound_adapter_failed"), `expected outbound_adapter_failed in ${labels}`);
+  assert.ok(!labels.includes("outbound_send_failed"), "pre-send label must not fire for an adapter-call failure");
+});
+
+test("handleOutbound: pre-send failure logs outbound_send_failed, not outbound_adapter_failed", async () => {
+  const bus = createFakeBus();
+  const redis = createFakeRedis();
+  const metaClient = createFakeMetaClient(async () => {
+    throw new Error("must not be called — failure happens before send");
+  });
+
+  const originalGetCredentials = channelRepository.getCredentials;
+  channelRepository.getCredentials = async () => {
+    throw new Error("channel_lookup_failed");
+  };
+
+  registerWorkerConsumers({ eventBus: bus, redis, metaClient });
+  const handleOutbound = bus.handlers.get(EventTopics.WhatsAppOutboundRequested);
+
+  const capture = captureStdout();
+  try {
+    await assert.rejects(() => handleOutbound(outboundEvent("env-1", "dispatch-label-presend")));
+  } finally {
+    capture.restore();
+    channelRepository.getCredentials = originalGetCredentials;
+  }
+
+  const labels = capture.labels();
+  assert.ok(labels.includes("outbound_send_failed"), `expected outbound_send_failed in ${labels}`);
+  assert.ok(!labels.includes("outbound_adapter_failed"), "adapter label must not fire for a pre-send failure");
+});
