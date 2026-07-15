@@ -498,6 +498,20 @@ export interface WhatsAppLocationSendRequest {
   accessToken?: string;
 }
 
+export interface WhatsAppContactCard {
+  name: { formattedName: string; firstName?: string; lastName?: string };
+  phones?: Array<{ phone: string; type?: string }>;
+  emails?: Array<{ email: string; type?: string }>;
+}
+
+/** WhatsApp contacts message — shares one or more vCard-style contact cards. */
+export interface WhatsAppContactsSendRequest {
+  phoneNumberId: string;
+  to: string;
+  contacts: WhatsAppContactCard[];
+  accessToken?: string;
+}
+
 export interface WhatsAppMarkReadRequest {
   phoneNumberId: string;
   messageId: string;
@@ -528,7 +542,7 @@ export interface WhatsAppOutboundRequest {
   channelId: string;
   conversationId: string;
   contactPhoneE164: string;
-  kind: "text" | "media" | "interactive" | "product" | "catalog" | "flow" | "template" | "location";
+  kind: "text" | "media" | "interactive" | "product" | "catalog" | "flow" | "template" | "location" | "contacts";
   text?: string;
   previewUrl?: boolean;
   media?: { mediaType: WhatsAppMediaKind; link?: string; mediaId?: string; caption?: string; filename?: string };
@@ -540,6 +554,7 @@ export interface WhatsAppOutboundRequest {
     components?: TemplateComponent[];
   };
   location?: { latitude: number; longitude: number; name?: string; address?: string };
+  contacts?: WhatsAppContactCard[];
   product?: { catalogId: string; productRetailerId: string; bodyText?: string };
   catalog?: {
     catalogId: string;

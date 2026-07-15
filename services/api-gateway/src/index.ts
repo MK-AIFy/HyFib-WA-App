@@ -75,6 +75,7 @@ import {
   type Template,
   type TemplateComponent,
   type VariableMapping,
+  type WhatsAppContactCard,
   type WhatsAppInteractivePayload,
   type WhatsAppMediaKind
 } from "@hyfib/shared-core";
@@ -88,7 +89,8 @@ import {
   validateInteractivePayload,
   validateCampaignBody,
   validateTemplatePayload,
-  validateLocationPayload
+  validateLocationPayload,
+  validateContactsPayload
 } from "./validation.js";
 import { filterSendableContacts } from "./campaign.js";
 import { canCreateContact, canCreateOrder } from "./authorization.js";
@@ -130,7 +132,7 @@ interface UpdateWhatsAppSettingsRequest {
 }
 
 interface SendMessageRequest {
-  kind?: "text" | "media" | "interactive" | "product" | "catalog" | "flow" | "template" | "location";
+  kind?: "text" | "media" | "interactive" | "product" | "catalog" | "flow" | "template" | "location" | "contacts";
   text?: string;
   previewUrl?: boolean;
   media?: { mediaType: WhatsAppMediaKind; link?: string; mediaId?: string; caption?: string; filename?: string };
@@ -158,6 +160,7 @@ interface SendMessageRequest {
     components?: TemplateComponent[];
   };
   location?: { latitude: number; longitude: number; name?: string; address?: string };
+  contacts?: WhatsAppContactCard[];
 }
 
 interface CreateTemplateRequest {
@@ -921,7 +924,8 @@ async function sendConversationMessage(
     "catalog",
     "flow",
     "template",
-    "location"
+    "location",
+    "contacts"
   ] as const;
   const kind = body.kind ?? "text";
   if (!VALID_MESSAGE_KINDS.includes(kind as (typeof VALID_MESSAGE_KINDS)[number])) {
@@ -966,6 +970,15 @@ async function sendConversationMessage(
     location = validated.value;
   }
 
+  let contacts: WhatsAppContactCard[] | undefined;
+  if (kind === "contacts") {
+    const validated = validateContactsPayload(body.contacts);
+    if (!validated.ok) {
+      return { status: 400, body: { error: validated.error } };
+    }
+    contacts = validated.value;
+  }
+
   let interactive: WhatsAppInteractivePayload | undefined;
   if (kind === "interactive") {
     const validated = validateInteractivePayload(body.interactive);
@@ -993,6 +1006,7 @@ async function sendConversationMessage(
         flow: body.flow,
         template,
         location,
+        contacts,
         actorId: asActorUuid(auth.subject),
         dispatchId: randomUUID()
       }

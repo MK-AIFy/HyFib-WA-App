@@ -1,4 +1,4 @@
-import type { TemplateComponent, WhatsAppInteractivePayload } from "@hyfib/shared-core";
+import type { TemplateComponent, WhatsAppContactCard, WhatsAppInteractivePayload } from "@hyfib/shared-core";
 
 export type ValidationResult<T> = { ok: true; value: T } | { ok: false; error: string };
 
@@ -416,4 +416,110 @@ export function validateLocationPayload(input: unknown): ValidationResult<Locati
   }
 
   return { ok: true, value };
+}
+
+const CONTACTS_MAX = 20;
+const CONTACT_NAME_MAX = 256;
+const CONTACT_PHONE_MAX = 32;
+const CONTACT_EMAIL_MAX = 256;
+const CONTACT_FIELD_TYPE_MAX = 32;
+const CONTACT_PHONES_MAX = 10;
+const CONTACT_EMAILS_MAX = 10;
+
+/**
+ * Validates a contacts-send request for the agent conversation-send route.
+ * Strips unknown fields the same way validateInteractivePayload does — only
+ * the shape below ever reaches the outbox.
+ */
+export function validateContactsPayload(input: unknown): ValidationResult<WhatsAppContactCard[]> {
+  if (!Array.isArray(input) || input.length === 0 || input.length > CONTACTS_MAX) {
+    return { ok: false, error: `contacts must be an array of 1-${CONTACTS_MAX} contact cards` };
+  }
+
+  const cleanContacts: WhatsAppContactCard[] = [];
+  for (const entry of input) {
+    const candidate = entry as Record<string, unknown>;
+    const nameCandidate = candidate?.name as Record<string, unknown> | undefined;
+    const formattedName = optionalString(
+      nameCandidate?.formattedName,
+      CONTACT_NAME_MAX,
+      "contacts[].name.formattedName"
+    );
+    if (!nameCandidate || formattedName.value === undefined) {
+      return {
+        ok: false,
+        error: formattedName.error ?? `contacts[].name.formattedName is required (at most ${CONTACT_NAME_MAX} chars)`
+      };
+    }
+    const firstName = optionalString(nameCandidate.firstName, CONTACT_NAME_MAX, "contacts[].name.firstName");
+    if (firstName.error) {
+      return { ok: false, error: firstName.error };
+    }
+    const lastName = optionalString(nameCandidate.lastName, CONTACT_NAME_MAX, "contacts[].name.lastName");
+    if (lastName.error) {
+      return { ok: false, error: lastName.error };
+    }
+
+    const contact: WhatsAppContactCard = {
+      name: {
+        formattedName: formattedName.value,
+        ...(firstName.value !== undefined ? { firstName: firstName.value } : {}),
+        ...(lastName.value !== undefined ? { lastName: lastName.value } : {})
+      }
+    };
+
+    const phonesRaw = candidate.phones;
+    if (phonesRaw !== undefined) {
+      if (!Array.isArray(phonesRaw) || phonesRaw.length > CONTACT_PHONES_MAX) {
+        return { ok: false, error: `contacts[].phones must be an array of at most ${CONTACT_PHONES_MAX} entries` };
+      }
+      const cleanPhones = [];
+      for (const phoneEntry of phonesRaw) {
+        const phoneCandidate = phoneEntry as Record<string, unknown>;
+        if (!isNonEmptyString(phoneCandidate?.phone, CONTACT_PHONE_MAX)) {
+          return { ok: false, error: `each contacts[].phones entry needs a phone (≤${CONTACT_PHONE_MAX} chars)` };
+        }
+        const type = optionalString(phoneCandidate.type, CONTACT_FIELD_TYPE_MAX, "contacts[].phones[].type");
+        if (type.error) {
+          return { ok: false, error: type.error };
+        }
+        cleanPhones.push({
+          phone: phoneCandidate.phone as string,
+          ...(type.value !== undefined ? { type: type.value } : {})
+        });
+      }
+      if (cleanPhones.length > 0) {
+        contact.phones = cleanPhones;
+      }
+    }
+
+    const emailsRaw = candidate.emails;
+    if (emailsRaw !== undefined) {
+      if (!Array.isArray(emailsRaw) || emailsRaw.length > CONTACT_EMAILS_MAX) {
+        return { ok: false, error: `contacts[].emails must be an array of at most ${CONTACT_EMAILS_MAX} entries` };
+      }
+      const cleanEmails = [];
+      for (const emailEntry of emailsRaw) {
+        const emailCandidate = emailEntry as Record<string, unknown>;
+        if (!isNonEmptyString(emailCandidate?.email, CONTACT_EMAIL_MAX)) {
+          return { ok: false, error: `each contacts[].emails entry needs an email (≤${CONTACT_EMAIL_MAX} chars)` };
+        }
+        const type = optionalString(emailCandidate.type, CONTACT_FIELD_TYPE_MAX, "contacts[].emails[].type");
+        if (type.error) {
+          return { ok: false, error: type.error };
+        }
+        cleanEmails.push({
+          email: emailCandidate.email as string,
+          ...(type.value !== undefined ? { type: type.value } : {})
+        });
+      }
+      if (cleanEmails.length > 0) {
+        contact.emails = cleanEmails;
+      }
+    }
+
+    cleanContacts.push(contact);
+  }
+
+  return { ok: true, value: cleanContacts };
 }

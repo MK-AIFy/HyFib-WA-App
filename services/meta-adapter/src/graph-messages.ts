@@ -1,5 +1,6 @@
 import type {
   TemplateComponent,
+  WhatsAppContactCard,
   WhatsAppInteractiveSendRequest,
   WhatsAppLocationSendRequest,
   WhatsAppMediaSendRequest,
@@ -100,6 +101,29 @@ export function buildLocationBody(
       ...(input.name ? { name: input.name } : {}),
       ...(input.address ? { address: input.address } : {})
     }
+  };
+}
+
+/** Builds a `contacts`-type message body sharing one or more vCard-style contact cards. */
+export function buildContactsBody(input: { to: string; contacts: WhatsAppContactCard[] }): Record<string, unknown> {
+  return {
+    messaging_product: "whatsapp",
+    recipient_type: "individual",
+    to: input.to,
+    type: "contacts",
+    contacts: input.contacts.map((contact) => ({
+      name: {
+        formatted_name: contact.name.formattedName,
+        ...(contact.name.firstName ? { first_name: contact.name.firstName } : {}),
+        ...(contact.name.lastName ? { last_name: contact.name.lastName } : {})
+      },
+      ...(contact.phones?.length
+        ? { phones: contact.phones.map((p) => ({ phone: p.phone, ...(p.type ? { type: p.type } : {}) })) }
+        : {}),
+      ...(contact.emails?.length
+        ? { emails: contact.emails.map((e) => ({ email: e.email, ...(e.type ? { type: e.type } : {}) })) }
+        : {})
+    }))
   };
 }
 

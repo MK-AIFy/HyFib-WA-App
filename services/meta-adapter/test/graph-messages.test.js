@@ -6,6 +6,7 @@ import {
   buildMediaBody,
   buildInteractiveBody,
   buildLocationBody,
+  buildContactsBody,
   buildMarkReadBody,
   buildMediaUploadForm,
   mapMetaTemplateStatus,
@@ -91,6 +92,40 @@ test("location body includes name/address when provided", () => {
     name: "HQ",
     address: "1600 Amphitheatre Pkwy"
   });
+});
+
+test("contacts body shapes a minimal contact card with only formattedName", () => {
+  const body = buildContactsBody({ to: "1", contacts: [{ name: { formattedName: "Jane Doe" } }] });
+  assert.equal(body.type, "contacts");
+  assert.deepEqual(body.contacts, [{ name: { formatted_name: "Jane Doe" } }]);
+});
+
+test("contacts body shapes a full contact card with phones and emails", () => {
+  const body = buildContactsBody({
+    to: "1",
+    contacts: [
+      {
+        name: { formattedName: "Jane Doe", firstName: "Jane", lastName: "Doe" },
+        phones: [{ phone: "+15551230000", type: "work" }],
+        emails: [{ email: "jane@example.com" }]
+      }
+    ]
+  });
+  assert.deepEqual(body.contacts, [
+    {
+      name: { formatted_name: "Jane Doe", first_name: "Jane", last_name: "Doe" },
+      phones: [{ phone: "+15551230000", type: "work" }],
+      emails: [{ email: "jane@example.com" }]
+    }
+  ]);
+});
+
+test("contacts body omits empty phones/emails arrays entirely", () => {
+  const body = buildContactsBody({
+    to: "1",
+    contacts: [{ name: { formattedName: "Jane Doe" }, phones: [], emails: [] }]
+  });
+  assert.deepEqual(body.contacts, [{ name: { formatted_name: "Jane Doe" } }]);
 });
 
 test("interactive button body shapes reply buttons", () => {

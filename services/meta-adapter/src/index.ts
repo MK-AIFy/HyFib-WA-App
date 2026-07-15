@@ -16,6 +16,7 @@ import {
   sendJson,
   sendMetrics,
   type MetaTemplateSummary,
+  type WhatsAppContactCard,
   type WhatsAppInteractiveSendRequest,
   type WhatsAppMarkReadRequest,
   type WhatsAppMediaSendRequest,
@@ -25,6 +26,7 @@ import {
 } from "@hyfib/shared-core";
 import {
   buildCatalogMessage,
+  buildContactsBody,
   buildFlowMessage,
   buildInteractiveBody,
   buildLocationBody,
@@ -317,6 +319,7 @@ export async function metaDispatch(
     longitude?: number;
     locationName?: string;
     locationAddress?: string;
+    contacts?: WhatsAppContactCard[];
     catalogId?: string;
     productRetailerId?: string;
     flowId?: string;
@@ -370,6 +373,17 @@ export async function metaDispatch(
         name: p.locationName,
         address: p.locationAddress
       });
+      return sendGraphMessage(requestId, p.phoneNumberId, body, p.accessToken);
+    }
+
+    case "/internal/v1/whatsapp/send-contacts": {
+      if (!p.phoneNumberId || !p.to || !Array.isArray(p.contacts) || p.contacts.length === 0) {
+        return { status: 400, body: { error: "phoneNumberId, to and at least one contact are required" } };
+      }
+      if (p.contacts.some((contact) => !contact?.name?.formattedName)) {
+        return { status: 400, body: { error: "each contact requires name.formattedName" } };
+      }
+      const body = buildContactsBody({ to: p.to, contacts: p.contacts });
       return sendGraphMessage(requestId, p.phoneNumberId, body, p.accessToken);
     }
 

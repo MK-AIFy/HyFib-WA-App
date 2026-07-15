@@ -81,6 +81,18 @@ export function buildOutboundAdapterCall(command: WhatsAppOutboundRequest, chann
       persistedPayload: { kind: "location", location: command.location, actorId: command.actorId }
     };
   }
+  if (command.kind === "contacts" && command.contacts) {
+    return {
+      endpoint: "/internal/v1/whatsapp/send-contacts",
+      payload: {
+        phoneNumberId: channel.phoneNumberId,
+        to: command.contactPhoneE164,
+        contacts: command.contacts,
+        accessToken: channel.accessToken
+      },
+      persistedPayload: { kind: "contacts", contacts: command.contacts, actorId: command.actorId }
+    };
+  }
   if (command.kind === "product" && command.product) {
     return {
       endpoint: "/internal/v1/whatsapp/send-product",

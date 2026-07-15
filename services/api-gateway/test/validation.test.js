@@ -9,7 +9,8 @@ import {
   validateCampaignBody,
   validateInteractivePayload,
   validateTemplatePayload,
-  validateLocationPayload
+  validateLocationPayload,
+  validateContactsPayload
 } from "../dist/validation.js";
 
 test("parseListQuery clamps limit and defaults offset", () => {
@@ -419,4 +420,83 @@ test("validateLocationPayload rejects an oversized name or address", () => {
   const addressResult = validateLocationPayload({ latitude: 0, longitude: 0, address: "x".repeat(501) });
   assert.equal(addressResult.ok, false);
   assert.match(addressResult.error, /location\.address/);
+});
+
+test("validateContactsPayload accepts a minimal contact and strips unknown fields", () => {
+  const result = validateContactsPayload([{ name: { formattedName: "Jane Doe" }, extra: "strip me" }]);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.value, [{ name: { formattedName: "Jane Doe" } }]);
+});
+
+test("validateContactsPayload accepts a full contact with phones and emails", () => {
+  const result = validateContactsPayload([
+    {
+      name: { formattedName: "Jane Doe", firstName: "Jane", lastName: "Doe" },
+      phones: [{ phone: "+15551230000", type: "work" }],
+      emails: [{ email: "jane@example.com" }]
+    }
+  ]);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.value, [
+    {
+      name: { formattedName: "Jane Doe", firstName: "Jane", lastName: "Doe" },
+      phones: [{ phone: "+15551230000", type: "work" }],
+      emails: [{ email: "jane@example.com" }]
+    }
+  ]);
+});
+
+test("validateContactsPayload rejects non-array or empty input", () => {
+  assert.equal(validateContactsPayload(undefined).ok, false);
+  assert.equal(validateContactsPayload({}).ok, false);
+  assert.equal(validateContactsPayload([]).ok, false);
+});
+
+test("validateContactsPayload rejects more than 20 contacts", () => {
+  const contacts = Array.from({ length: 21 }, () => ({ name: { formattedName: "X" } }));
+  const result = validateContactsPayload(contacts);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /1-20/);
+});
+
+test("validateContactsPayload rejects a contact missing name.formattedName", () => {
+  const missingName = validateContactsPayload([{}]);
+  assert.equal(missingName.ok, false);
+  assert.match(missingName.error, /formattedName/);
+
+  const emptyName = validateContactsPayload([{ name: {} }]);
+  assert.equal(emptyName.ok, false);
+  assert.match(emptyName.error, /formattedName/);
+});
+
+test("validateContactsPayload rejects a phone entry missing phone", () => {
+  const result = validateContactsPayload([{ name: { formattedName: "Jane" }, phones: [{ type: "work" }] }]);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /phone/);
+});
+
+test("validateContactsPayload rejects more than 10 phones", () => {
+  const phones = Array.from({ length: 11 }, (_, i) => ({ phone: `+1555123000${i}` }));
+  const result = validateContactsPayload([{ name: { formattedName: "Jane" }, phones }]);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /phones/);
+});
+
+test("validateContactsPayload rejects an email entry missing email", () => {
+  const result = validateContactsPayload([{ name: { formattedName: "Jane" }, emails: [{ type: "work" }] }]);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /email/);
+});
+
+test("validateContactsPayload rejects more than 10 emails", () => {
+  const emails = Array.from({ length: 11 }, (_, i) => ({ email: `jane${i}@example.com` }));
+  const result = validateContactsPayload([{ name: { formattedName: "Jane" }, emails }]);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /emails/);
+});
+
+test("validateContactsPayload omits empty phones/emails arrays from the cleaned value", () => {
+  const result = validateContactsPayload([{ name: { formattedName: "Jane Doe" }, phones: [], emails: [] }]);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.value, [{ name: { formattedName: "Jane Doe" } }]);
 });
