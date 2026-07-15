@@ -66,3 +66,15 @@ test("send-interactive cta_url requires ctaUrl (400, not 404), rejecting the emp
   assert.equal(res.status, 400);
   assert.match(res.body.error, /ctaUrl/);
 });
+
+test("send-interactive cta_url requires ctaDisplayText even when ctaUrl is present (400, not a malformed Meta payload)", async () => {
+  const res = await post("/internal/v1/whatsapp/send-interactive", {
+    phoneNumberId: "PN-1",
+    to: "+15551230000",
+    interactiveType: "cta_url",
+    bodyText: "Check us out",
+    ctaUrl: "https://example.com"
+  });
+  assert.equal(res.status, 400);
+  assert.match(res.body.error, /ctaDisplayText/);
+});

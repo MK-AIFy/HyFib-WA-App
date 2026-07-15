@@ -115,8 +115,11 @@ test("location command maps to send-location", () => {
   assert.equal(call.payload.to, "+15551230000");
   assert.equal(call.payload.latitude, 37.4);
   assert.equal(call.payload.longitude, -122.1);
-  assert.equal(call.payload.locationName, "HQ");
-  assert.equal(call.payload.locationAddress, "1600 Amphitheatre Pkwy");
+  // These keys must match exactly what both metaDispatch and the standalone
+  // send-location HTTP route read (name/address), so the location name/address
+  // are not silently dropped on the standalone-deployment path.
+  assert.equal(call.payload.name, "HQ");
+  assert.equal(call.payload.address, "1600 Amphitheatre Pkwy");
   assert.deepEqual(call.persistedPayload, { kind: "location", location, actorId: "actor-1" });
 });
 

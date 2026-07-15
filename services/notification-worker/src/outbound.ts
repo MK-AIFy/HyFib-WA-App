@@ -74,8 +74,8 @@ export function buildOutboundAdapterCall(command: WhatsAppOutboundRequest, chann
         to: command.contactPhoneE164,
         latitude: command.location.latitude,
         longitude: command.location.longitude,
-        locationName: command.location.name,
-        locationAddress: command.location.address,
+        name: command.location.name,
+        address: command.location.address,
         accessToken: channel.accessToken
       },
       persistedPayload: { kind: "location", location: command.location, actorId: command.actorId }

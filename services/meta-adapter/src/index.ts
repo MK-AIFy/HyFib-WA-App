@@ -350,8 +350,8 @@ export async function metaDispatch(
     ctaUrl?: string;
     latitude?: number;
     longitude?: number;
-    locationName?: string;
-    locationAddress?: string;
+    name?: string;
+    address?: string;
     contacts?: WhatsAppContactCard[];
     catalogId?: string;
     productRetailerId?: string;
@@ -403,8 +403,8 @@ export async function metaDispatch(
         to: p.to,
         latitude: p.latitude,
         longitude: p.longitude,
-        name: p.locationName,
-        address: p.locationAddress
+        name: p.name,
+        address: p.address
       });
       return sendGraphMessage(requestId, p.phoneNumberId, body, p.accessToken);
     }
@@ -424,8 +424,8 @@ export async function metaDispatch(
       if (!p.phoneNumberId || !p.to || !p.interactiveType || !p.bodyText) {
         return { status: 400, body: { error: "phoneNumberId, to, interactiveType and bodyText are required" } };
       }
-      if (p.interactiveType === "cta_url" && !p.ctaUrl) {
-        return { status: 400, body: { error: "ctaUrl is required for interactiveType cta_url" } };
+      if (p.interactiveType === "cta_url" && (!p.ctaUrl || !p.ctaDisplayText)) {
+        return { status: 400, body: { error: "ctaUrl and ctaDisplayText are required for interactiveType cta_url" } };
       }
       const body = buildInteractiveBody({
         to: p.to,
@@ -775,8 +775,8 @@ export const server = createServer(async (req, res) => {
         sendJson(res, 400, { error: "phoneNumberId, to, interactiveType and bodyText are required" });
         return;
       }
-      if (payload.interactiveType === "cta_url" && !payload.ctaUrl) {
-        sendJson(res, 400, { error: "ctaUrl is required for interactiveType cta_url" });
+      if (payload.interactiveType === "cta_url" && (!payload.ctaUrl || !payload.ctaDisplayText)) {
+        sendJson(res, 400, { error: "ctaUrl and ctaDisplayText are required for interactiveType cta_url" });
         return;
       }
       const graphBody = buildInteractiveBody({
