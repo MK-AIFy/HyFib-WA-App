@@ -87,7 +87,8 @@ import {
   clampInt,
   validateInteractivePayload,
   validateCampaignBody,
-  validateTemplatePayload
+  validateTemplatePayload,
+  validateLocationPayload
 } from "./validation.js";
 import { filterSendableContacts } from "./campaign.js";
 import { canCreateContact, canCreateOrder } from "./authorization.js";
@@ -129,7 +130,7 @@ interface UpdateWhatsAppSettingsRequest {
 }
 
 interface SendMessageRequest {
-  kind?: "text" | "media" | "interactive" | "product" | "catalog" | "flow" | "template";
+  kind?: "text" | "media" | "interactive" | "product" | "catalog" | "flow" | "template" | "location";
   text?: string;
   previewUrl?: boolean;
   media?: { mediaType: WhatsAppMediaKind; link?: string; mediaId?: string; caption?: string; filename?: string };
@@ -156,6 +157,7 @@ interface SendMessageRequest {
     parameters?: string[];
     components?: TemplateComponent[];
   };
+  location?: { latitude: number; longitude: number; name?: string; address?: string };
 }
 
 interface CreateTemplateRequest {
@@ -911,7 +913,16 @@ async function sendConversationMessage(
     return { status: 422, body: { error: "contact_opted_out" } };
   }
 
-  const VALID_MESSAGE_KINDS = ["text", "media", "interactive", "product", "catalog", "flow", "template"] as const;
+  const VALID_MESSAGE_KINDS = [
+    "text",
+    "media",
+    "interactive",
+    "product",
+    "catalog",
+    "flow",
+    "template",
+    "location"
+  ] as const;
   const kind = body.kind ?? "text";
   if (!VALID_MESSAGE_KINDS.includes(kind as (typeof VALID_MESSAGE_KINDS)[number])) {
     return { status: 400, body: { error: `kind must be one of: ${VALID_MESSAGE_KINDS.join(", ")}` } };
@@ -946,6 +957,15 @@ async function sendConversationMessage(
     template = validated.value;
   }
 
+  let location: SendMessageRequest["location"] | undefined;
+  if (kind === "location") {
+    const validated = validateLocationPayload(body.location);
+    if (!validated.ok) {
+      return { status: 400, body: { error: validated.error } };
+    }
+    location = validated.value;
+  }
+
   let interactive: WhatsAppInteractivePayload | undefined;
   if (kind === "interactive") {
     const validated = validateInteractivePayload(body.interactive);
@@ -972,6 +992,7 @@ async function sendConversationMessage(
         catalog: body.catalog,
         flow: body.flow,
         template,
+        location,
         actorId: asActorUuid(auth.subject),
         dispatchId: randomUUID()
       }

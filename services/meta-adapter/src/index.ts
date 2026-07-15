@@ -27,6 +27,7 @@ import {
   buildCatalogMessage,
   buildFlowMessage,
   buildInteractiveBody,
+  buildLocationBody,
   buildMarkReadBody,
   buildMediaBody,
   buildMediaUploadForm,
@@ -312,6 +313,10 @@ export async function metaDispatch(
     sections?: unknown;
     ctaDisplayText?: string;
     ctaUrl?: string;
+    latitude?: number;
+    longitude?: number;
+    locationName?: string;
+    locationAddress?: string;
     catalogId?: string;
     productRetailerId?: string;
     flowId?: string;
@@ -343,6 +348,27 @@ export async function metaDispatch(
         mediaId: p.mediaId,
         caption: p.caption,
         filename: p.filename
+      });
+      return sendGraphMessage(requestId, p.phoneNumberId, body, p.accessToken);
+    }
+
+    case "/internal/v1/whatsapp/send-location": {
+      if (
+        !p.phoneNumberId ||
+        !p.to ||
+        typeof p.latitude !== "number" ||
+        typeof p.longitude !== "number" ||
+        !Number.isFinite(p.latitude) ||
+        !Number.isFinite(p.longitude)
+      ) {
+        return { status: 400, body: { error: "phoneNumberId, to, latitude and longitude are required" } };
+      }
+      const body = buildLocationBody({
+        to: p.to,
+        latitude: p.latitude,
+        longitude: p.longitude,
+        name: p.locationName,
+        address: p.locationAddress
       });
       return sendGraphMessage(requestId, p.phoneNumberId, body, p.accessToken);
     }

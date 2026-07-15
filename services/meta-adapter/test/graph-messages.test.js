@@ -5,6 +5,7 @@ import {
   buildTextBody,
   buildMediaBody,
   buildInteractiveBody,
+  buildLocationBody,
   buildMarkReadBody,
   buildMediaUploadForm,
   mapMetaTemplateStatus,
@@ -68,6 +69,28 @@ test("media body uses id over link and attaches filename only for documents", ()
 
   const audio = buildMediaBody({ to: "1", mediaType: "audio", link: "https://x/a.ogg", caption: "ignored" });
   assert.deepEqual(audio.audio, { link: "https://x/a.ogg" });
+});
+
+test("location body includes latitude/longitude and omits name/address when absent", () => {
+  const body = buildLocationBody({ to: "1", latitude: 37.4, longitude: -122.1 });
+  assert.equal(body.type, "location");
+  assert.deepEqual(body.location, { latitude: 37.4, longitude: -122.1 });
+});
+
+test("location body includes name/address when provided", () => {
+  const body = buildLocationBody({
+    to: "1",
+    latitude: 37.4,
+    longitude: -122.1,
+    name: "HQ",
+    address: "1600 Amphitheatre Pkwy"
+  });
+  assert.deepEqual(body.location, {
+    latitude: 37.4,
+    longitude: -122.1,
+    name: "HQ",
+    address: "1600 Amphitheatre Pkwy"
+  });
 });
 
 test("interactive button body shapes reply buttons", () => {

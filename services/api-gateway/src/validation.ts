@@ -371,3 +371,49 @@ export function validateTemplatePayload(input: unknown): ValidationResult<Templa
 
   return { ok: true, value };
 }
+
+const LOCATION_NAME_MAX = 200;
+const LOCATION_ADDRESS_MAX = 500;
+
+export interface LocationSendPayload {
+  latitude: number;
+  longitude: number;
+  name?: string;
+  address?: string;
+}
+
+/** Validates a location-send request for the agent conversation-send route. */
+export function validateLocationPayload(input: unknown): ValidationResult<LocationSendPayload> {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return { ok: false, error: "location must be an object" };
+  }
+  const candidate = input as Record<string, unknown>;
+
+  const latitude = candidate.latitude;
+  if (typeof latitude !== "number" || !Number.isFinite(latitude) || latitude < -90 || latitude > 90) {
+    return { ok: false, error: "location.latitude must be a finite number between -90 and 90" };
+  }
+  const longitude = candidate.longitude;
+  if (typeof longitude !== "number" || !Number.isFinite(longitude) || longitude < -180 || longitude > 180) {
+    return { ok: false, error: "location.longitude must be a finite number between -180 and 180" };
+  }
+
+  const value: LocationSendPayload = { latitude, longitude };
+
+  const name = optionalString(candidate.name, LOCATION_NAME_MAX, "location.name");
+  if (name.error) {
+    return { ok: false, error: name.error };
+  }
+  if (name.value !== undefined) {
+    value.name = name.value;
+  }
+  const address = optionalString(candidate.address, LOCATION_ADDRESS_MAX, "location.address");
+  if (address.error) {
+    return { ok: false, error: address.error };
+  }
+  if (address.value !== undefined) {
+    value.address = address.value;
+  }
+
+  return { ok: true, value };
+}

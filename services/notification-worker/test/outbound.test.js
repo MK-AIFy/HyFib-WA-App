@@ -106,3 +106,21 @@ test("template kind without a payload falls back to text", () => {
   const call = buildOutboundAdapterCall({ ...base, kind: "template", text: "fallback" }, channel);
   assert.equal(call.endpoint, "/internal/v1/whatsapp/send-text");
 });
+
+test("location command maps to send-location", () => {
+  const location = { latitude: 37.4, longitude: -122.1, name: "HQ", address: "1600 Amphitheatre Pkwy" };
+  const call = buildOutboundAdapterCall({ ...base, kind: "location", location }, channel);
+  assert.equal(call.endpoint, "/internal/v1/whatsapp/send-location");
+  assert.equal(call.payload.phoneNumberId, "PN-1");
+  assert.equal(call.payload.to, "+15551230000");
+  assert.equal(call.payload.latitude, 37.4);
+  assert.equal(call.payload.longitude, -122.1);
+  assert.equal(call.payload.locationName, "HQ");
+  assert.equal(call.payload.locationAddress, "1600 Amphitheatre Pkwy");
+  assert.deepEqual(call.persistedPayload, { kind: "location", location, actorId: "actor-1" });
+});
+
+test("location kind without a payload falls back to text", () => {
+  const call = buildOutboundAdapterCall({ ...base, kind: "location", text: "fallback" }, channel);
+  assert.equal(call.endpoint, "/internal/v1/whatsapp/send-text");
+});

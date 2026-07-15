@@ -8,7 +8,8 @@ import {
   parseOptionalIsoDate,
   validateCampaignBody,
   validateInteractivePayload,
-  validateTemplatePayload
+  validateTemplatePayload,
+  validateLocationPayload
 } from "../dist/validation.js";
 
 test("parseListQuery clamps limit and defaults offset", () => {
@@ -369,4 +370,53 @@ test("validateTemplatePayload rejects a parameter entry longer than 1024 charact
   });
   assert.equal(result.ok, false);
   assert.match(result.error, /1024/);
+});
+
+test("validateLocationPayload accepts a minimal valid payload", () => {
+  const result = validateLocationPayload({ latitude: 37.4, longitude: -122.1 });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.value, { latitude: 37.4, longitude: -122.1 });
+});
+
+test("validateLocationPayload accepts optional name/address", () => {
+  const result = validateLocationPayload({
+    latitude: 37.4,
+    longitude: -122.1,
+    name: "HQ",
+    address: "1600 Amphitheatre Pkwy"
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.value.name, "HQ");
+  assert.equal(result.value.address, "1600 Amphitheatre Pkwy");
+});
+
+test("validateLocationPayload rejects non-object input", () => {
+  assert.equal(validateLocationPayload(undefined).ok, false);
+  assert.equal(validateLocationPayload("x").ok, false);
+  assert.equal(validateLocationPayload([]).ok, false);
+});
+
+test("validateLocationPayload rejects out-of-range or non-finite latitude", () => {
+  assert.equal(validateLocationPayload({ latitude: 91, longitude: 0 }).ok, false);
+  assert.equal(validateLocationPayload({ latitude: -91, longitude: 0 }).ok, false);
+  assert.equal(validateLocationPayload({ latitude: Infinity, longitude: 0 }).ok, false);
+  assert.equal(validateLocationPayload({ latitude: "37.4", longitude: 0 }).ok, false);
+  assert.equal(validateLocationPayload({ longitude: 0 }).ok, false);
+});
+
+test("validateLocationPayload rejects out-of-range or non-finite longitude", () => {
+  assert.equal(validateLocationPayload({ latitude: 0, longitude: 181 }).ok, false);
+  assert.equal(validateLocationPayload({ latitude: 0, longitude: -181 }).ok, false);
+  assert.equal(validateLocationPayload({ latitude: 0, longitude: NaN }).ok, false);
+  assert.equal(validateLocationPayload({ latitude: 0 }).ok, false);
+});
+
+test("validateLocationPayload rejects an oversized name or address", () => {
+  const nameResult = validateLocationPayload({ latitude: 0, longitude: 0, name: "x".repeat(201) });
+  assert.equal(nameResult.ok, false);
+  assert.match(nameResult.error, /location\.name/);
+
+  const addressResult = validateLocationPayload({ latitude: 0, longitude: 0, address: "x".repeat(501) });
+  assert.equal(addressResult.ok, false);
+  assert.match(addressResult.error, /location\.address/);
 });

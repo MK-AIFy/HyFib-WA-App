@@ -1,6 +1,7 @@
 import type {
   TemplateComponent,
   WhatsAppInteractiveSendRequest,
+  WhatsAppLocationSendRequest,
   WhatsAppMediaSendRequest,
   WhatsAppTextSendRequest
 } from "@hyfib/shared-core";
@@ -82,6 +83,23 @@ export function buildMediaBody(
     to: input.to,
     type: input.mediaType,
     [input.mediaType]: media
+  };
+}
+
+export function buildLocationBody(
+  input: Pick<WhatsAppLocationSendRequest, "to" | "latitude" | "longitude" | "name" | "address">
+): Record<string, unknown> {
+  return {
+    messaging_product: "whatsapp",
+    recipient_type: "individual",
+    to: input.to,
+    type: "location",
+    location: {
+      latitude: input.latitude,
+      longitude: input.longitude,
+      ...(input.name ? { name: input.name } : {}),
+      ...(input.address ? { address: input.address } : {})
+    }
   };
 }
 

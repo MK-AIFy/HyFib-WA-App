@@ -487,6 +487,17 @@ export interface WhatsAppInteractiveSendRequest {
  */
 export type WhatsAppInteractivePayload = Omit<WhatsAppInteractiveSendRequest, "phoneNumberId" | "to" | "accessToken">;
 
+/** WhatsApp location message. */
+export interface WhatsAppLocationSendRequest {
+  phoneNumberId: string;
+  to: string;
+  latitude: number;
+  longitude: number;
+  name?: string;
+  address?: string;
+  accessToken?: string;
+}
+
 export interface WhatsAppMarkReadRequest {
   phoneNumberId: string;
   messageId: string;
@@ -517,7 +528,7 @@ export interface WhatsAppOutboundRequest {
   channelId: string;
   conversationId: string;
   contactPhoneE164: string;
-  kind: "text" | "media" | "interactive" | "product" | "catalog" | "flow" | "template";
+  kind: "text" | "media" | "interactive" | "product" | "catalog" | "flow" | "template" | "location";
   text?: string;
   previewUrl?: boolean;
   media?: { mediaType: WhatsAppMediaKind; link?: string; mediaId?: string; caption?: string; filename?: string };
@@ -528,6 +539,7 @@ export interface WhatsAppOutboundRequest {
     parameters?: string[];
     components?: TemplateComponent[];
   };
+  location?: { latitude: number; longitude: number; name?: string; address?: string };
   product?: { catalogId: string; productRetailerId: string; bodyText?: string };
   catalog?: {
     catalogId: string;
