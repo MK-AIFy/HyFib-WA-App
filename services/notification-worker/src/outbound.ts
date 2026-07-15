@@ -51,6 +51,48 @@ export interface OutboundAdapterCall {
  * so each kind's wiring can be unit-tested.
  */
 export function buildOutboundAdapterCall(command: WhatsAppOutboundRequest, channel: SendChannel): OutboundAdapterCall {
+  if (command.kind === "template" && command.template) {
+    return {
+      endpoint: "/internal/v1/whatsapp/send-template",
+      payload: {
+        phoneNumberId: channel.phoneNumberId,
+        to: command.contactPhoneE164,
+        templateName: command.template.templateName,
+        templateLanguage: command.template.templateLanguage,
+        parameters: command.template.parameters ?? [],
+        components: command.template.components,
+        accessToken: channel.accessToken
+      },
+      persistedPayload: { kind: "template", template: command.template, actorId: command.actorId }
+    };
+  }
+  if (command.kind === "location" && command.location) {
+    return {
+      endpoint: "/internal/v1/whatsapp/send-location",
+      payload: {
+        phoneNumberId: channel.phoneNumberId,
+        to: command.contactPhoneE164,
+        latitude: command.location.latitude,
+        longitude: command.location.longitude,
+        name: command.location.name,
+        address: command.location.address,
+        accessToken: channel.accessToken
+      },
+      persistedPayload: { kind: "location", location: command.location, actorId: command.actorId }
+    };
+  }
+  if (command.kind === "contacts" && command.contacts) {
+    return {
+      endpoint: "/internal/v1/whatsapp/send-contacts",
+      payload: {
+        phoneNumberId: channel.phoneNumberId,
+        to: command.contactPhoneE164,
+        contacts: command.contacts,
+        accessToken: channel.accessToken
+      },
+      persistedPayload: { kind: "contacts", contacts: command.contacts, actorId: command.actorId }
+    };
+  }
   if (command.kind === "product" && command.product) {
     return {
       endpoint: "/internal/v1/whatsapp/send-product",
@@ -111,6 +153,8 @@ export function buildOutboundAdapterCall(command: WhatsAppOutboundRequest, chann
         buttons: command.interactive.buttons,
         buttonLabel: command.interactive.buttonLabel,
         sections: command.interactive.sections,
+        ctaDisplayText: command.interactive.ctaDisplayText,
+        ctaUrl: command.interactive.ctaUrl,
         accessToken: channel.accessToken
       },
       persistedPayload: { kind: "interactive", interactive: command.interactive, actorId: command.actorId }

@@ -7,7 +7,10 @@ import {
   parseListQuery,
   parseOptionalIsoDate,
   validateCampaignBody,
-  validateInteractivePayload
+  validateInteractivePayload,
+  validateTemplatePayload,
+  validateLocationPayload,
+  validateContactsPayload
 } from "../dist/validation.js";
 
 test("parseListQuery clamps limit and defaults offset", () => {
@@ -168,6 +171,59 @@ test("rejects an unknown interactiveType", () => {
   assert.match(result.error, /interactiveType/);
 });
 
+test("accepts a valid cta_url payload and strips unknown fields", () => {
+  const result = validateInteractivePayload({
+    interactiveType: "cta_url",
+    bodyText: "Check out our site",
+    ctaDisplayText: "Visit us",
+    ctaUrl: "https://example.com",
+    buttons: [{ id: "should", title: "be stripped" }]
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.value, {
+    interactiveType: "cta_url",
+    bodyText: "Check out our site",
+    ctaDisplayText: "Visit us",
+    ctaUrl: "https://example.com"
+  });
+});
+
+test("rejects cta_url with a missing ctaDisplayText", () => {
+  const result = validateInteractivePayload({
+    interactiveType: "cta_url",
+    bodyText: "x",
+    ctaUrl: "https://example.com"
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /ctaDisplayText/);
+});
+
+test("rejects cta_url with a missing or non-http(s) ctaUrl", () => {
+  const missing = validateInteractivePayload({ interactiveType: "cta_url", bodyText: "x", ctaDisplayText: "Visit" });
+  assert.equal(missing.ok, false);
+  assert.match(missing.error, /ctaUrl/);
+
+  const badScheme = validateInteractivePayload({
+    interactiveType: "cta_url",
+    bodyText: "x",
+    ctaDisplayText: "Visit",
+    ctaUrl: "javascript:alert(1)"
+  });
+  assert.equal(badScheme.ok, false);
+  assert.match(badScheme.error, /ctaUrl/);
+});
+
+test("rejects a cta_url ctaDisplayText longer than 20 characters", () => {
+  const result = validateInteractivePayload({
+    interactiveType: "cta_url",
+    bodyText: "x",
+    ctaDisplayText: "this label is way too long",
+    ctaUrl: "https://example.com"
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /ctaDisplayText/);
+});
+
 test("rejects missing or oversized bodyText", () => {
   assert.equal(validateInteractivePayload({ interactiveType: "button", buttons: [{ id: "a", title: "A" }] }).ok, false);
   const result = validateInteractivePayload({
@@ -240,4 +296,374 @@ test("rejects duplicate row ids across sections", () => {
   });
   assert.equal(result.ok, false);
   assert.match(result.error, /unique/);
+});
+
+test("validateTemplatePayload accepts a minimal valid payload and trims name/language", () => {
+  const result = validateTemplatePayload({ templateName: "  order_confirmation  ", templateLanguage: " en_US " });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.value, { templateName: "order_confirmation", templateLanguage: "en_US" });
+});
+
+test("validateTemplatePayload accepts optional parameters and components", () => {
+  const components = [{ type: "body", parameters: [{ type: "text", text: "12345" }] }];
+  const result = validateTemplatePayload({
+    templateName: "shipping_update",
+    templateLanguage: "en_US",
+    parameters: ["12345"],
+    components
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.value.parameters, ["12345"]);
+  assert.deepEqual(result.value.components, components);
+});
+
+test("validateTemplatePayload rejects non-object input", () => {
+  assert.equal(validateTemplatePayload(undefined).ok, false);
+  assert.equal(validateTemplatePayload("x").ok, false);
+  assert.equal(validateTemplatePayload([]).ok, false);
+});
+
+test("validateTemplatePayload requires templateName", () => {
+  const result = validateTemplatePayload({ templateLanguage: "en_US" });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /templateName/);
+});
+
+test("validateTemplatePayload requires templateLanguage", () => {
+  const result = validateTemplatePayload({ templateName: "order_confirmation" });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /templateLanguage/);
+});
+
+test("validateTemplatePayload rejects a templateLanguage longer than 10 characters", () => {
+  const result = validateTemplatePayload({ templateName: "x", templateLanguage: "en_US_extra_long" });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /templateLanguage/);
+});
+
+test("validateTemplatePayload rejects non-array parameters", () => {
+  const result = validateTemplatePayload({ templateName: "x", templateLanguage: "en_US", parameters: "not-an-array" });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /parameters/);
+});
+
+test("validateTemplatePayload rejects more than 50 parameters", () => {
+  const result = validateTemplatePayload({
+    templateName: "x",
+    templateLanguage: "en_US",
+    parameters: Array.from({ length: 51 }, (_, i) => `p${i}`)
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /parameters/);
+});
+
+test("validateTemplatePayload rejects a non-string parameter entry", () => {
+  const result = validateTemplatePayload({ templateName: "x", templateLanguage: "en_US", parameters: [123] });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /string/);
+});
+
+test("validateTemplatePayload rejects a parameter entry longer than 1024 characters", () => {
+  const result = validateTemplatePayload({
+    templateName: "x",
+    templateLanguage: "en_US",
+    parameters: ["a".repeat(1025)]
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /1024/);
+});
+
+test("validateTemplatePayload accepts a fully-populated components array and strips unknown fields", () => {
+  const result = validateTemplatePayload({
+    templateName: "shipping_update",
+    templateLanguage: "en_US",
+    components: [
+      {
+        type: "header",
+        parameters: [{ type: "image", image: { link: "https://example.com/img.png" } }],
+        extraField: "dropped"
+      },
+      {
+        type: "body",
+        parameters: [
+          { type: "text", text: "12345" },
+          { type: "currency", currency: { fallback_value: "$10.00", code: "USD", amount_1000: 10000 } },
+          { type: "date_time", date_time: { fallback_value: "2026-01-01" } },
+          { type: "payload", payload: "TRACK-1" }
+        ]
+      },
+      {
+        type: "button",
+        sub_type: "url",
+        index: 0,
+        parameters: [{ type: "text", text: "TRACK-1" }]
+      }
+    ]
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.value.components, [
+    { type: "header", parameters: [{ type: "image", image: { link: "https://example.com/img.png" } }] },
+    {
+      type: "body",
+      parameters: [
+        { type: "text", text: "12345" },
+        { type: "currency", currency: { fallback_value: "$10.00", code: "USD", amount_1000: 10000 } },
+        { type: "date_time", date_time: { fallback_value: "2026-01-01" } },
+        { type: "payload", payload: "TRACK-1" }
+      ]
+    },
+    { type: "button", sub_type: "url", index: 0, parameters: [{ type: "text", text: "TRACK-1" }] }
+  ]);
+});
+
+test("validateTemplatePayload rejects a non-array components field", () => {
+  const result = validateTemplatePayload({ templateName: "x", templateLanguage: "en_US", components: "not-an-array" });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /components/);
+});
+
+test("validateTemplatePayload rejects more than 10 components", () => {
+  const components = Array.from({ length: 11 }, () => ({ type: "body", parameters: [] }));
+  const result = validateTemplatePayload({ templateName: "x", templateLanguage: "en_US", components });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /components/);
+});
+
+test("validateTemplatePayload rejects an unknown component type", () => {
+  const result = validateTemplatePayload({
+    templateName: "x",
+    templateLanguage: "en_US",
+    components: [{ type: "footer", parameters: [] }]
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /type/);
+});
+
+test("validateTemplatePayload rejects an unknown component sub_type", () => {
+  const result = validateTemplatePayload({
+    templateName: "x",
+    templateLanguage: "en_US",
+    components: [{ type: "button", sub_type: "carousel", parameters: [] }]
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /sub_type/);
+});
+
+test("validateTemplatePayload rejects a negative or non-integer component index", () => {
+  const negative = validateTemplatePayload({
+    templateName: "x",
+    templateLanguage: "en_US",
+    components: [{ type: "button", index: -1, parameters: [] }]
+  });
+  assert.equal(negative.ok, false);
+  assert.match(negative.error, /index/);
+
+  const fractional = validateTemplatePayload({
+    templateName: "x",
+    templateLanguage: "en_US",
+    components: [{ type: "button", index: 1.5, parameters: [] }]
+  });
+  assert.equal(fractional.ok, false);
+  assert.match(fractional.error, /index/);
+});
+
+test("validateTemplatePayload rejects more than 20 parameters within a single component", () => {
+  const parameters = Array.from({ length: 21 }, () => ({ type: "text", text: "x" }));
+  const result = validateTemplatePayload({
+    templateName: "x",
+    templateLanguage: "en_US",
+    components: [{ type: "body", parameters }]
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /parameters/);
+});
+
+test("validateTemplatePayload rejects an unknown parameter type", () => {
+  const result = validateTemplatePayload({
+    templateName: "x",
+    templateLanguage: "en_US",
+    components: [{ type: "body", parameters: [{ type: "video_call" }] }]
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /type/);
+});
+
+test("validateTemplatePayload rejects a text parameter with no text field", () => {
+  const result = validateTemplatePayload({
+    templateName: "x",
+    templateLanguage: "en_US",
+    components: [{ type: "body", parameters: [{ type: "text" }] }]
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /text/);
+});
+
+test("validateTemplatePayload rejects a text parameter longer than 1024 characters", () => {
+  const result = validateTemplatePayload({
+    templateName: "x",
+    templateLanguage: "en_US",
+    components: [{ type: "body", parameters: [{ type: "text", text: "a".repeat(1025) }] }]
+  });
+  assert.equal(result.ok, false);
+});
+
+test("validateTemplatePayload rejects a currency parameter with a non-finite amount_1000", () => {
+  const result = validateTemplatePayload({
+    templateName: "x",
+    templateLanguage: "en_US",
+    components: [{ type: "body", parameters: [{ type: "currency", currency: { fallback_value: "$1", code: "USD" } }] }]
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /amount_1000/);
+});
+
+test("validateTemplatePayload rejects an image parameter with neither link nor id", () => {
+  const result = validateTemplatePayload({
+    templateName: "x",
+    templateLanguage: "en_US",
+    components: [{ type: "header", parameters: [{ type: "image", image: {} }] }]
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /image/);
+});
+
+test("validateTemplatePayload accepts a document parameter with id and filename, no link", () => {
+  const result = validateTemplatePayload({
+    templateName: "x",
+    templateLanguage: "en_US",
+    components: [{ type: "header", parameters: [{ type: "document", document: { id: "MID-1", filename: "f.pdf" } }] }]
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.value.components[0].parameters[0], {
+    type: "document",
+    document: { id: "MID-1", filename: "f.pdf" }
+  });
+});
+
+test("validateLocationPayload accepts a minimal valid payload", () => {
+  const result = validateLocationPayload({ latitude: 37.4, longitude: -122.1 });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.value, { latitude: 37.4, longitude: -122.1 });
+});
+
+test("validateLocationPayload accepts optional name/address", () => {
+  const result = validateLocationPayload({
+    latitude: 37.4,
+    longitude: -122.1,
+    name: "HQ",
+    address: "1600 Amphitheatre Pkwy"
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.value.name, "HQ");
+  assert.equal(result.value.address, "1600 Amphitheatre Pkwy");
+});
+
+test("validateLocationPayload rejects non-object input", () => {
+  assert.equal(validateLocationPayload(undefined).ok, false);
+  assert.equal(validateLocationPayload("x").ok, false);
+  assert.equal(validateLocationPayload([]).ok, false);
+});
+
+test("validateLocationPayload rejects out-of-range or non-finite latitude", () => {
+  assert.equal(validateLocationPayload({ latitude: 91, longitude: 0 }).ok, false);
+  assert.equal(validateLocationPayload({ latitude: -91, longitude: 0 }).ok, false);
+  assert.equal(validateLocationPayload({ latitude: Infinity, longitude: 0 }).ok, false);
+  assert.equal(validateLocationPayload({ latitude: "37.4", longitude: 0 }).ok, false);
+  assert.equal(validateLocationPayload({ longitude: 0 }).ok, false);
+});
+
+test("validateLocationPayload rejects out-of-range or non-finite longitude", () => {
+  assert.equal(validateLocationPayload({ latitude: 0, longitude: 181 }).ok, false);
+  assert.equal(validateLocationPayload({ latitude: 0, longitude: -181 }).ok, false);
+  assert.equal(validateLocationPayload({ latitude: 0, longitude: NaN }).ok, false);
+  assert.equal(validateLocationPayload({ latitude: 0 }).ok, false);
+});
+
+test("validateLocationPayload rejects an oversized name or address", () => {
+  const nameResult = validateLocationPayload({ latitude: 0, longitude: 0, name: "x".repeat(201) });
+  assert.equal(nameResult.ok, false);
+  assert.match(nameResult.error, /location\.name/);
+
+  const addressResult = validateLocationPayload({ latitude: 0, longitude: 0, address: "x".repeat(501) });
+  assert.equal(addressResult.ok, false);
+  assert.match(addressResult.error, /location\.address/);
+});
+
+test("validateContactsPayload accepts a minimal contact and strips unknown fields", () => {
+  const result = validateContactsPayload([{ name: { formattedName: "Jane Doe" }, extra: "strip me" }]);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.value, [{ name: { formattedName: "Jane Doe" } }]);
+});
+
+test("validateContactsPayload accepts a full contact with phones and emails", () => {
+  const result = validateContactsPayload([
+    {
+      name: { formattedName: "Jane Doe", firstName: "Jane", lastName: "Doe" },
+      phones: [{ phone: "+15551230000", type: "work" }],
+      emails: [{ email: "jane@example.com" }]
+    }
+  ]);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.value, [
+    {
+      name: { formattedName: "Jane Doe", firstName: "Jane", lastName: "Doe" },
+      phones: [{ phone: "+15551230000", type: "work" }],
+      emails: [{ email: "jane@example.com" }]
+    }
+  ]);
+});
+
+test("validateContactsPayload rejects non-array or empty input", () => {
+  assert.equal(validateContactsPayload(undefined).ok, false);
+  assert.equal(validateContactsPayload({}).ok, false);
+  assert.equal(validateContactsPayload([]).ok, false);
+});
+
+test("validateContactsPayload rejects more than 20 contacts", () => {
+  const contacts = Array.from({ length: 21 }, () => ({ name: { formattedName: "X" } }));
+  const result = validateContactsPayload(contacts);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /1-20/);
+});
+
+test("validateContactsPayload rejects a contact missing name.formattedName", () => {
+  const missingName = validateContactsPayload([{}]);
+  assert.equal(missingName.ok, false);
+  assert.match(missingName.error, /formattedName/);
+
+  const emptyName = validateContactsPayload([{ name: {} }]);
+  assert.equal(emptyName.ok, false);
+  assert.match(emptyName.error, /formattedName/);
+});
+
+test("validateContactsPayload rejects a phone entry missing phone", () => {
+  const result = validateContactsPayload([{ name: { formattedName: "Jane" }, phones: [{ type: "work" }] }]);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /phone/);
+});
+
+test("validateContactsPayload rejects more than 10 phones", () => {
+  const phones = Array.from({ length: 11 }, (_, i) => ({ phone: `+1555123000${i}` }));
+  const result = validateContactsPayload([{ name: { formattedName: "Jane" }, phones }]);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /phones/);
+});
+
+test("validateContactsPayload rejects an email entry missing email", () => {
+  const result = validateContactsPayload([{ name: { formattedName: "Jane" }, emails: [{ type: "work" }] }]);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /email/);
+});
+
+test("validateContactsPayload rejects more than 10 emails", () => {
+  const emails = Array.from({ length: 11 }, (_, i) => ({ email: `jane${i}@example.com` }));
+  const result = validateContactsPayload([{ name: { formattedName: "Jane" }, emails }]);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /emails/);
+});
+
+test("validateContactsPayload omits empty phones/emails arrays from the cleaned value", () => {
+  const result = validateContactsPayload([{ name: { formattedName: "Jane Doe" }, phones: [], emails: [] }]);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.value, [{ name: { formattedName: "Jane Doe" } }]);
 });

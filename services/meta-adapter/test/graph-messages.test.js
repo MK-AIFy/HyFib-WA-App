@@ -5,7 +5,10 @@ import {
   buildTextBody,
   buildMediaBody,
   buildInteractiveBody,
+  buildLocationBody,
+  buildContactsBody,
   buildMarkReadBody,
+  buildTypingIndicatorBody,
   buildMediaUploadForm,
   mapMetaTemplateStatus,
   extractTemplateBody,
@@ -70,6 +73,62 @@ test("media body uses id over link and attaches filename only for documents", ()
   assert.deepEqual(audio.audio, { link: "https://x/a.ogg" });
 });
 
+test("location body includes latitude/longitude and omits name/address when absent", () => {
+  const body = buildLocationBody({ to: "1", latitude: 37.4, longitude: -122.1 });
+  assert.equal(body.type, "location");
+  assert.deepEqual(body.location, { latitude: 37.4, longitude: -122.1 });
+});
+
+test("location body includes name/address when provided", () => {
+  const body = buildLocationBody({
+    to: "1",
+    latitude: 37.4,
+    longitude: -122.1,
+    name: "HQ",
+    address: "1600 Amphitheatre Pkwy"
+  });
+  assert.deepEqual(body.location, {
+    latitude: 37.4,
+    longitude: -122.1,
+    name: "HQ",
+    address: "1600 Amphitheatre Pkwy"
+  });
+});
+
+test("contacts body shapes a minimal contact card with only formattedName", () => {
+  const body = buildContactsBody({ to: "1", contacts: [{ name: { formattedName: "Jane Doe" } }] });
+  assert.equal(body.type, "contacts");
+  assert.deepEqual(body.contacts, [{ name: { formatted_name: "Jane Doe" } }]);
+});
+
+test("contacts body shapes a full contact card with phones and emails", () => {
+  const body = buildContactsBody({
+    to: "1",
+    contacts: [
+      {
+        name: { formattedName: "Jane Doe", firstName: "Jane", lastName: "Doe" },
+        phones: [{ phone: "+15551230000", type: "work" }],
+        emails: [{ email: "jane@example.com" }]
+      }
+    ]
+  });
+  assert.deepEqual(body.contacts, [
+    {
+      name: { formatted_name: "Jane Doe", first_name: "Jane", last_name: "Doe" },
+      phones: [{ phone: "+15551230000", type: "work" }],
+      emails: [{ email: "jane@example.com" }]
+    }
+  ]);
+});
+
+test("contacts body omits empty phones/emails arrays entirely", () => {
+  const body = buildContactsBody({
+    to: "1",
+    contacts: [{ name: { formattedName: "Jane Doe" }, phones: [], emails: [] }]
+  });
+  assert.deepEqual(body.contacts, [{ name: { formatted_name: "Jane Doe" } }]);
+});
+
 test("interactive button body shapes reply buttons", () => {
   const body = buildInteractiveBody({
     to: "1",
@@ -93,11 +152,35 @@ test("interactive list body shapes sections", () => {
   assert.equal(body.interactive.action.sections[0].rows[0].description, "hot");
 });
 
+test("interactive cta_url body shapes the action name and parameters", () => {
+  const body = buildInteractiveBody({
+    to: "1",
+    interactiveType: "cta_url",
+    bodyText: "Check out our site",
+    ctaDisplayText: "Visit us",
+    ctaUrl: "https://example.com"
+  });
+  assert.equal(body.interactive.type, "cta_url");
+  assert.deepEqual(body.interactive.action, {
+    name: "cta_url",
+    parameters: { display_text: "Visit us", url: "https://example.com" }
+  });
+});
+
 test("mark-read body", () => {
   assert.deepEqual(buildMarkReadBody("wamid.1"), {
     messaging_product: "whatsapp",
     status: "read",
     message_id: "wamid.1"
+  });
+});
+
+test("typing indicator body sets status read and typing_indicator type", () => {
+  assert.deepEqual(buildTypingIndicatorBody("wamid.1"), {
+    messaging_product: "whatsapp",
+    status: "read",
+    message_id: "wamid.1",
+    typing_indicator: { type: "text" }
   });
 });
 

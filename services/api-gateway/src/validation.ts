@@ -1,4 +1,4 @@
-import type { WhatsAppInteractivePayload } from "@hyfib/shared-core";
+import type { TemplateComponent, WhatsAppContactCard, WhatsAppInteractivePayload } from "@hyfib/shared-core";
 
 export type ValidationResult<T> = { ok: true; value: T } | { ok: false; error: string };
 
@@ -98,6 +98,8 @@ const ROW_ID_MAX = 200;
 const ROW_TITLE_MAX = 24;
 const ROW_DESCRIPTION_MAX = 72;
 const TOTAL_ROWS_MAX = 10;
+const CTA_DISPLAY_TEXT_MAX = 20;
+const CTA_URL_MAX = 2048;
 
 function isNonEmptyString(value: unknown, max: number): value is string {
   return typeof value === "string" && value.trim().length > 0 && value.length <= max;
@@ -188,8 +190,12 @@ export function validateInteractivePayload(input: unknown): ValidationResult<Wha
   }
   const candidate = input as Record<string, unknown>;
 
-  if (candidate.interactiveType !== "button" && candidate.interactiveType !== "list") {
-    return { ok: false, error: 'interactive.interactiveType must be "button" or "list"' };
+  if (
+    candidate.interactiveType !== "button" &&
+    candidate.interactiveType !== "list" &&
+    candidate.interactiveType !== "cta_url"
+  ) {
+    return { ok: false, error: 'interactive.interactiveType must be "button", "list" or "cta_url"' };
   }
   if (!isNonEmptyString(candidate.bodyText, BODY_TEXT_MAX)) {
     return { ok: false, error: `interactive.bodyText is required (at most ${BODY_TEXT_MAX} characters)` };
@@ -232,6 +238,18 @@ export function validateInteractivePayload(input: unknown): ValidationResult<Wha
       cleanButtons.push({ id: entry.id as string, title: entry.title as string });
     }
     value.buttons = cleanButtons;
+    return { ok: true, value };
+  }
+
+  if (candidate.interactiveType === "cta_url") {
+    if (!isNonEmptyString(candidate.ctaDisplayText, CTA_DISPLAY_TEXT_MAX)) {
+      return { ok: false, error: `interactive.ctaDisplayText is required (at most ${CTA_DISPLAY_TEXT_MAX} chars)` };
+    }
+    if (!isNonEmptyString(candidate.ctaUrl, CTA_URL_MAX) || !/^https?:\/\//i.test(candidate.ctaUrl)) {
+      return { ok: false, error: `interactive.ctaUrl must be an http(s) URL (at most ${CTA_URL_MAX} chars)` };
+    }
+    value.ctaDisplayText = candidate.ctaDisplayText;
+    value.ctaUrl = candidate.ctaUrl;
     return { ok: true, value };
   }
 
@@ -291,4 +309,367 @@ export function validateInteractivePayload(input: unknown): ValidationResult<Wha
   }
   value.sections = cleanSections;
   return { ok: true, value };
+}
+
+const TEMPLATE_NAME_MAX = 512;
+const TEMPLATE_LANGUAGE_MAX = 10;
+const TEMPLATE_PARAMETERS_MAX = 50;
+const TEMPLATE_PARAMETER_MAX = 1024;
+
+export interface TemplateSendPayload {
+  templateName: string;
+  templateLanguage: string;
+  parameters?: string[];
+  components?: TemplateComponent[];
+}
+
+const TEMPLATE_COMPONENTS_MAX = 10;
+const TEMPLATE_COMPONENT_PARAMETERS_MAX = 20;
+const TEMPLATE_PARAMETER_TEXT_MAX = 1024;
+const TEMPLATE_CURRENCY_CODE_MAX = 10;
+const TEMPLATE_MEDIA_LINK_MAX = 2048;
+const TEMPLATE_MEDIA_ID_MAX = 256;
+const TEMPLATE_MEDIA_FILENAME_MAX = 256;
+const TEMPLATE_COMPONENT_TYPES = new Set(["header", "body", "button"]);
+const TEMPLATE_COMPONENT_SUB_TYPES = new Set(["url", "quick_reply"]);
+const TEMPLATE_PARAMETER_TYPES = new Set(["text", "currency", "date_time", "image", "document", "video", "payload"]);
+
+function validateTemplateParameter(input: unknown): ValidationResult<TemplateComponent["parameters"][number]> {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return { ok: false, error: "template.components[].parameters[] must be an object" };
+  }
+  const candidate = input as Record<string, unknown>;
+  if (typeof candidate.type !== "string" || !TEMPLATE_PARAMETER_TYPES.has(candidate.type)) {
+    return { ok: false, error: "template.components[].parameters[].type is invalid" };
+  }
+  const type = candidate.type as TemplateComponent["parameters"][number]["type"];
+
+  switch (type) {
+    case "text": {
+      const text = optionalString(candidate.text, TEMPLATE_PARAMETER_TEXT_MAX, "template parameter text");
+      if (text.error || text.value === undefined) {
+        return { ok: false, error: text.error ?? "template.components[].parameters[].text is required for type text" };
+      }
+      return { ok: true, value: { type, text: text.value } };
+    }
+    case "payload": {
+      const payload = optionalString(candidate.payload, TEMPLATE_PARAMETER_TEXT_MAX, "template parameter payload");
+      if (payload.error || payload.value === undefined) {
+        return {
+          ok: false,
+          error: payload.error ?? "template.components[].parameters[].payload is required for type payload"
+        };
+      }
+      return { ok: true, value: { type, payload: payload.value } };
+    }
+    case "currency": {
+      const currency = candidate.currency as Record<string, unknown> | undefined;
+      const fallback = optionalString(currency?.fallback_value, TEMPLATE_PARAMETER_TEXT_MAX, "currency.fallback_value");
+      const code = optionalString(currency?.code, TEMPLATE_CURRENCY_CODE_MAX, "currency.code");
+      if (!currency || fallback.error || fallback.value === undefined || code.error || code.value === undefined) {
+        return { ok: false, error: fallback.error ?? code.error ?? "template parameter currency is malformed" };
+      }
+      const amount = currency.amount_1000;
+      if (typeof amount !== "number" || !Number.isFinite(amount)) {
+        return { ok: false, error: "template parameter currency.amount_1000 must be a finite number" };
+      }
+      return {
+        ok: true,
+        value: { type, currency: { fallback_value: fallback.value, code: code.value, amount_1000: amount } }
+      };
+    }
+    case "date_time": {
+      const dateTime = candidate.date_time as Record<string, unknown> | undefined;
+      const fallback = optionalString(
+        dateTime?.fallback_value,
+        TEMPLATE_PARAMETER_TEXT_MAX,
+        "date_time.fallback_value"
+      );
+      if (!dateTime || fallback.error || fallback.value === undefined) {
+        return { ok: false, error: fallback.error ?? "template parameter date_time.fallback_value is required" };
+      }
+      return { ok: true, value: { type, date_time: { fallback_value: fallback.value } } };
+    }
+    case "image":
+    case "video": {
+      const media = candidate[type] as Record<string, unknown> | undefined;
+      const link = optionalString(media?.link, TEMPLATE_MEDIA_LINK_MAX, `${type}.link`);
+      const id = optionalString(media?.id, TEMPLATE_MEDIA_ID_MAX, `${type}.id`);
+      if (link.error || id.error || (link.value === undefined && id.value === undefined)) {
+        return { ok: false, error: link.error ?? id.error ?? `template parameter ${type} requires a link or id` };
+      }
+      return {
+        ok: true,
+        value: { type, [type]: { ...(link.value ? { link: link.value } : {}), ...(id.value ? { id: id.value } : {}) } }
+      };
+    }
+    case "document": {
+      const media = candidate.document as Record<string, unknown> | undefined;
+      const link = optionalString(media?.link, TEMPLATE_MEDIA_LINK_MAX, "document.link");
+      const id = optionalString(media?.id, TEMPLATE_MEDIA_ID_MAX, "document.id");
+      const filename = optionalString(media?.filename, TEMPLATE_MEDIA_FILENAME_MAX, "document.filename");
+      if (link.error || id.error || filename.error || (link.value === undefined && id.value === undefined)) {
+        return {
+          ok: false,
+          error: link.error ?? id.error ?? filename.error ?? "template parameter document requires a link or id"
+        };
+      }
+      return {
+        ok: true,
+        value: {
+          type,
+          document: {
+            ...(link.value ? { link: link.value } : {}),
+            ...(id.value ? { id: id.value } : {}),
+            ...(filename.value ? { filename: filename.value } : {})
+          }
+        }
+      };
+    }
+  }
+}
+
+function validateTemplateComponents(input: unknown): ValidationResult<TemplateComponent[]> {
+  if (!Array.isArray(input) || input.length > TEMPLATE_COMPONENTS_MAX) {
+    return { ok: false, error: `template.components must be an array of at most ${TEMPLATE_COMPONENTS_MAX} entries` };
+  }
+  const cleanComponents: TemplateComponent[] = [];
+  for (const entry of input) {
+    const candidate = entry as Record<string, unknown>;
+    if (typeof candidate?.type !== "string" || !TEMPLATE_COMPONENT_TYPES.has(candidate.type)) {
+      return { ok: false, error: 'template.components[].type must be "header", "body" or "button"' };
+    }
+    if (candidate.sub_type !== undefined && !TEMPLATE_COMPONENT_SUB_TYPES.has(candidate.sub_type as string)) {
+      return { ok: false, error: 'template.components[].sub_type must be "url" or "quick_reply"' };
+    }
+    if (candidate.index !== undefined && (!Number.isInteger(candidate.index) || (candidate.index as number) < 0)) {
+      return { ok: false, error: "template.components[].index must be a non-negative integer" };
+    }
+    const parametersRaw = candidate.parameters;
+    if (!Array.isArray(parametersRaw) || parametersRaw.length > TEMPLATE_COMPONENT_PARAMETERS_MAX) {
+      return {
+        ok: false,
+        error: `template.components[].parameters must be an array of at most ${TEMPLATE_COMPONENT_PARAMETERS_MAX} entries`
+      };
+    }
+    const cleanParameters = [];
+    for (const param of parametersRaw) {
+      const validated = validateTemplateParameter(param);
+      if (!validated.ok) {
+        return validated;
+      }
+      cleanParameters.push(validated.value);
+    }
+    cleanComponents.push({
+      type: candidate.type as TemplateComponent["type"],
+      ...(candidate.sub_type !== undefined ? { sub_type: candidate.sub_type as TemplateComponent["sub_type"] } : {}),
+      ...(candidate.index !== undefined ? { index: candidate.index as number } : {}),
+      parameters: cleanParameters
+    });
+  }
+  return { ok: true, value: cleanComponents };
+}
+
+/**
+ * Validates a template-send request for the agent conversation-send route.
+ * Trims templateName/templateLanguage; `components`, when present, is
+ * deeply validated and stripped of unknown fields the same way
+ * validateInteractivePayload strips its own caller input.
+ */
+export function validateTemplatePayload(input: unknown): ValidationResult<TemplateSendPayload> {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return { ok: false, error: "template must be an object" };
+  }
+  const candidate = input as Record<string, unknown>;
+
+  const nameCheck = boundedText(candidate.templateName, TEMPLATE_NAME_MAX);
+  if (!nameCheck.ok) {
+    return { ok: false, error: `template.templateName ${nameCheck.error}` };
+  }
+  const languageCheck = boundedText(candidate.templateLanguage, TEMPLATE_LANGUAGE_MAX);
+  if (!languageCheck.ok) {
+    return { ok: false, error: `template.templateLanguage ${languageCheck.error}` };
+  }
+
+  const value: TemplateSendPayload = {
+    templateName: nameCheck.value,
+    templateLanguage: languageCheck.value
+  };
+
+  if (candidate.parameters !== undefined) {
+    if (!Array.isArray(candidate.parameters) || candidate.parameters.length > TEMPLATE_PARAMETERS_MAX) {
+      return { ok: false, error: `template.parameters must be an array of at most ${TEMPLATE_PARAMETERS_MAX} strings` };
+    }
+    for (const param of candidate.parameters) {
+      if (typeof param !== "string" || param.length > TEMPLATE_PARAMETER_MAX) {
+        return {
+          ok: false,
+          error: `each template.parameters entry must be a string of at most ${TEMPLATE_PARAMETER_MAX} characters`
+        };
+      }
+    }
+    value.parameters = candidate.parameters;
+  }
+
+  if (candidate.components !== undefined) {
+    const componentsCheck = validateTemplateComponents(candidate.components);
+    if (!componentsCheck.ok) {
+      return { ok: false, error: componentsCheck.error };
+    }
+    value.components = componentsCheck.value;
+  }
+
+  return { ok: true, value };
+}
+
+const LOCATION_NAME_MAX = 200;
+const LOCATION_ADDRESS_MAX = 500;
+
+export interface LocationSendPayload {
+  latitude: number;
+  longitude: number;
+  name?: string;
+  address?: string;
+}
+
+/** Validates a location-send request for the agent conversation-send route. */
+export function validateLocationPayload(input: unknown): ValidationResult<LocationSendPayload> {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return { ok: false, error: "location must be an object" };
+  }
+  const candidate = input as Record<string, unknown>;
+
+  const latitude = candidate.latitude;
+  if (typeof latitude !== "number" || !Number.isFinite(latitude) || latitude < -90 || latitude > 90) {
+    return { ok: false, error: "location.latitude must be a finite number between -90 and 90" };
+  }
+  const longitude = candidate.longitude;
+  if (typeof longitude !== "number" || !Number.isFinite(longitude) || longitude < -180 || longitude > 180) {
+    return { ok: false, error: "location.longitude must be a finite number between -180 and 180" };
+  }
+
+  const value: LocationSendPayload = { latitude, longitude };
+
+  const name = optionalString(candidate.name, LOCATION_NAME_MAX, "location.name");
+  if (name.error) {
+    return { ok: false, error: name.error };
+  }
+  if (name.value !== undefined) {
+    value.name = name.value;
+  }
+  const address = optionalString(candidate.address, LOCATION_ADDRESS_MAX, "location.address");
+  if (address.error) {
+    return { ok: false, error: address.error };
+  }
+  if (address.value !== undefined) {
+    value.address = address.value;
+  }
+
+  return { ok: true, value };
+}
+
+const CONTACTS_MAX = 20;
+const CONTACT_NAME_MAX = 256;
+const CONTACT_PHONE_MAX = 32;
+const CONTACT_EMAIL_MAX = 256;
+const CONTACT_FIELD_TYPE_MAX = 32;
+const CONTACT_PHONES_MAX = 10;
+const CONTACT_EMAILS_MAX = 10;
+
+/**
+ * Validates a contacts-send request for the agent conversation-send route.
+ * Strips unknown fields the same way validateInteractivePayload does — only
+ * the shape below ever reaches the outbox.
+ */
+export function validateContactsPayload(input: unknown): ValidationResult<WhatsAppContactCard[]> {
+  if (!Array.isArray(input) || input.length === 0 || input.length > CONTACTS_MAX) {
+    return { ok: false, error: `contacts must be an array of 1-${CONTACTS_MAX} contact cards` };
+  }
+
+  const cleanContacts: WhatsAppContactCard[] = [];
+  for (const entry of input) {
+    const candidate = entry as Record<string, unknown>;
+    const nameCandidate = candidate?.name as Record<string, unknown> | undefined;
+    const formattedName = optionalString(
+      nameCandidate?.formattedName,
+      CONTACT_NAME_MAX,
+      "contacts[].name.formattedName"
+    );
+    if (!nameCandidate || formattedName.value === undefined) {
+      return {
+        ok: false,
+        error: formattedName.error ?? `contacts[].name.formattedName is required (at most ${CONTACT_NAME_MAX} chars)`
+      };
+    }
+    const firstName = optionalString(nameCandidate.firstName, CONTACT_NAME_MAX, "contacts[].name.firstName");
+    if (firstName.error) {
+      return { ok: false, error: firstName.error };
+    }
+    const lastName = optionalString(nameCandidate.lastName, CONTACT_NAME_MAX, "contacts[].name.lastName");
+    if (lastName.error) {
+      return { ok: false, error: lastName.error };
+    }
+
+    const contact: WhatsAppContactCard = {
+      name: {
+        formattedName: formattedName.value,
+        ...(firstName.value !== undefined ? { firstName: firstName.value } : {}),
+        ...(lastName.value !== undefined ? { lastName: lastName.value } : {})
+      }
+    };
+
+    const phonesRaw = candidate.phones;
+    if (phonesRaw !== undefined) {
+      if (!Array.isArray(phonesRaw) || phonesRaw.length > CONTACT_PHONES_MAX) {
+        return { ok: false, error: `contacts[].phones must be an array of at most ${CONTACT_PHONES_MAX} entries` };
+      }
+      const cleanPhones = [];
+      for (const phoneEntry of phonesRaw) {
+        const phoneCandidate = phoneEntry as Record<string, unknown>;
+        if (!isNonEmptyString(phoneCandidate?.phone, CONTACT_PHONE_MAX)) {
+          return { ok: false, error: `each contacts[].phones entry needs a phone (≤${CONTACT_PHONE_MAX} chars)` };
+        }
+        const type = optionalString(phoneCandidate.type, CONTACT_FIELD_TYPE_MAX, "contacts[].phones[].type");
+        if (type.error) {
+          return { ok: false, error: type.error };
+        }
+        cleanPhones.push({
+          phone: phoneCandidate.phone as string,
+          ...(type.value !== undefined ? { type: type.value } : {})
+        });
+      }
+      if (cleanPhones.length > 0) {
+        contact.phones = cleanPhones;
+      }
+    }
+
+    const emailsRaw = candidate.emails;
+    if (emailsRaw !== undefined) {
+      if (!Array.isArray(emailsRaw) || emailsRaw.length > CONTACT_EMAILS_MAX) {
+        return { ok: false, error: `contacts[].emails must be an array of at most ${CONTACT_EMAILS_MAX} entries` };
+      }
+      const cleanEmails = [];
+      for (const emailEntry of emailsRaw) {
+        const emailCandidate = emailEntry as Record<string, unknown>;
+        if (!isNonEmptyString(emailCandidate?.email, CONTACT_EMAIL_MAX)) {
+          return { ok: false, error: `each contacts[].emails entry needs an email (≤${CONTACT_EMAIL_MAX} chars)` };
+        }
+        const type = optionalString(emailCandidate.type, CONTACT_FIELD_TYPE_MAX, "contacts[].emails[].type");
+        if (type.error) {
+          return { ok: false, error: type.error };
+        }
+        cleanEmails.push({
+          email: emailCandidate.email as string,
+          ...(type.value !== undefined ? { type: type.value } : {})
+        });
+      }
+      if (cleanEmails.length > 0) {
+        contact.emails = cleanEmails;
+      }
+    }
+
+    cleanContacts.push(contact);
+  }
+
+  return { ok: true, value: cleanContacts };
 }

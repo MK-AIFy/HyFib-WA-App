@@ -1798,6 +1798,23 @@ export const messageRepository = {
       return result.rows[0] ? mapMessage(result.rows[0]) : undefined;
     });
   },
+  /**
+   * The external (Meta) message id of the most recent inbound message in a
+   * conversation, or undefined if none exists (or none carries an external
+   * id). Used to resolve the message id a typing indicator must reference —
+   * rides idx_messages_conversation_created (see 005_channel_credentials.sql).
+   */
+  async lastInboundExternalId(tenantId: string, conversationId: string): Promise<string | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<{ external_message_id: string | null }>(
+        `SELECT external_message_id FROM messages
+         WHERE conversation_id = $1 AND direction = 'inbound' AND external_message_id IS NOT NULL
+         ORDER BY created_at DESC LIMIT 1`,
+        [conversationId]
+      );
+      return result.rows[0]?.external_message_id ?? undefined;
+    });
+  },
   async countOutboundSince(tenantId: string, contactId: string, sinceISO: string): Promise<number> {
     return withTenant(tenantId, async (client) => {
       const result = await client.query<{ count: string }>(

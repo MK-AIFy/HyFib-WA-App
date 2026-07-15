@@ -16,6 +16,7 @@ import {
   sendJson,
   sendMetrics,
   type MetaTemplateSummary,
+  type WhatsAppContactCard,
   type WhatsAppInteractiveSendRequest,
   type WhatsAppMarkReadRequest,
   type WhatsAppMediaSendRequest,
@@ -25,14 +26,17 @@ import {
 } from "@hyfib/shared-core";
 import {
   buildCatalogMessage,
+  buildContactsBody,
   buildFlowMessage,
   buildInteractiveBody,
+  buildLocationBody,
   buildMarkReadBody,
   buildMediaBody,
   buildMediaUploadForm,
   buildProductMessage,
   buildTemplateBody,
   buildTextBody,
+  buildTypingIndicatorBody,
   extractTemplateBody,
   mapMetaTemplateStatus
 } from "./graph-messages.js";
@@ -282,6 +286,38 @@ export async function markReadDirect(
 }
 
 /**
+ * Direct in-process typing indicator. Mirrors `markReadDirect`'s shape —
+ * best-effort, never routed through the outbox since a typing indicator has
+ * no meaning once delayed.
+ */
+export async function sendTypingIndicatorDirect(
+  payload: WhatsAppMarkReadRequest,
+  _requestId: string
+): Promise<MetaDispatchResult> {
+  if (!payload.phoneNumberId || !payload.messageId) {
+    return { status: 400, body: { error: "phoneNumberId and messageId are required" } };
+  }
+  try {
+    const response = await graphRequest(
+      `/${payload.phoneNumberId}/messages`,
+      "POST",
+      buildTypingIndicatorBody(payload.messageId),
+      payload.accessToken
+    );
+    if (!response.ok) {
+      const graphError = await parseGraphError(response);
+      return { status: 502, body: { error: "meta_typing_indicator_failed", details: graphError } };
+    }
+    return { status: 200, body: { status: "typing_indicator_sent", messageId: payload.messageId } };
+  } catch (error) {
+    return {
+      status: 503,
+      body: { error: "meta_adapter_unavailable", details: error instanceof Error ? error.message : String(error) }
+    };
+  }
+}
+
+/**
  * Route an internal `/internal/v1/whatsapp/*` send/mark-read request to the
  * matching Graph builder + send, returning the same status/body the HTTP
  * endpoint produces. The worker calls this in-process in the monolith instead
@@ -310,6 +346,13 @@ export async function metaDispatch(
     buttons?: WhatsAppInteractiveSendRequest["buttons"];
     buttonLabel?: string;
     sections?: unknown;
+    ctaDisplayText?: string;
+    ctaUrl?: string;
+    latitude?: number;
+    longitude?: number;
+    name?: string;
+    address?: string;
+    contacts?: WhatsAppContactCard[];
     catalogId?: string;
     productRetailerId?: string;
     flowId?: string;
@@ -345,9 +388,44 @@ export async function metaDispatch(
       return sendGraphMessage(requestId, p.phoneNumberId, body, p.accessToken);
     }
 
+    case "/internal/v1/whatsapp/send-location": {
+      if (
+        !p.phoneNumberId ||
+        !p.to ||
+        typeof p.latitude !== "number" ||
+        typeof p.longitude !== "number" ||
+        !Number.isFinite(p.latitude) ||
+        !Number.isFinite(p.longitude)
+      ) {
+        return { status: 400, body: { error: "phoneNumberId, to, latitude and longitude are required" } };
+      }
+      const body = buildLocationBody({
+        to: p.to,
+        latitude: p.latitude,
+        longitude: p.longitude,
+        name: p.name,
+        address: p.address
+      });
+      return sendGraphMessage(requestId, p.phoneNumberId, body, p.accessToken);
+    }
+
+    case "/internal/v1/whatsapp/send-contacts": {
+      if (!p.phoneNumberId || !p.to || !Array.isArray(p.contacts) || p.contacts.length === 0) {
+        return { status: 400, body: { error: "phoneNumberId, to and at least one contact are required" } };
+      }
+      if (p.contacts.some((contact) => !contact?.name?.formattedName)) {
+        return { status: 400, body: { error: "each contact requires name.formattedName" } };
+      }
+      const body = buildContactsBody({ to: p.to, contacts: p.contacts });
+      return sendGraphMessage(requestId, p.phoneNumberId, body, p.accessToken);
+    }
+
     case "/internal/v1/whatsapp/send-interactive": {
       if (!p.phoneNumberId || !p.to || !p.interactiveType || !p.bodyText) {
         return { status: 400, body: { error: "phoneNumberId, to, interactiveType and bodyText are required" } };
+      }
+      if (p.interactiveType === "cta_url" && (!p.ctaUrl || !p.ctaDisplayText)) {
+        return { status: 400, body: { error: "ctaUrl and ctaDisplayText are required for interactiveType cta_url" } };
       }
       const body = buildInteractiveBody({
         to: p.to,
@@ -357,7 +435,9 @@ export async function metaDispatch(
         footerText: p.footerText,
         buttons: p.buttons,
         buttonLabel: p.buttonLabel,
-        sections: p.sections as never
+        sections: p.sections as never,
+        ctaDisplayText: p.ctaDisplayText,
+        ctaUrl: p.ctaUrl
       });
       return sendGraphMessage(requestId, p.phoneNumberId, body, p.accessToken);
     }
@@ -412,6 +492,9 @@ export async function metaDispatch(
 
     case "/internal/v1/whatsapp/mark-read":
       return markReadDirect(payload as unknown as WhatsAppMarkReadRequest, requestId);
+
+    case "/internal/v1/whatsapp/send-typing":
+      return sendTypingIndicatorDirect(payload as unknown as WhatsAppMarkReadRequest, requestId);
 
     default:
       return { status: 404, body: { error: "unknown_meta_endpoint", endpoint } };
@@ -598,7 +681,11 @@ export async function fetchMediaDirect(
   return lastFailure ?? { status: 502, error: "meta_media_download_failed" };
 }
 
-const server = createServer(async (req, res) => {
+// Exported (not just used via isMain below) so tests can do real HTTP
+// round-trips against the standalone route table without binding the
+// production port — this is what catches a metaDispatch case shipping
+// without its matching HTTP route registration (they must stay paired).
+export const server = createServer(async (req, res) => {
   try {
     const path = parseUrlPath(req.url);
     const method = req.method ?? "GET";
@@ -688,6 +775,10 @@ const server = createServer(async (req, res) => {
         sendJson(res, 400, { error: "phoneNumberId, to, interactiveType and bodyText are required" });
         return;
       }
+      if (payload.interactiveType === "cta_url" && (!payload.ctaUrl || !payload.ctaDisplayText)) {
+        sendJson(res, 400, { error: "ctaUrl and ctaDisplayText are required for interactiveType cta_url" });
+        return;
+      }
       const graphBody = buildInteractiveBody({
         to: payload.to,
         interactiveType: payload.interactiveType,
@@ -696,7 +787,9 @@ const server = createServer(async (req, res) => {
         footerText: payload.footerText,
         buttons: payload.buttons,
         buttonLabel: payload.buttonLabel,
-        sections: payload.sections
+        sections: payload.sections,
+        ctaDisplayText: payload.ctaDisplayText,
+        ctaUrl: payload.ctaUrl
       });
       await dispatchSend(res, ctx.requestId, payload.phoneNumberId, graphBody, payload.accessToken);
       return;
@@ -802,6 +895,66 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    if (path === "/internal/v1/whatsapp/send-location") {
+      if (method !== "POST") {
+        methodNotAllowed(res);
+        return;
+      }
+      const payload = await readJsonBody<{
+        phoneNumberId?: string;
+        to?: string;
+        latitude?: number;
+        longitude?: number;
+        name?: string;
+        address?: string;
+        accessToken?: string;
+      }>(req);
+      if (
+        !payload.phoneNumberId ||
+        !payload.to ||
+        typeof payload.latitude !== "number" ||
+        typeof payload.longitude !== "number" ||
+        !Number.isFinite(payload.latitude) ||
+        !Number.isFinite(payload.longitude)
+      ) {
+        sendJson(res, 400, { error: "phoneNumberId, to, latitude and longitude are required" });
+        return;
+      }
+      const graphBody = buildLocationBody({
+        to: payload.to,
+        latitude: payload.latitude,
+        longitude: payload.longitude,
+        name: payload.name,
+        address: payload.address
+      });
+      await dispatchSend(res, ctx.requestId, payload.phoneNumberId, graphBody, payload.accessToken);
+      return;
+    }
+
+    if (path === "/internal/v1/whatsapp/send-contacts") {
+      if (method !== "POST") {
+        methodNotAllowed(res);
+        return;
+      }
+      const payload = await readJsonBody<{
+        phoneNumberId?: string;
+        to?: string;
+        contacts?: WhatsAppContactCard[];
+        accessToken?: string;
+      }>(req);
+      if (!payload.phoneNumberId || !payload.to || !Array.isArray(payload.contacts) || payload.contacts.length === 0) {
+        sendJson(res, 400, { error: "phoneNumberId, to and at least one contact are required" });
+        return;
+      }
+      if (payload.contacts.some((contact) => !contact?.name?.formattedName)) {
+        sendJson(res, 400, { error: "each contact requires name.formattedName" });
+        return;
+      }
+      const graphBody = buildContactsBody({ to: payload.to, contacts: payload.contacts });
+      await dispatchSend(res, ctx.requestId, payload.phoneNumberId, graphBody, payload.accessToken);
+      return;
+    }
+
     if (path === "/internal/v1/whatsapp/mark-read") {
       if (method !== "POST") {
         methodNotAllowed(res);
@@ -809,6 +962,17 @@ const server = createServer(async (req, res) => {
       }
       const payload = await readJsonBody<WhatsAppMarkReadRequest>(req);
       const { status, body } = await markReadDirect(payload, ctx.requestId);
+      sendJson(res, status, body);
+      return;
+    }
+
+    if (path === "/internal/v1/whatsapp/send-typing") {
+      if (method !== "POST") {
+        methodNotAllowed(res);
+        return;
+      }
+      const payload = await readJsonBody<WhatsAppMarkReadRequest>(req);
+      const { status, body } = await sendTypingIndicatorDirect(payload, ctx.requestId);
       sendJson(res, status, body);
       return;
     }

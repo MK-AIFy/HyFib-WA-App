@@ -286,6 +286,61 @@ test("an archived, pinned conversation appears only in the archived list, not th
   assert.ok(archivedList.items[0].pinnedAt, "pinnedAt should still be set even though the conversation is archived");
 });
 
+test(
+  "lastInboundExternalId returns the most recent inbound message's external id, ignoring outbound messages and messages without one",
+  { skip },
+  async () => {
+    const { tenant, channel } = await seedTenantWithChannel("Last Inbound External Id Tenant");
+    const { conversation } = await seedConversation(tenant, channel, {
+      phoneE164: "+15556660002",
+      firstName: "Typing",
+      lastName: "Test"
+    });
+
+    // No messages yet.
+    assert.equal(await messageRepository.lastInboundExternalId(tenant.id, conversation.id), undefined);
+
+    await messageRepository.create(tenant.id, {
+      conversationId: conversation.id,
+      direction: "inbound",
+      status: "delivered",
+      payload: { text: "first inbound" },
+      externalMessageId: "wamid.first"
+    });
+
+    // A burst of outbound messages must not shadow the earlier inbound one.
+    for (let i = 0; i < 5; i++) {
+      await messageRepository.create(tenant.id, {
+        conversationId: conversation.id,
+        direction: "outbound",
+        status: "sent",
+        payload: { text: `agent reply ${i}` },
+        externalMessageId: `wamid.outbound-${i}`
+      });
+    }
+    assert.equal(await messageRepository.lastInboundExternalId(tenant.id, conversation.id), "wamid.first");
+
+    // An inbound message with no external id must be skipped in favor of the earlier one that has one.
+    await messageRepository.create(tenant.id, {
+      conversationId: conversation.id,
+      direction: "inbound",
+      status: "delivered",
+      payload: { text: "inbound without external id" }
+    });
+    assert.equal(await messageRepository.lastInboundExternalId(tenant.id, conversation.id), "wamid.first");
+
+    // A newer inbound message with an external id becomes the answer.
+    await messageRepository.create(tenant.id, {
+      conversationId: conversation.id,
+      direction: "inbound",
+      status: "delivered",
+      payload: { text: "newest inbound" },
+      externalMessageId: "wamid.newest"
+    });
+    assert.equal(await messageRepository.lastInboundExternalId(tenant.id, conversation.id), "wamid.newest");
+  }
+);
+
 test.after(async () => {
   if (!skip) {
     await closePool();

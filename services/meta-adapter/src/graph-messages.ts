@@ -1,6 +1,8 @@
 import type {
   TemplateComponent,
+  WhatsAppContactCard,
   WhatsAppInteractiveSendRequest,
+  WhatsAppLocationSendRequest,
   WhatsAppMediaSendRequest,
   WhatsAppTextSendRequest
 } from "@hyfib/shared-core";
@@ -85,10 +87,59 @@ export function buildMediaBody(
   };
 }
 
+export function buildLocationBody(
+  input: Pick<WhatsAppLocationSendRequest, "to" | "latitude" | "longitude" | "name" | "address">
+): Record<string, unknown> {
+  return {
+    messaging_product: "whatsapp",
+    recipient_type: "individual",
+    to: input.to,
+    type: "location",
+    location: {
+      latitude: input.latitude,
+      longitude: input.longitude,
+      ...(input.name ? { name: input.name } : {}),
+      ...(input.address ? { address: input.address } : {})
+    }
+  };
+}
+
+/** Builds a `contacts`-type message body sharing one or more vCard-style contact cards. */
+export function buildContactsBody(input: { to: string; contacts: WhatsAppContactCard[] }): Record<string, unknown> {
+  return {
+    messaging_product: "whatsapp",
+    recipient_type: "individual",
+    to: input.to,
+    type: "contacts",
+    contacts: input.contacts.map((contact) => ({
+      name: {
+        formatted_name: contact.name.formattedName,
+        ...(contact.name.firstName ? { first_name: contact.name.firstName } : {}),
+        ...(contact.name.lastName ? { last_name: contact.name.lastName } : {})
+      },
+      ...(contact.phones?.length
+        ? { phones: contact.phones.map((p) => ({ phone: p.phone, ...(p.type ? { type: p.type } : {}) })) }
+        : {}),
+      ...(contact.emails?.length
+        ? { emails: contact.emails.map((e) => ({ email: e.email, ...(e.type ? { type: e.type } : {}) })) }
+        : {})
+    }))
+  };
+}
+
 export function buildInteractiveBody(
   input: Pick<
     WhatsAppInteractiveSendRequest,
-    "to" | "interactiveType" | "bodyText" | "headerText" | "footerText" | "buttons" | "buttonLabel" | "sections"
+    | "to"
+    | "interactiveType"
+    | "bodyText"
+    | "headerText"
+    | "footerText"
+    | "buttons"
+    | "buttonLabel"
+    | "sections"
+    | "ctaDisplayText"
+    | "ctaUrl"
   >
 ): Record<string, unknown> {
   const interactive: Record<string, unknown> = {
@@ -107,6 +158,11 @@ export function buildInteractiveBody(
         type: "reply",
         reply: { id: button.id, title: button.title }
       }))
+    };
+  } else if (input.interactiveType === "cta_url") {
+    interactive.action = {
+      name: "cta_url",
+      parameters: { display_text: input.ctaDisplayText, url: input.ctaUrl }
     };
   } else {
     interactive.action = {
@@ -257,6 +313,20 @@ export function buildMarkReadBody(messageId: string): Record<string, unknown> {
     messaging_product: "whatsapp",
     status: "read",
     message_id: messageId
+  };
+}
+
+/**
+ * Marks the referenced inbound message read and shows the typing indicator
+ * to the customer. Meta only exposes typing indicators as an extension of
+ * the read-receipt call — there is no standalone "start typing" endpoint.
+ */
+export function buildTypingIndicatorBody(messageId: string): Record<string, unknown> {
+  return {
+    messaging_product: "whatsapp",
+    status: "read",
+    message_id: messageId,
+    typing_indicator: { type: "text" }
   };
 }
 

@@ -464,7 +464,7 @@ export interface WhatsAppInteractiveRow {
 export interface WhatsAppInteractiveSendRequest {
   phoneNumberId: string;
   to: string;
-  interactiveType: "button" | "list";
+  interactiveType: "button" | "list" | "cta_url";
   bodyText: string;
   headerText?: string;
   footerText?: string;
@@ -473,6 +473,10 @@ export interface WhatsAppInteractiveSendRequest {
   /** For interactiveType "list". */
   buttonLabel?: string;
   sections?: Array<{ title?: string; rows: WhatsAppInteractiveRow[] }>;
+  /** For interactiveType "cta_url": the button's visible label. */
+  ctaDisplayText?: string;
+  /** For interactiveType "cta_url": the URL opened when the button is tapped. */
+  ctaUrl?: string;
   accessToken?: string;
 }
 
@@ -482,6 +486,31 @@ export interface WhatsAppInteractiveSendRequest {
  * resolves from the channel at send time.
  */
 export type WhatsAppInteractivePayload = Omit<WhatsAppInteractiveSendRequest, "phoneNumberId" | "to" | "accessToken">;
+
+/** WhatsApp location message. */
+export interface WhatsAppLocationSendRequest {
+  phoneNumberId: string;
+  to: string;
+  latitude: number;
+  longitude: number;
+  name?: string;
+  address?: string;
+  accessToken?: string;
+}
+
+export interface WhatsAppContactCard {
+  name: { formattedName: string; firstName?: string; lastName?: string };
+  phones?: Array<{ phone: string; type?: string }>;
+  emails?: Array<{ email: string; type?: string }>;
+}
+
+/** WhatsApp contacts message — shares one or more vCard-style contact cards. */
+export interface WhatsAppContactsSendRequest {
+  phoneNumberId: string;
+  to: string;
+  contacts: WhatsAppContactCard[];
+  accessToken?: string;
+}
 
 export interface WhatsAppMarkReadRequest {
   phoneNumberId: string;
@@ -513,11 +542,19 @@ export interface WhatsAppOutboundRequest {
   channelId: string;
   conversationId: string;
   contactPhoneE164: string;
-  kind: "text" | "media" | "interactive" | "product" | "catalog" | "flow";
+  kind: "text" | "media" | "interactive" | "product" | "catalog" | "flow" | "template" | "location" | "contacts";
   text?: string;
   previewUrl?: boolean;
   media?: { mediaType: WhatsAppMediaKind; link?: string; mediaId?: string; caption?: string; filename?: string };
   interactive?: WhatsAppInteractivePayload;
+  template?: {
+    templateName: string;
+    templateLanguage: string;
+    parameters?: string[];
+    components?: TemplateComponent[];
+  };
+  location?: { latitude: number; longitude: number; name?: string; address?: string };
+  contacts?: WhatsAppContactCard[];
   product?: { catalogId: string; productRetailerId: string; bodyText?: string };
   catalog?: {
     catalogId: string;
