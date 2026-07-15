@@ -123,7 +123,14 @@ async function main(): Promise<void> {
       metaAppSecret: config.metaAppSecret,
       logger
     });
-    return { ok: verified, body: { status: verified ? "accepted" : "invalid_signature", ...summary } };
+    return {
+      ok: verified,
+      body: { status: verified ? "accepted" : "invalid_signature", ...summary },
+      // HTTP-equivalent upstream status so gateway failure logs can
+      // distinguish signature rejections from processing errors on the
+      // in-process path too.
+      status: verified ? 200 : 401
+    };
   };
 
   const { server, gateway, shutdown } = createAppServer({

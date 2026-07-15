@@ -243,16 +243,22 @@ const webhookIdempotency = new RedisIdempotencyStore(getRedisClient(config), 24 
 
 // Internal proxy to the webhook-ingestor. Injectable so the modular monolith
 // swaps in a direct in-process call instead of HTTP (Phase 3).
-export type IngestWebhookProxy = (forwarded: {
-  rawBody: string;
-  signature?: string;
-  tenantId?: string;
-}) => Promise<{ ok: boolean; body: unknown }>;
+export type IngestWebhookProxy = (forwarded: { rawBody: string; signature?: string; tenantId?: string }) => Promise<{
+  ok: boolean;
+  body: unknown;
+  /**
+   * Upstream status for observability: the ingestor's HTTP status on the
+   * standalone path, or the equivalent (200/401) from the in-process path.
+   * Lets failure logs distinguish 401-signature from 5xx-processing.
+   * Optional so custom injected proxies remain source-compatible.
+   */
+  status?: number;
+}>;
 
 async function defaultIngestWebhookProxy(forwarded: {
   rawBody: string;
   signature?: string;
-}): Promise<{ ok: boolean; body: unknown }> {
+}): Promise<{ ok: boolean; body: unknown; status?: number }> {
   const proxyResponse = await fetch(`${config.webhookIngestorUrl}/internal/v1/webhooks/meta/whatsapp`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-request-id": randomUUID() },
@@ -260,7 +266,7 @@ async function defaultIngestWebhookProxy(forwarded: {
     signal: AbortSignal.timeout(10_000)
   });
   const body = (await proxyResponse.json()) as unknown;
-  return { ok: proxyResponse.ok, body };
+  return { ok: proxyResponse.ok, body, status: proxyResponse.status };
 }
 
 let ingestWebhookProxy: IngestWebhookProxy = defaultIngestWebhookProxy;
@@ -1340,12 +1346,23 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       //     throws on network errors, not HTTP error statuses, so a 5xx from
       //     the webhook-ingestor service (e.g. its own DB outage) surfaces as
       //     a normal ok:false return here, never via the catch block.
-      const { ok, body: proxyBody } = await ingestWebhookProxy({ rawBody, signature: normalizedSignature });
+      const {
+        ok,
+        body: proxyBody,
+        status: upstreamStatus
+      } = await ingestWebhookProxy({ rawBody, signature: normalizedSignature });
       if (!ok) {
         const isInvalidSignature =
           typeof proxyBody === "object" &&
           proxyBody !== null &&
           (proxyBody as { status?: unknown }).status === "invalid_signature";
+        // 401-signature vs 5xx-processing are different operational problems;
+        // surface the upstream status so dashboards can tell them apart.
+        logger.warn("webhook_upstream_failed", {
+          requestId: ctx.requestId,
+          upstreamStatus,
+          invalidSignature: isInvalidSignature
+        });
         if (!isInvalidSignature) {
           // Genuine processing failure reported without a throw (path 2
           // above, and defensively any future non-throwing failure of path
