@@ -2965,10 +2965,12 @@ function mapMediaAssetMeta(row: MediaAssetMetaRow): MediaAssetMeta {
  */
 export const mediaRepository = {
   /**
-   * Creates the pending row for a newly-seen (tenant, metaMediaId), or is a
-   * no-op re-affirmation if it already exists. `message_id` is COALESCEd so
-   * a later webhook referencing the same media id never clobbers the
-   * message that first introduced it.
+   * Creates the pending row for a newly-seen (tenant, metaMediaId), or
+   * re-affirms it if it already exists. All conflict updates are
+   * fill-if-null (COALESCE with the existing value first): `message_id`
+   * keeps the message that first introduced the media, and later-arriving
+   * `mime_type`/`filename`/`sha256` metadata enriches a row that was first
+   * seen without it but never overwrites values already present.
    */
   async upsertPending(
     tenantId: string,
@@ -2986,7 +2988,10 @@ export const mediaRepository = {
         `INSERT INTO media_assets (tenant_id, meta_media_id, message_id, conversation_id, mime_type, filename, sha256)
          VALUES ($1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT (tenant_id, meta_media_id) DO UPDATE
-           SET message_id = COALESCE(media_assets.message_id, EXCLUDED.message_id)
+           SET message_id = COALESCE(media_assets.message_id, EXCLUDED.message_id),
+               mime_type = COALESCE(media_assets.mime_type, EXCLUDED.mime_type),
+               filename = COALESCE(media_assets.filename, EXCLUDED.filename),
+               sha256 = COALESCE(media_assets.sha256, EXCLUDED.sha256)
          RETURNING id, status`,
         [
           tenantId,

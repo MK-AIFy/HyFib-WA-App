@@ -70,6 +70,55 @@ test(
 );
 
 test(
+  "upsertPending enriches mime/filename/sha256 fill-if-null on conflict, never overwriting present values",
+  { skip },
+  async () => {
+    const { tenant, conversation, message } = await seedMessage("Media Tenant Enrich", "+15551110009");
+
+    // First sighting arrives bare — a webhook that referenced the media id
+    // without metadata.
+    const first = await mediaRepository.upsertPending(tenant.id, {
+      metaMediaId: "meta-media-enrich",
+      messageId: message.id,
+      conversationId: conversation.id
+    });
+    let meta = await mediaRepository.getMeta(tenant.id, first.id);
+    assert.equal(meta.mimeType, undefined);
+    assert.equal(meta.filename, undefined);
+    assert.equal(meta.sha256, undefined);
+
+    // A later replay carries the metadata — it must land on the existing row.
+    const second = await mediaRepository.upsertPending(tenant.id, {
+      metaMediaId: "meta-media-enrich",
+      messageId: message.id,
+      conversationId: conversation.id,
+      mimeType: "image/png",
+      filename: "receipt.png",
+      sha256: "abc123"
+    });
+    assert.equal(second.id, first.id);
+    meta = await mediaRepository.getMeta(tenant.id, first.id);
+    assert.equal(meta.mimeType, "image/png", "null mime_type must be enriched on conflict");
+    assert.equal(meta.filename, "receipt.png", "null filename must be enriched on conflict");
+    assert.equal(meta.sha256, "abc123", "null sha256 must be enriched on conflict");
+
+    // A third sighting with different values must NOT overwrite what's there.
+    await mediaRepository.upsertPending(tenant.id, {
+      metaMediaId: "meta-media-enrich",
+      messageId: message.id,
+      conversationId: conversation.id,
+      mimeType: "application/pdf",
+      filename: "other.pdf",
+      sha256: "zzz999"
+    });
+    meta = await mediaRepository.getMeta(tenant.id, first.id);
+    assert.equal(meta.mimeType, "image/png", "present mime_type must never be overwritten");
+    assert.equal(meta.filename, "receipt.png", "present filename must never be overwritten");
+    assert.equal(meta.sha256, "abc123", "present sha256 must never be overwritten");
+  }
+);
+
+test(
   "markStored round-trips bytes and transitions pending -> stored; recordError transitions -> failed",
   { skip },
   async () => {
