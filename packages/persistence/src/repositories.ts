@@ -3041,7 +3041,21 @@ export const mediaRepository = {
       return result.rows[0] ? mapMediaAssetMeta(result.rows[0]) : undefined;
     });
   },
-  /** Fetches the bytes + serving metadata for the gateway serve route (later task). Null-safe when still `pending`. */
+  /**
+   * Fetches the bytes + serving metadata for the gateway serve route.
+   * Null-safe when still `pending`.
+   *
+   * Storage seam: bytes live inline in Postgres (media_assets.bytes BYTEA)
+   * and this method materializes the whole asset in memory in one query —
+   * fine at current volumes (WhatsApp media caps at ~100MB, typical assets
+   * are far smaller), but there is no streaming and no HTTP Range support.
+   * If media volume grows, swap the substrate behind THIS method (and
+   * markStored above): store bytes in object storage (e.g. S3), keep the
+   * media_assets row as metadata + object key, and have getForServing
+   * return a stream/presigned locator instead of a Buffer. Callers only
+   * touch mediaRepository — no gateway route changes needed beyond the
+   * response plumbing.
+   */
   async getForServing(tenantId: string, id: string): Promise<MediaAssetForServing | undefined> {
     return withTenant(tenantId, async (client) => {
       const result = await client.query<{
