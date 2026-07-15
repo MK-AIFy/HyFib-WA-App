@@ -681,7 +681,11 @@ export async function fetchMediaDirect(
   return lastFailure ?? { status: 502, error: "meta_media_download_failed" };
 }
 
-const server = createServer(async (req, res) => {
+// Exported (not just used via isMain below) so tests can do real HTTP
+// round-trips against the standalone route table without binding the
+// production port — this is what catches a metaDispatch case shipping
+// without its matching HTTP route registration (they must stay paired).
+export const server = createServer(async (req, res) => {
   try {
     const path = parseUrlPath(req.url);
     const method = req.method ?? "GET";
@@ -771,6 +775,10 @@ const server = createServer(async (req, res) => {
         sendJson(res, 400, { error: "phoneNumberId, to, interactiveType and bodyText are required" });
         return;
       }
+      if (payload.interactiveType === "cta_url" && !payload.ctaUrl) {
+        sendJson(res, 400, { error: "ctaUrl is required for interactiveType cta_url" });
+        return;
+      }
       const graphBody = buildInteractiveBody({
         to: payload.to,
         interactiveType: payload.interactiveType,
@@ -779,7 +787,9 @@ const server = createServer(async (req, res) => {
         footerText: payload.footerText,
         buttons: payload.buttons,
         buttonLabel: payload.buttonLabel,
-        sections: payload.sections
+        sections: payload.sections,
+        ctaDisplayText: payload.ctaDisplayText,
+        ctaUrl: payload.ctaUrl
       });
       await dispatchSend(res, ctx.requestId, payload.phoneNumberId, graphBody, payload.accessToken);
       return;
@@ -881,6 +891,66 @@ const server = createServer(async (req, res) => {
         footerText: payload.footerText,
         mode: payload.mode
       });
+      await dispatchSend(res, ctx.requestId, payload.phoneNumberId, graphBody, payload.accessToken);
+      return;
+    }
+
+    if (path === "/internal/v1/whatsapp/send-location") {
+      if (method !== "POST") {
+        methodNotAllowed(res);
+        return;
+      }
+      const payload = await readJsonBody<{
+        phoneNumberId?: string;
+        to?: string;
+        latitude?: number;
+        longitude?: number;
+        name?: string;
+        address?: string;
+        accessToken?: string;
+      }>(req);
+      if (
+        !payload.phoneNumberId ||
+        !payload.to ||
+        typeof payload.latitude !== "number" ||
+        typeof payload.longitude !== "number" ||
+        !Number.isFinite(payload.latitude) ||
+        !Number.isFinite(payload.longitude)
+      ) {
+        sendJson(res, 400, { error: "phoneNumberId, to, latitude and longitude are required" });
+        return;
+      }
+      const graphBody = buildLocationBody({
+        to: payload.to,
+        latitude: payload.latitude,
+        longitude: payload.longitude,
+        name: payload.name,
+        address: payload.address
+      });
+      await dispatchSend(res, ctx.requestId, payload.phoneNumberId, graphBody, payload.accessToken);
+      return;
+    }
+
+    if (path === "/internal/v1/whatsapp/send-contacts") {
+      if (method !== "POST") {
+        methodNotAllowed(res);
+        return;
+      }
+      const payload = await readJsonBody<{
+        phoneNumberId?: string;
+        to?: string;
+        contacts?: WhatsAppContactCard[];
+        accessToken?: string;
+      }>(req);
+      if (!payload.phoneNumberId || !payload.to || !Array.isArray(payload.contacts) || payload.contacts.length === 0) {
+        sendJson(res, 400, { error: "phoneNumberId, to and at least one contact are required" });
+        return;
+      }
+      if (payload.contacts.some((contact) => !contact?.name?.formattedName)) {
+        sendJson(res, 400, { error: "each contact requires name.formattedName" });
+        return;
+      }
+      const graphBody = buildContactsBody({ to: payload.to, contacts: payload.contacts });
       await dispatchSend(res, ctx.requestId, payload.phoneNumberId, graphBody, payload.accessToken);
       return;
     }
