@@ -40,12 +40,19 @@ export async function runOutboxRelayOnce(deps: OutboxRelayDeps, batchSize = 50):
   }
 
   for (const row of batch) {
+    // Distinguishes a failed publish (outbox_publish_failed) from a publish
+    // that succeeded but whose markProcessed write failed
+    // (outbox_mark_processed_failed). Both walk the same markFailed/retry
+    // path — the retry re-publishes and idempotent consumers absorb the
+    // duplicate — but dashboards must not blame the bus for a DB write error.
+    let published = false;
     try {
       await deps.publish(row.topic, row.payload, row.tenant_id ?? undefined);
+      published = true;
       await deps.markProcessed(row.id);
       deps.counters?.published(row.topic);
-    } catch (publishError) {
-      const message = publishError instanceof Error ? publishError.message : String(publishError);
+    } catch (rowError) {
+      const message = rowError instanceof Error ? rowError.message : String(rowError);
       try {
         await deps.markFailed(row.id, message);
       } catch (markFailedError) {
@@ -59,9 +66,14 @@ export async function runOutboxRelayOnce(deps: OutboxRelayDeps, batchSize = 50):
       const attempts = row.attempts + 1;
       if (attempts >= maxAttempts) {
         deps.counters?.dead(row.topic);
-        deps.logger.error("outbox_row_dead", { id: row.id, topic: row.topic, attempts });
+        deps.logger.error("outbox_row_dead", { id: row.id, topic: row.topic, attempts, published });
       } else {
-        deps.logger.warn("outbox_publish_failed", { id: row.id, topic: row.topic, attempts, error: message });
+        deps.logger.warn(published ? "outbox_mark_processed_failed" : "outbox_publish_failed", {
+          id: row.id,
+          topic: row.topic,
+          attempts,
+          error: message
+        });
       }
     }
   }
