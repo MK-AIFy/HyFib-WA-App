@@ -126,6 +126,8 @@ export function buildOutboundAdapterCall(command: WhatsAppOutboundRequest, chann
         buttons: command.interactive.buttons,
         buttonLabel: command.interactive.buttonLabel,
         sections: command.interactive.sections,
+        ctaDisplayText: command.interactive.ctaDisplayText,
+        ctaUrl: command.interactive.ctaUrl,
         accessToken: channel.accessToken
       },
       persistedPayload: { kind: "interactive", interactive: command.interactive, actorId: command.actorId }

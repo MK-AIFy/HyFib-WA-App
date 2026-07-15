@@ -464,7 +464,7 @@ export interface WhatsAppInteractiveRow {
 export interface WhatsAppInteractiveSendRequest {
   phoneNumberId: string;
   to: string;
-  interactiveType: "button" | "list";
+  interactiveType: "button" | "list" | "cta_url";
   bodyText: string;
   headerText?: string;
   footerText?: string;
@@ -473,6 +473,10 @@ export interface WhatsAppInteractiveSendRequest {
   /** For interactiveType "list". */
   buttonLabel?: string;
   sections?: Array<{ title?: string; rows: WhatsAppInteractiveRow[] }>;
+  /** For interactiveType "cta_url": the button's visible label. */
+  ctaDisplayText?: string;
+  /** For interactiveType "cta_url": the URL opened when the button is tapped. */
+  ctaUrl?: string;
   accessToken?: string;
 }
 

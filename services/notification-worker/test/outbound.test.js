@@ -51,6 +51,21 @@ test("interactive command maps to send-interactive with the full payload", () =>
   assert.deepEqual(call.persistedPayload, { kind: "interactive", interactive, actorId: "actor-1" });
 });
 
+test("interactive cta_url command maps to send-interactive with ctaDisplayText/ctaUrl", () => {
+  const interactive = {
+    interactiveType: "cta_url",
+    bodyText: "Check us out",
+    ctaDisplayText: "Visit",
+    ctaUrl: "https://example.com"
+  };
+  const call = buildOutboundAdapterCall({ ...base, kind: "interactive", interactive }, channel);
+  assert.equal(call.endpoint, "/internal/v1/whatsapp/send-interactive");
+  assert.equal(call.payload.interactiveType, "cta_url");
+  assert.equal(call.payload.ctaDisplayText, "Visit");
+  assert.equal(call.payload.ctaUrl, "https://example.com");
+  assert.deepEqual(call.persistedPayload, { kind: "interactive", interactive, actorId: "actor-1" });
+});
+
 test("interactive kind without a payload falls back to text", () => {
   const call = buildOutboundAdapterCall({ ...base, kind: "interactive", text: "fallback" }, channel);
   assert.equal(call.endpoint, "/internal/v1/whatsapp/send-text");

@@ -98,6 +98,8 @@ const ROW_ID_MAX = 200;
 const ROW_TITLE_MAX = 24;
 const ROW_DESCRIPTION_MAX = 72;
 const TOTAL_ROWS_MAX = 10;
+const CTA_DISPLAY_TEXT_MAX = 20;
+const CTA_URL_MAX = 2048;
 
 function isNonEmptyString(value: unknown, max: number): value is string {
   return typeof value === "string" && value.trim().length > 0 && value.length <= max;
@@ -188,8 +190,12 @@ export function validateInteractivePayload(input: unknown): ValidationResult<Wha
   }
   const candidate = input as Record<string, unknown>;
 
-  if (candidate.interactiveType !== "button" && candidate.interactiveType !== "list") {
-    return { ok: false, error: 'interactive.interactiveType must be "button" or "list"' };
+  if (
+    candidate.interactiveType !== "button" &&
+    candidate.interactiveType !== "list" &&
+    candidate.interactiveType !== "cta_url"
+  ) {
+    return { ok: false, error: 'interactive.interactiveType must be "button", "list" or "cta_url"' };
   }
   if (!isNonEmptyString(candidate.bodyText, BODY_TEXT_MAX)) {
     return { ok: false, error: `interactive.bodyText is required (at most ${BODY_TEXT_MAX} characters)` };
@@ -232,6 +238,18 @@ export function validateInteractivePayload(input: unknown): ValidationResult<Wha
       cleanButtons.push({ id: entry.id as string, title: entry.title as string });
     }
     value.buttons = cleanButtons;
+    return { ok: true, value };
+  }
+
+  if (candidate.interactiveType === "cta_url") {
+    if (!isNonEmptyString(candidate.ctaDisplayText, CTA_DISPLAY_TEXT_MAX)) {
+      return { ok: false, error: `interactive.ctaDisplayText is required (at most ${CTA_DISPLAY_TEXT_MAX} chars)` };
+    }
+    if (!isNonEmptyString(candidate.ctaUrl, CTA_URL_MAX) || !/^https?:\/\//i.test(candidate.ctaUrl)) {
+      return { ok: false, error: `interactive.ctaUrl must be an http(s) URL (at most ${CTA_URL_MAX} chars)` };
+    }
+    value.ctaDisplayText = candidate.ctaDisplayText;
+    value.ctaUrl = candidate.ctaUrl;
     return { ok: true, value };
   }
 

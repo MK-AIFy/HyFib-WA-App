@@ -93,6 +93,21 @@ test("interactive list body shapes sections", () => {
   assert.equal(body.interactive.action.sections[0].rows[0].description, "hot");
 });
 
+test("interactive cta_url body shapes the action name and parameters", () => {
+  const body = buildInteractiveBody({
+    to: "1",
+    interactiveType: "cta_url",
+    bodyText: "Check out our site",
+    ctaDisplayText: "Visit us",
+    ctaUrl: "https://example.com"
+  });
+  assert.equal(body.interactive.type, "cta_url");
+  assert.deepEqual(body.interactive.action, {
+    name: "cta_url",
+    parameters: { display_text: "Visit us", url: "https://example.com" }
+  });
+});
+
 test("mark-read body", () => {
   assert.deepEqual(buildMarkReadBody("wamid.1"), {
     messaging_product: "whatsapp",

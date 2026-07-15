@@ -169,6 +169,59 @@ test("rejects an unknown interactiveType", () => {
   assert.match(result.error, /interactiveType/);
 });
 
+test("accepts a valid cta_url payload and strips unknown fields", () => {
+  const result = validateInteractivePayload({
+    interactiveType: "cta_url",
+    bodyText: "Check out our site",
+    ctaDisplayText: "Visit us",
+    ctaUrl: "https://example.com",
+    buttons: [{ id: "should", title: "be stripped" }]
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.value, {
+    interactiveType: "cta_url",
+    bodyText: "Check out our site",
+    ctaDisplayText: "Visit us",
+    ctaUrl: "https://example.com"
+  });
+});
+
+test("rejects cta_url with a missing ctaDisplayText", () => {
+  const result = validateInteractivePayload({
+    interactiveType: "cta_url",
+    bodyText: "x",
+    ctaUrl: "https://example.com"
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /ctaDisplayText/);
+});
+
+test("rejects cta_url with a missing or non-http(s) ctaUrl", () => {
+  const missing = validateInteractivePayload({ interactiveType: "cta_url", bodyText: "x", ctaDisplayText: "Visit" });
+  assert.equal(missing.ok, false);
+  assert.match(missing.error, /ctaUrl/);
+
+  const badScheme = validateInteractivePayload({
+    interactiveType: "cta_url",
+    bodyText: "x",
+    ctaDisplayText: "Visit",
+    ctaUrl: "javascript:alert(1)"
+  });
+  assert.equal(badScheme.ok, false);
+  assert.match(badScheme.error, /ctaUrl/);
+});
+
+test("rejects a cta_url ctaDisplayText longer than 20 characters", () => {
+  const result = validateInteractivePayload({
+    interactiveType: "cta_url",
+    bodyText: "x",
+    ctaDisplayText: "this label is way too long",
+    ctaUrl: "https://example.com"
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /ctaDisplayText/);
+});
+
 test("rejects missing or oversized bodyText", () => {
   assert.equal(validateInteractivePayload({ interactiveType: "button", buttons: [{ id: "a", title: "A" }] }).ok, false);
   const result = validateInteractivePayload({

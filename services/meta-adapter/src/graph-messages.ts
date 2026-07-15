@@ -88,7 +88,16 @@ export function buildMediaBody(
 export function buildInteractiveBody(
   input: Pick<
     WhatsAppInteractiveSendRequest,
-    "to" | "interactiveType" | "bodyText" | "headerText" | "footerText" | "buttons" | "buttonLabel" | "sections"
+    | "to"
+    | "interactiveType"
+    | "bodyText"
+    | "headerText"
+    | "footerText"
+    | "buttons"
+    | "buttonLabel"
+    | "sections"
+    | "ctaDisplayText"
+    | "ctaUrl"
   >
 ): Record<string, unknown> {
   const interactive: Record<string, unknown> = {
@@ -107,6 +116,11 @@ export function buildInteractiveBody(
         type: "reply",
         reply: { id: button.id, title: button.title }
       }))
+    };
+  } else if (input.interactiveType === "cta_url") {
+    interactive.action = {
+      name: "cta_url",
+      parameters: { display_text: input.ctaDisplayText, url: input.ctaUrl }
     };
   } else {
     interactive.action = {

@@ -310,6 +310,8 @@ export async function metaDispatch(
     buttons?: WhatsAppInteractiveSendRequest["buttons"];
     buttonLabel?: string;
     sections?: unknown;
+    ctaDisplayText?: string;
+    ctaUrl?: string;
     catalogId?: string;
     productRetailerId?: string;
     flowId?: string;
@@ -349,6 +351,9 @@ export async function metaDispatch(
       if (!p.phoneNumberId || !p.to || !p.interactiveType || !p.bodyText) {
         return { status: 400, body: { error: "phoneNumberId, to, interactiveType and bodyText are required" } };
       }
+      if (p.interactiveType === "cta_url" && !p.ctaUrl) {
+        return { status: 400, body: { error: "ctaUrl is required for interactiveType cta_url" } };
+      }
       const body = buildInteractiveBody({
         to: p.to,
         interactiveType: p.interactiveType,
@@ -357,7 +362,9 @@ export async function metaDispatch(
         footerText: p.footerText,
         buttons: p.buttons,
         buttonLabel: p.buttonLabel,
-        sections: p.sections as never
+        sections: p.sections as never,
+        ctaDisplayText: p.ctaDisplayText,
+        ctaUrl: p.ctaUrl
       });
       return sendGraphMessage(requestId, p.phoneNumberId, body, p.accessToken);
     }
