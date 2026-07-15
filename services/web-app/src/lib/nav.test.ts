@@ -15,10 +15,10 @@ describe("getNavItems", () => {
     expect(ids).not.toContain("tenants");
   });
 
-  it("shows both Users and Tenants for a platform_owner", () => {
+  it("shows Users but never Tenants for a platform_owner", () => {
     const ids = getNavItems(["platform_owner"]).map((i) => i.id);
     expect(ids).toContain("users");
-    expect(ids).toContain("tenants");
+    expect(ids).not.toContain("tenants");
   });
 
   it("always places Settings last", () => {

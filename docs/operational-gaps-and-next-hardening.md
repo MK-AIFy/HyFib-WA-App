@@ -56,6 +56,10 @@ This implementation provides a production-grade foundation, but these items must
   source control — the first platform_owner account is created at startup
   from `BOOTSTRAP_ADMIN_EMAIL`/`BOOTSTRAP_ADMIN_PASSWORD` if set and no user
   with that email exists yet.
+  (2026-07 single-org hardening: `/auth/register` now returns
+  `410 registration_disabled` — this deployment is single-organization, so
+  the bootstrap-admin path above and the `POST /api/v1/users` invite flow are
+  the only ways to create users. See `docs/runbooks/single-org-deployment.md`.)
 
 The items below remain environment-specific and are delivered as configuration
 plus runbooks (not turnkey automation), to be completed against the client's

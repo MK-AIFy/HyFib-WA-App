@@ -4,20 +4,12 @@ import type { Contact } from "@hyfib/shared-core";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger
-} from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { PageHeader } from "@/components/PageHeader";
 import { EmptyState } from "@/components/EmptyState";
-import { readStoredToken } from "@/lib/auth-storage";
 import { useCreate, useList } from "@/hooks/use-resource";
 
 interface NewContact {
@@ -87,7 +79,11 @@ export function ContactsPage() {
                     </div>
                   </TableCell>
                   <TableCell>
-                    {c.optedOut ? <Badge variant="destructive">Opted out</Badge> : <Badge variant="green">Active</Badge>}
+                    {c.optedOut ? (
+                      <Badge variant="destructive">Opted out</Badge>
+                    ) : (
+                      <Badge variant="green">Active</Badge>
+                    )}
                   </TableCell>
                 </TableRow>
               ))}
@@ -103,7 +99,7 @@ function ExportButton() {
   async function download() {
     try {
       const res = await fetch("/api/v1/contacts/export", {
-        headers: { authorization: `Bearer ${readStoredToken() ?? ""}` }
+        headers: { "x-requested-with": "fetch" }
       });
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);

@@ -2,7 +2,6 @@ import type { Role } from "@hyfib/shared-core";
 import {
   BarChart3,
   Bot,
-  Building2,
   CheckSquare,
   Inbox,
   LineChart,
@@ -39,16 +38,16 @@ const BASE_NAV: NavItem[] = [
 ];
 
 const USERS_NAV: NavItem = { id: "users", to: "/users", label: "Users", icon: UserCog };
-const TENANTS_NAV: NavItem = { id: "tenants", to: "/tenants", label: "Tenants", icon: Building2 };
 const SETTINGS_NAV: NavItem = { id: "settings", to: "/settings", label: "Settings", icon: Settings };
 
 /**
  * Mirrors the visibility matrix in the vanilla-JS portal (index.html:1157-1173):
- * "Users" is visible to platform_owner/tenant_admin, "Tenants" to platform_owner only.
+ * "Users" is visible to platform_owner/tenant_admin. The platform-level "Tenants"
+ * console was removed as part of the single-org hardening (see /auth/register 410
+ * and the retired /api/v1/tenants routes).
  */
 export function getNavItems(roles: Role[]): NavItem[] {
   const isAdmin = roles.some((r) => r === "platform_owner" || r === "tenant_admin");
-  const isPlatformOwner = roles.includes("platform_owner");
 
-  return [...BASE_NAV, ...(isAdmin ? [USERS_NAV] : []), ...(isPlatformOwner ? [TENANTS_NAV] : []), SETTINGS_NAV];
+  return [...BASE_NAV, ...(isAdmin ? [USERS_NAV] : []), SETTINGS_NAV];
 }

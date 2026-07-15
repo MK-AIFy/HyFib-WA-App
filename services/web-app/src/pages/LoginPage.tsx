@@ -1,6 +1,6 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useForm } from "react-hook-form";
-import { Link, Navigate, useNavigate } from "react-router";
+import { Navigate, useNavigate } from "react-router";
 import { z } from "zod";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -57,7 +57,13 @@ export function LoginPage() {
             ) : null}
             <div className="flex flex-col gap-1.5">
               <Label htmlFor="email">Email</Label>
-              <Input id="email" type="email" autoComplete="email" aria-invalid={!!errors.email} {...register("email")} />
+              <Input
+                id="email"
+                type="email"
+                autoComplete="email"
+                aria-invalid={!!errors.email}
+                {...register("email")}
+              />
               {errors.email ? <p className="text-xs text-destructive">{errors.email.message}</p> : null}
             </div>
             <div className="flex flex-col gap-1.5">
@@ -74,12 +80,6 @@ export function LoginPage() {
             <Button type="submit" disabled={isSubmitting}>
               {isSubmitting ? "Signing in…" : "Sign in"}
             </Button>
-            <p className="text-center text-sm text-muted-foreground">
-              New to HyFib?{" "}
-              <Link to="/register" className="text-primary underline-offset-4 hover:underline">
-                Create an account
-              </Link>
-            </p>
           </form>
         </CardContent>
       </Card>

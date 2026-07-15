@@ -6,9 +6,7 @@ export function RequireAuth() {
   const { user, isLoading } = useAuth();
 
   if (isLoading) {
-    return (
-      <div className="flex min-h-screen items-center justify-center text-sm text-muted-foreground">Loading…</div>
-    );
+    return <div className="flex min-h-screen items-center justify-center text-sm text-muted-foreground">Loading…</div>;
   }
   if (!user) {
     return <Navigate to="/login" replace />;

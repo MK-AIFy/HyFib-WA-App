@@ -27,6 +27,8 @@ export interface PlatformConfig {
   nodeEnv: string;
   logLevel: string;
   platformBaseUrl: string;
+  orgTenantId: string;
+  orgName: string;
   database: DatabaseConfig;
   keycloak: KeycloakConfig;
   redis: RedisConfig;
@@ -122,6 +124,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PlatformConfig
     nodeEnv,
     logLevel: env.LOG_LEVEL ?? "info",
     platformBaseUrl: env.PLATFORM_BASE_URL ?? "http://localhost:8080",
+    orgTenantId: env.ORG_TENANT_ID ?? "",
+    orgName: env.ORG_NAME ?? "",
     database: {
       host: env.POSTGRES_HOST ?? "postgres-primary",
       port: parseNumber("POSTGRES_PORT", env.POSTGRES_PORT, 5432),

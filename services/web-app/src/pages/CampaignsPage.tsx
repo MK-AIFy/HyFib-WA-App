@@ -40,7 +40,11 @@ export function CampaignsPage() {
 
   return (
     <div className="flex h-full flex-col">
-      <PageHeader title="Campaigns" description="Template broadcasts with policy enforcement." action={<CreateCampaign />} />
+      <PageHeader
+        title="Campaigns"
+        description="Template broadcasts with policy enforcement."
+        action={<CreateCampaign />}
+      />
       <div className="flex-1 overflow-auto">
         {isLoading ? (
           <p className="p-6 text-sm text-muted-foreground">Loading…</p>

@@ -5,6 +5,39 @@ export interface SendChannel {
   accessToken?: string;
 }
 
+/** Minimal Redis surface needed for the replay-claim guard (matches ioredis). */
+export interface ClaimRedis {
+  set(key: string, value: string, ttlFlag: "EX", ttlSeconds: number, nxFlag: "NX"): Promise<string | null>;
+  del(key: string): Promise<number>;
+}
+
+/** Prefix for outbound dispatchId replay-claim keys, mirroring the `atreq:` guard's naming style. */
+export const DISPATCH_CLAIM_PREFIX = "outb:";
+
+/** How long an outbound dispatch claim survives — long enough to outlast the outbox relay's retry/backoff window. */
+export const DISPATCH_CLAIM_TTL_SECONDS = 86_400;
+
+/** Builds the Redis key used to claim a caller-assigned dispatchId before sending. */
+export function dispatchClaimKey(dispatchId: string): string {
+  return `${DISPATCH_CLAIM_PREFIX}${dispatchId}`;
+}
+
+/**
+ * Claims a Redis key with SET NX EX so redelivery of the same logical work (a
+ * replayed outbox row gets a new envelope id, so event.id-keyed dedupe misses it)
+ * can be recognized and skipped. Returns true when newly claimed, false when an
+ * existing claim is already held.
+ */
+export async function claimRedisKey(redis: ClaimRedis, key: string, ttlSeconds: number): Promise<boolean> {
+  const claimed = await redis.set(key, "1", "EX", ttlSeconds, "NX");
+  return claimed !== null;
+}
+
+/** Releases a previously claimed key so a failed send can be retried on redelivery. */
+export async function releaseRedisKey(redis: ClaimRedis, key: string): Promise<void> {
+  await redis.del(key);
+}
+
 export interface OutboundAdapterCall {
   endpoint: string;
   payload: Record<string, unknown>;

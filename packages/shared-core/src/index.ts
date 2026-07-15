@@ -241,8 +241,12 @@ export interface Conversation {
   lastMessage?: string;
   lastMessageAt?: string;
   lastInboundAt?: string;
+  lastReadAt?: string;
+  unreadCount: number;
   assignedUserId?: string;
   state: "open" | "pending" | "closed";
+  archivedAt?: string;
+  pinnedAt?: string;
 }
 
 export interface ConversationNote {
@@ -276,6 +280,17 @@ export interface Message {
   status: "queued" | "sent" | "delivered" | "read" | "failed";
   payload: Record<string, unknown>;
   createdAt: string;
+}
+
+export interface MessageSearchResult {
+  id: string;
+  conversationId: string;
+  direction: "inbound" | "outbound";
+  status: Message["status"];
+  createdAt: string;
+  text: string;
+  contactName?: string;
+  contactPhone?: string;
 }
 
 export interface Order {
@@ -520,6 +535,12 @@ export interface WhatsAppOutboundRequest {
     footerText?: string;
   };
   actorId?: string;
+  /**
+   * Caller-assigned idempotency key, stable across outbox replay (unlike the
+   * envelope's event.id, which is regenerated on every republish). When set, the
+   * worker claims it before sending so a replayed outbox row can't double-send.
+   */
+  dispatchId?: string;
 }
 
 export const EventTopics = {
@@ -533,7 +554,9 @@ export const EventTopics = {
   AutomationTemplateRequested: "automation.template.requested",
   CommerceOrderEvent: "commerce.order.event",
   ComplianceOptOutEvent: "compliance.optout.event",
-  AuditEventRecorded: "audit.event.recorded"
+  AuditEventRecorded: "audit.event.recorded",
+  MediaFetchRequested: "media.fetch.requested",
+  MediaStored: "media.stored"
 } as const;
 
 export type EventTopic = (typeof EventTopics)[keyof typeof EventTopics];
@@ -546,4 +569,23 @@ export interface AutomationTemplateRequest {
   contactPhoneE164: string;
   templateName: string;
   templateLanguage: string;
+  /** Caller-assigned idempotency key, stable across outbox replay. See WhatsAppOutboundRequest.dispatchId. */
+  dispatchId?: string;
+}
+
+/**
+ * Requests that the Meta media adapter fetch an inbound media asset's bytes
+ * and persist them. Enqueued when a webhook message carries a media id;
+ * consumed by the notification-worker media consumer (later task).
+ */
+export interface MediaFetchRequest {
+  tenantId: string;
+  channelId: string;
+  phoneNumberId?: string;
+  conversationId: string;
+  messageId: string;
+  mediaId: string;
+  mimeType?: string;
+  filename?: string;
+  sha256?: string;
 }

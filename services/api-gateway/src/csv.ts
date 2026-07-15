@@ -167,9 +167,7 @@ export function extractMultipartFile(buffer: Buffer, boundary: string): Buffer |
     const fileStart = headerEnd + 4;
     const closing = Buffer.from(`\r\n--${boundary}`);
     const fileEnd = buffer.indexOf(closing, fileStart);
-    return fileEnd === -1
-      ? buffer.subarray(fileStart)
-      : buffer.subarray(fileStart, fileEnd);
+    return fileEnd === -1 ? buffer.subarray(fileStart) : buffer.subarray(fileStart, fileEnd);
   } catch {
     return null;
   }

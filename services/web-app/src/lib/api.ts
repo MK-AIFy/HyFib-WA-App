@@ -1,4 +1,4 @@
-import { clearSession, readStoredToken } from "./auth-storage";
+import { clearSession } from "./auth-storage";
 
 export class ApiError extends Error {
   status: number;
@@ -20,12 +20,24 @@ export function setUnauthorizedHandler(handler: UnauthorizedHandler): void {
   unauthorizedHandler = handler;
 }
 
-async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
-  const token = readStoredToken();
-  const headers: Record<string, string> = { "content-type": "application/json" };
-  if (token) {
-    headers["authorization"] = `Bearer ${token}`;
-  }
+/**
+ * `extraHeaders` exists solely for the one-shot legacy-token upgrade in
+ * auth-context.tsx's boot effect (2026-07-12, Task 18): it lets that single
+ * call attach a Bearer header explicitly without this module reading a
+ * token out of storage itself. Every other caller relies on the session
+ * cookie, sent automatically by the browser (same-origin default).
+ */
+async function request<T>(
+  method: string,
+  path: string,
+  body?: unknown,
+  extraHeaders?: Record<string, string>
+): Promise<T> {
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    "x-requested-with": "fetch",
+    ...extraHeaders
+  };
 
   const res = await fetch(path, {
     method,
@@ -50,10 +62,42 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   return data as T;
 }
 
+async function requestBlob(path: string): Promise<Blob> {
+  const headers: Record<string, string> = { "x-requested-with": "fetch" };
+
+  const res = await fetch(path, { headers });
+
+  if (res.status === 401) {
+    clearSession();
+    unauthorizedHandler?.();
+    throw new ApiError(401, "Not authenticated");
+  }
+
+  if (!res.ok) {
+    let message = `Request failed (${res.status})`;
+    let detail: string | undefined;
+    const text = await res.text();
+    if (text) {
+      try {
+        const errBody = JSON.parse(text) as { error?: string; detail?: string };
+        message = errBody.error ?? message;
+        detail = errBody.detail;
+      } catch {
+        // Non-JSON error body — fall back to the generic status message.
+      }
+    }
+    throw new ApiError(res.status, message, detail);
+  }
+
+  return res.blob();
+}
+
 export const api = {
-  get: <T>(path: string): Promise<T> => request<T>("GET", path),
+  get: <T>(path: string, extraHeaders?: Record<string, string>): Promise<T> =>
+    request<T>("GET", path, undefined, extraHeaders),
   post: <T>(path: string, body?: unknown): Promise<T> => request<T>("POST", path, body),
   patch: <T>(path: string, body?: unknown): Promise<T> => request<T>("PATCH", path, body),
   put: <T>(path: string, body?: unknown): Promise<T> => request<T>("PUT", path, body),
-  del: <T>(path: string): Promise<T> => request<T>("DELETE", path)
+  del: <T>(path: string): Promise<T> => request<T>("DELETE", path),
+  getBlob: (path: string): Promise<Blob> => requestBlob(path)
 };

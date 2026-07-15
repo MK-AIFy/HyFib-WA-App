@@ -205,10 +205,16 @@ export async function dispatchAi(
     const pc = Number(payload.purchaseCount);
     const aov = Number(payload.averageOrderValue);
     if (
-      !Number.isFinite(rd) || rd < 0 || rd > 3650 ||
-      !Number.isFinite(es) || es < 0 || es > 100 ||
-      !Number.isFinite(pc) || pc < 0 ||
-      !Number.isFinite(aov) || aov < 0
+      !Number.isFinite(rd) ||
+      rd < 0 ||
+      rd > 3650 ||
+      !Number.isFinite(es) ||
+      es < 0 ||
+      es > 100 ||
+      !Number.isFinite(pc) ||
+      pc < 0 ||
+      !Number.isFinite(aov) ||
+      aov < 0
     ) {
       return {
         status: 400,
@@ -237,46 +243,45 @@ export async function dispatchAi(
 
 const server = createServer(async (req, res) => {
   try {
-  const path = parseUrlPath(req.url);
-  const method = req.method ?? "GET";
-  const ctx = requestContext(req);
+    const path = parseUrlPath(req.url);
+    const method = req.method ?? "GET";
+    const ctx = requestContext(req);
 
-  if (path === "/metrics") {
-    sendMetrics(res);
-    return;
-  }
-
-  if (path.startsWith("/internal/")) {
-    const providedSecret = typeof req.headers["x-internal-secret"] === "string"
-      ? req.headers["x-internal-secret"]
-      : "";
-    if (config.internalServiceSecret !== "" && providedSecret !== config.internalServiceSecret) {
-      logger.warn("internal_auth_failed", { requestId: ctx.requestId, path });
-      sendJson(res, 401, { error: "Unauthorized" });
+    if (path === "/metrics") {
+      sendMetrics(res);
       return;
     }
-  }
 
-  if (path === "/health") {
-    sendJson(res, 200, {
-      service: "ai-intelligence-service",
-      status: "ok",
-      model: config.anthropicModel,
-      deterministicFallback: config.aiDeterministicFallback,
-      timestamp: new Date().toISOString()
-    });
-    return;
-  }
+    if (path.startsWith("/internal/")) {
+      const providedSecret =
+        typeof req.headers["x-internal-secret"] === "string" ? req.headers["x-internal-secret"] : "";
+      if (config.internalServiceSecret !== "" && providedSecret !== config.internalServiceSecret) {
+        logger.warn("internal_auth_failed", { requestId: ctx.requestId, path });
+        sendJson(res, 401, { error: "Unauthorized" });
+        return;
+      }
+    }
 
-  if (path.startsWith("/internal/v1/ai/")) {
-    const aiPath = path.slice("/internal/v1/ai/".length);
-    const raw = await readRawBody(req);
-    const { status, body } = await dispatchAi(aiPath, method, raw, ctx.requestId);
-    sendJson(res, status, body);
-    return;
-  }
+    if (path === "/health") {
+      sendJson(res, 200, {
+        service: "ai-intelligence-service",
+        status: "ok",
+        model: config.anthropicModel,
+        deterministicFallback: config.aiDeterministicFallback,
+        timestamp: new Date().toISOString()
+      });
+      return;
+    }
 
-  notFound(res);
+    if (path.startsWith("/internal/v1/ai/")) {
+      const aiPath = path.slice("/internal/v1/ai/".length);
+      const raw = await readRawBody(req);
+      const { status, body } = await dispatchAi(aiPath, method, raw, ctx.requestId);
+      sendJson(res, status, body);
+      return;
+    }
+
+    notFound(res);
   } catch (error) {
     logger.error("request_handler_error", { error: error instanceof Error ? error.message : String(error) });
     if (!res.headersSent) {

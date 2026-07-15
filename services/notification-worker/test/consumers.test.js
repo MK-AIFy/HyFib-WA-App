@@ -21,6 +21,7 @@ test("registerWorkerConsumers subscribes all worker topics on the injected bus",
     "campaign-results",
     "campaign-run",
     "inbound-messages",
+    "media-fetch",
     "outbound-messages",
     "status-updates"
   ]);

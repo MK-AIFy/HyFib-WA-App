@@ -2,10 +2,10 @@
 # Credential-free smoke driver for the HyFib WhatsApp platform.
 #
 # Brings up the full docker compose stack and drives one end-to-end flow
-# with header identity (AUTH_ENABLED=false): tenant -> user -> channel
-# (dummy ids, no Meta calls) -> contact -> consent -> template (DB-approved)
-# -> campaign -> dispatch -> signed inbound webhook -> conversation ->
-# agent reply -> history -> analytics -> audit -> SSE probe.
+# with header identity (AUTH_ENABLED=false): fixed single-org tenant -> user
+# -> channel (dummy ids, no Meta calls) -> contact -> consent -> template
+# (DB-approved) -> campaign -> dispatch -> signed inbound webhook ->
+# conversation -> agent reply -> history -> analytics -> audit -> SSE probe.
 #
 # Usage:
 #   .claude/skills/run-hyfib-wa-app/smoke.sh                  # full run
@@ -117,7 +117,13 @@ PG_DB="$(grep -E '^POSTGRES_DB=' .env | head -n1 | cut -d= -f2-)"
 # Fresh phone-number id per run: webhook -> tenant routing is by phoneNumberId,
 # so reusing one across runs would route events to the oldest matching channel.
 PN_ID="$(date +%s)$((RANDOM % 900 + 100))"
-PHONE="+15551234567"
+# Fixed org id: this driver no longer creates a tenant per run (POST
+# /api/v1/tenants is retired). All entities land in the single seeded org, so
+# identities that used to be scoped to a fresh tenant each run (contact phone,
+# user email, template name) must be made unique per run instead, or they'll
+# collide with rows left behind by a previous run against a persistent DB
+# volume. PN_ID (already unique per run) is reused for that.
+PHONE="+1555${PN_ID: -7}"
 
 api() { # method path role tenant [json-body]
   local method="$1" path="$2" role="$3" tenant="$4" body="${5:-}"
@@ -127,11 +133,16 @@ api() { # method path role tenant [json-body]
   curl "${args[@]}"
 }
 
-step "tenant + user"
-TENANT_ID=$(api POST /api/v1/tenants platform_owner "" "{\"name\":\"Smoke Tenant $PN_ID\"}" | jq -r '.id // empty')
-[[ -n "$TENANT_ID" ]] || fail "tenant create"
+step "org + user"
+# The backend serves a single fixed org now (POST /api/v1/tenants is retired).
+# infra/postgres/init/013_auth.sql seeds this id on fresh installs;
+# ORG_TENANT_ID overrides it for pinned deployments.
+TENANT_ID="${ORG_TENANT_ID:-00000000-0000-0000-0000-000000000001}"
 echo "TENANT_ID=$TENANT_ID"
-api POST /api/v1/users tenant_admin "$TENANT_ID" '{"email":"admin@smoke.example","displayName":"Smoke Admin","roles":["tenant_admin","marketing_manager"]}' | jq -c '{id,email}'
+# Email must be unique per run: user creation 409s on a duplicate email, and
+# with the org fixed across runs the same literal email would collide against
+# a persistent DB volume.
+api POST /api/v1/users tenant_admin "$TENANT_ID" "{\"email\":\"admin+$PN_ID@smoke.example\",\"displayName\":\"Smoke Admin\",\"roles\":[\"tenant_admin\",\"marketing_manager\"]}" | jq -c '{id,email}'
 
 step "whatsapp channel with dummy ids (no Meta Graph calls)"
 api POST /api/v1/channels/whatsapp tenant_admin "$TENANT_ID" "{\"wabaId\":\"000000000000000\",\"phoneNumberId\":\"$PN_ID\",\"displayPhoneNumber\":\"+15550001111\"}" | jq -c '{id,status}'
@@ -147,7 +158,9 @@ CONTACT_ID=$(api POST /api/v1/contacts marketing_manager "$TENANT_ID" "{\"phoneE
 api POST "/api/v1/contacts/$CONTACT_ID/consent" marketing_manager "$TENANT_ID" '{"source":"smoke","policyVersion":"v1"}' | jq -c .
 
 step "template (DB-approved, Meta approval is async in real envs) + campaign + test dispatch"
-TEMPLATE_ID=$(api POST /api/v1/templates marketing_manager "$TENANT_ID" '{"name":"smoke_offer_v1","category":"marketing","language":"en","body":"Hi {{1}}, enjoy 20% off."}' | jq -r '.id // empty')
+# Template name is unique per (tenant, name, language); suffix with PN_ID so
+# reruns against the fixed org don't collide with a prior run's template.
+TEMPLATE_ID=$(api POST /api/v1/templates marketing_manager "$TENANT_ID" "{\"name\":\"smoke_offer_v1_$PN_ID\",\"category\":\"marketing\",\"language\":\"en\",\"body\":\"Hi {{1}}, enjoy 20% off.\"}" | jq -r '.id // empty')
 [[ -n "$TEMPLATE_ID" ]] || fail "template create"
 docker compose exec -T postgres-primary psql -U "$PG_USER" -d "$PG_DB" \
   -c "UPDATE templates SET status='approved' WHERE id='$TEMPLATE_ID';" >/dev/null
@@ -168,7 +181,10 @@ IMPORT_RESP=$(curl -fsS -X POST "$BASE/api/v1/contacts/import" \
   -H "x-role: marketing_manager" -H "x-tenant-id: $TENANT_ID" \
   -H "content-type: text/csv" \
   --data-raw "$CSV_BODY")
-echo "$IMPORT_RESP" | jq -e '.created >= 3' >/dev/null || fail "CSV import: $IMPORT_RESP"
+# bulkUpsert (ON CONFLICT DO UPDATE on tenant_id+phone_e164) means a rerun
+# against the fixed org sees these same phone numbers as updates, not
+# creates — assert on the combined count so the driver tolerates reruns.
+echo "$IMPORT_RESP" | jq -e '(.created + .updated) >= 3' >/dev/null || fail "CSV import: $IMPORT_RESP"
 echo "CSV import: $(echo "$IMPORT_RESP" | jq -c '{created,updated,skipped}') errors=$(echo "$IMPORT_RESP" | jq '.errors|length')"
 
 step "segment create + preview (Phase 1)"

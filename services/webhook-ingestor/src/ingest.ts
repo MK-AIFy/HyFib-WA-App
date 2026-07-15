@@ -1,4 +1,5 @@
 import { EventTopics, incCounter, verifyMetaSignature } from "@hyfib/shared-core";
+import type { Logger } from "@hyfib/shared-core";
 import type { EventBus } from "@hyfib/event-bus";
 import { normalizeInbound, normalizeStatus, type RawValue } from "./normalize.js";
 
@@ -14,11 +15,25 @@ export interface WebhookPayload {
 
 export interface IdempotencyStore {
   isDuplicate(key: string): Promise<boolean>;
+  /**
+   * Release a previously claimed key. Optional so third-party/legacy
+   * implementers of this interface without a release method remain
+   * compatible; when absent, a failed publish simply cannot release its
+   * claim (falls back to prior at-most-once-per-TTL behavior).
+   */
+  release?(key: string): Promise<void>;
 }
 
 export interface IngestDeps {
   eventBus: EventBus;
   idempotency: IdempotencyStore;
+  /**
+   * Optional diagnostics logger. Never affects control flow — e.g. when a
+   * release() call (see below) itself fails, it's logged here rather than
+   * replacing the original error. Optional/silent-by-default so existing
+   * callers and tests that don't supply one remain compatible.
+   */
+  logger?: Logger;
 }
 
 export interface IngestSummary {
@@ -72,11 +87,28 @@ export async function ingestMetaWebhook(
         incCounter("events_published_total", "Events published to the bus.", {
           topic: EventTopics.WhatsAppInboundReceived
         });
-        await deps.eventBus.publish(
-          EventTopics.WhatsAppInboundReceived,
-          { ...normalizeInbound(value, message, entry.id) },
-          tenantId
-        );
+        try {
+          await deps.eventBus.publish(
+            EventTopics.WhatsAppInboundReceived,
+            { ...normalizeInbound(value, message, entry.id) },
+            tenantId
+          );
+        } catch (error) {
+          // Publish failed after the idempotency key was claimed — release it
+          // so a retry of the same webhook (e.g. Meta re-delivery) isn't
+          // swallowed as a duplicate. Guard the release itself: if it throws
+          // (e.g. Redis is also down), log that separately and still rethrow
+          // the ORIGINAL publish error rather than masking it.
+          try {
+            await deps.idempotency.release?.(key);
+          } catch (releaseError) {
+            deps.logger?.warn("idempotency_release_failed", {
+              key,
+              error: releaseError instanceof Error ? releaseError.message : String(releaseError)
+            });
+          }
+          throw error;
+        }
       }
 
       for (const status of value.statuses ?? []) {
@@ -90,11 +122,28 @@ export async function ingestMetaWebhook(
         incCounter("events_published_total", "Events published to the bus.", {
           topic: EventTopics.WhatsAppStatusUpdated
         });
-        await deps.eventBus.publish(
-          EventTopics.WhatsAppStatusUpdated,
-          { ...normalizeStatus(value, status, entry.id) },
-          tenantId
-        );
+        try {
+          await deps.eventBus.publish(
+            EventTopics.WhatsAppStatusUpdated,
+            { ...normalizeStatus(value, status, entry.id) },
+            tenantId
+          );
+        } catch (error) {
+          // Publish failed after the idempotency key was claimed — release it
+          // so a retry of the same webhook (e.g. Meta re-delivery) isn't
+          // swallowed as a duplicate. Guard the release itself: if it throws
+          // (e.g. Redis is also down), log that separately and still rethrow
+          // the ORIGINAL publish error rather than masking it.
+          try {
+            await deps.idempotency.release?.(key);
+          } catch (releaseError) {
+            deps.logger?.warn("idempotency_release_failed", {
+              key,
+              error: releaseError instanceof Error ? releaseError.message : String(releaseError)
+            });
+          }
+          throw error;
+        }
       }
     }
   }

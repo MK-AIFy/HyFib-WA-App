@@ -1,0 +1,23 @@
+-- Global message search: a pg_trgm GIN expression index over message text
+-- (payload->>'text'), enabling substring ILIKE search across all of a
+-- tenant's conversations. No schema change and no table rewrite — message
+-- text lives in JSONB (there is no dedicated text column), and Postgres can
+-- index an expression directly without materializing it as a column.
+-- Substring/trigram matching (not full-text/tsvector) is deliberate:
+-- WhatsApp message text is multilingual and short, so English-oriented
+-- stemming/ranking buys nothing — plain substring search is what users
+-- expect. pg_trgm extension already created by migration
+-- 017_conversation_search.sql.
+--
+-- Locking note: this is a plain (non-CONCURRENT) CREATE INDEX, which takes
+-- a SHARE lock on `messages` for the duration of the build and blocks
+-- writes to that table until it completes. Fine at current (single-org)
+-- message volume. scripts/migrate.sh applies each *.sql file as a single
+-- psql -f invocation with no explicit BEGIN, so statements autocommit
+-- individually — if `messages` grows large enough that the write-blocking
+-- window becomes a problem before this index exists in prod, the escape
+-- hatch is CREATE INDEX CONCURRENTLY (safe to run this way since it is not
+-- wrapped in a transaction block), applied as a one-off manual step rather
+-- than through this migration file.
+CREATE INDEX IF NOT EXISTS idx_messages_text_trgm
+  ON messages USING gin ((coalesce(payload->>'text','')) gin_trgm_ops);

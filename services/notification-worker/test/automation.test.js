@@ -31,10 +31,11 @@ test("matchesConditions enforces tag on tag_added", () => {
 test("planAction maps each action type and drops misconfigured ones", () => {
   assert.deepEqual(planAction(rule()), { kind: "add_tag", tag: "vip" });
   assert.deepEqual(planAction(rule({ actionType: "add_tag", actionConfig: {} })), undefined);
-  assert.deepEqual(
-    planAction(rule({ actionType: "send_template", actionConfig: { templateName: "welcome" } })),
-    { kind: "send_template", templateName: "welcome", templateLanguage: "en_US" }
-  );
+  assert.deepEqual(planAction(rule({ actionType: "send_template", actionConfig: { templateName: "welcome" } })), {
+    kind: "send_template",
+    templateName: "welcome",
+    templateLanguage: "en_US"
+  });
   assert.deepEqual(planAction(rule({ actionType: "create_task", actionConfig: {} })), {
     kind: "create_task",
     title: "Follow up",

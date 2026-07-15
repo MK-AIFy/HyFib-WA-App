@@ -37,11 +37,17 @@ BASE_URL="${BASE_URL%/}"
 EDGE_URL="${EDGE_URL:-http://localhost}"
 WEB_PORTAL_URL="${WEB_PORTAL_URL:-http://localhost:3001}"
 CURL_IMAGE="${CURL_IMAGE:-curlimages/curl:8.8.0}"
-TENANT_NAME="${TENANT_NAME:-Acme Commerce}"
-TENANT_ADMIN_EMAIL="${TENANT_ADMIN_EMAIL:-admin@acme.example}"
+# Fixed org id: this runbook no longer creates a tenant per run (POST
+# /api/v1/tenants is retired). Entities that used to be scoped to a fresh
+# tenant each run (admin email, contact phone, template name) now land in
+# the persistent single-org tenant, so the defaults below are made unique
+# per run (RUN_ID) to avoid colliding with a previous run's rows. Override
+# any of them explicitly if you want stable values for manual testing.
+RUN_ID="$(date +%s)$((RANDOM % 900 + 100))"
+TENANT_ADMIN_EMAIL="${TENANT_ADMIN_EMAIL:-admin+${RUN_ID}@acme.example}"
 TENANT_ADMIN_NAME="${TENANT_ADMIN_NAME:-Acme Admin}"
 DISPLAY_PHONE_NUMBER="${DISPLAY_PHONE_NUMBER:-+1XXXXXXXXXX}"
-CONTACT_PHONE="${CONTACT_PHONE:-+15551234567}"
+CONTACT_PHONE="${CONTACT_PHONE:-+1555${RUN_ID: -7}}"
 
 if [[ ! -f .env ]]; then
   echo "[0/9] .env missing; creating from .env.example"
@@ -72,17 +78,11 @@ curl -fsS "${BASE_URL}/health" | jq .
 curl -fsS "${WEB_PORTAL_URL}/health" | jq .
 curl -fsS -A "Mozilla/5.0" "${EDGE_URL}/health" | jq .
 
-echo "[4/9] Tenant onboarding"
-TENANT_ID="$(
-  curl -fsS -X POST "${BASE_URL}/api/v1/tenants" \
-    -H 'content-type: application/json' \
-    -H 'x-role: platform_owner' \
-    -d "{\"name\":\"${TENANT_NAME}\"}" | jq -r '.id // empty'
-)"
-if [[ -z "${TENANT_ID}" ]]; then
-  echo "Failed to create tenant"
-  exit 1
-fi
+echo "[4/9] Resolve org (fixed single-org tenant) + create admin user"
+# The backend serves a single fixed org now (POST /api/v1/tenants is
+# retired). infra/postgres/init/013_auth.sql seeds this id on fresh
+# installs; ORG_TENANT_ID overrides it for pinned deployments.
+TENANT_ID="${ORG_TENANT_ID:-00000000-0000-0000-0000-000000000001}"
 echo "TENANT_ID=${TENANT_ID}"
 
 curl -fsS -X POST "${BASE_URL}/api/v1/users" \
@@ -112,12 +112,14 @@ curl -fsS -X POST "${BASE_URL}/api/v1/channels/whatsapp" \
   -d "{\"wabaId\":\"${WHATSAPP_WABA_ID}\",\"phoneNumberId\":\"${WHATSAPP_PHONE_NUMBER_ID}\",\"displayPhoneNumber\":\"${DISPLAY_PHONE_NUMBER}\"}" | jq .
 
 echo "[6/9] Template + campaign + async dispatch"
+# Template name is unique per (tenant, name, language); suffix with RUN_ID so
+# reruns against the fixed org don't collide with a prior run's template.
 TEMPLATE_ID="$(
   curl -fsS -X POST "${BASE_URL}/api/v1/templates" \
     -H 'content-type: application/json' \
     -H 'x-role: marketing_manager' \
     -H "x-tenant-id: ${TENANT_ID}" \
-    -d '{"name":"summer_offer_v1","category":"marketing","language":"en","body":"Hi {{1}}, enjoy 20% off today."}' | jq -r '.id // empty'
+    -d "{\"name\":\"summer_offer_v1_${RUN_ID}\",\"category\":\"marketing\",\"language\":\"en\",\"body\":\"Hi {{1}}, enjoy 20% off today.\"}" | jq -r '.id // empty'
 )"
 if [[ -z "${TEMPLATE_ID}" ]]; then
   echo "Failed to create template"

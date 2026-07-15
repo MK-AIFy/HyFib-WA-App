@@ -17,7 +17,9 @@ const CONTACT_LIST_MAX_LIMIT = 100;
 export function parseContactListQuery(params: URLSearchParams): ContactListQuery {
   const rawLimit = Number(params.get("limit"));
   const limit =
-    Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.floor(rawLimit), CONTACT_LIST_MAX_LIMIT) : CONTACT_LIST_DEFAULT_LIMIT;
+    Number.isFinite(rawLimit) && rawLimit > 0
+      ? Math.min(Math.floor(rawLimit), CONTACT_LIST_MAX_LIMIT)
+      : CONTACT_LIST_DEFAULT_LIMIT;
   const rawOffset = Number(params.get("offset"));
   const offset = Number.isFinite(rawOffset) && rawOffset > 0 ? Math.floor(rawOffset) : 0;
   const query = params.get("q")?.trim() || undefined;
@@ -76,13 +78,11 @@ export interface ListQuery {
 /** Parses and clamps generic limit/offset list pagination params. */
 export function parseListQuery(params: URLSearchParams, defaultLimit = 25, maxLimit = 100): ListQuery {
   const rawLimit = Number(params.get("limit"));
-  const limit =
-    Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.floor(rawLimit), maxLimit) : defaultLimit;
+  const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.floor(rawLimit), maxLimit) : defaultLimit;
   const rawOffset = Number(params.get("offset"));
   const offset = Number.isFinite(rawOffset) && rawOffset > 0 ? Math.floor(rawOffset) : 0;
   return { limit, offset };
 }
-
 
 // Meta Cloud API limits for interactive messages.
 const BODY_TEXT_MAX = 1024;
@@ -143,8 +143,14 @@ export function validateCampaignBody(payload: CampaignBodyInput): { ok: true } |
     const qh = payload.quietHours as Record<string, unknown>;
     const sh = qh.startHour;
     const eh = qh.endHour;
-    if (!Number.isInteger(sh) || (sh as number) < 0 || (sh as number) > 23 ||
-        !Number.isInteger(eh) || (eh as number) < 0 || (eh as number) > 23) {
+    if (
+      !Number.isInteger(sh) ||
+      (sh as number) < 0 ||
+      (sh as number) > 23 ||
+      !Number.isInteger(eh) ||
+      (eh as number) < 0 ||
+      (eh as number) > 23
+    ) {
       return { ok: false, error: "quietHours.startHour and endHour must be integers between 0 and 23" };
     }
   }
@@ -156,10 +162,16 @@ export function validateCampaignBody(payload: CampaignBodyInput): { ok: true } |
     const mm = fc.maxMessages;
     const ph = fc.periodHours;
     if (!Number.isInteger(mm) || (mm as number) < 1 || (mm as number) > FREQUENCY_CAP_MAX_MESSAGES_MAX) {
-      return { ok: false, error: `frequencyCap.maxMessages must be an integer between 1 and ${FREQUENCY_CAP_MAX_MESSAGES_MAX}` };
+      return {
+        ok: false,
+        error: `frequencyCap.maxMessages must be an integer between 1 and ${FREQUENCY_CAP_MAX_MESSAGES_MAX}`
+      };
     }
     if (!Number.isInteger(ph) || (ph as number) < 1 || (ph as number) > FREQUENCY_CAP_PERIOD_HOURS_MAX) {
-      return { ok: false, error: `frequencyCap.periodHours must be an integer between 1 and ${FREQUENCY_CAP_PERIOD_HOURS_MAX}` };
+      return {
+        ok: false,
+        error: `frequencyCap.periodHours must be an integer between 1 and ${FREQUENCY_CAP_PERIOD_HOURS_MAX}`
+      };
     }
   }
   return { ok: true };

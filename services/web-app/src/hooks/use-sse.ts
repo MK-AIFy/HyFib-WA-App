@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
 import { useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { readStoredToken } from "@/lib/auth-storage";
 
 export type SseStatus = "live" | "offline" | "connecting";
 
@@ -76,10 +75,41 @@ function handleEvent(evt: SseEvent, queryClient: QueryClient): void {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       return;
     }
+    case "conversation.read": {
+      // Broadcast directly via sseHub.broadcast(tenantId, "conversation.read", id,
+      // { conversationId }) in api-gateway/src/index.ts — a flat payload, same as
+      // conversation.assigned/team_assigned/state_changed above, NOT the nested
+      // { occurredAt, payload } shape forwardEventToSse wraps bus-forwarded topics
+      // (whatsapp.inbound.received, media.stored) in below. No per-id targeting is
+      // needed here since a full ["conversations"] invalidation already covers the
+      // multi-tab/agent sync this event exists for.
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      return;
+    }
+    case "conversation.archived":
+    case "conversation.pinned": {
+      // Broadcast via sseHub.broadcast(tenantId, "conversation.archived"/"conversation.pinned",
+      // id, { conversationId, archived/pinned }) in api-gateway/src/index.ts — flat payloads,
+      // same shape as conversation.read above. A full ["conversations"] invalidation covers
+      // both the archived-folder membership change and pinned-first reordering.
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      return;
+    }
     case "whatsapp.inbound.received":
     case "whatsapp.status.updated": {
       const data = evt.payload as { payload?: { conversationId?: string } };
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      const conversationId = data.payload?.conversationId;
+      if (conversationId) {
+        void queryClient.invalidateQueries({ queryKey: ["messages", conversationId] });
+      }
+      return;
+    }
+    case "media.stored": {
+      // The blob query for this asset only mounts once payload.mediaAsset
+      // lands on the message, which this refetch brings — no separate
+      // ["media-blob", assetId] invalidation needed since it doesn't exist yet.
+      const data = evt.payload as { payload?: { conversationId?: string } };
       const conversationId = data.payload?.conversationId;
       if (conversationId) {
         void queryClient.invalidateQueries({ queryKey: ["messages", conversationId] });
@@ -108,14 +138,12 @@ export function useSse(enabled: boolean): SseStatus {
     let attempt = 0;
 
     async function connect() {
-      const token = readStoredToken();
-      if (!token) {
-        return;
-      }
       setStatus("connecting");
       try {
+        // Cookie auth: the browser attaches hf_session automatically
+        // (same-origin default) — the connect guard above (`enabled`) is
+        // what tracks whether there's an authenticated user to stream for.
         const res = await fetch("/api/v1/events/stream", {
-          headers: { authorization: `Bearer ${token}` },
           signal: controller.signal
         });
         if (!res.body) {

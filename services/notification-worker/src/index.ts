@@ -19,6 +19,7 @@ import {
   contactRepository,
   conversationRepository,
   healthCheck,
+  mediaRepository,
   messageRepository,
   outboxRepository,
   resolveChannelByPhoneNumberId,
@@ -43,19 +44,29 @@ import {
   type CampaignDispatchRequest,
   type CampaignRunRequest,
   type EventEnvelope,
+  type MediaFetchRequest,
   type Message,
   type MessageCategory,
   type WhatsAppOutboundRequest
 } from "@hyfib/shared-core";
-import { buildOutboundAdapterCall } from "./outbound.js";
+import {
+  buildOutboundAdapterCall,
+  claimRedisKey,
+  releaseRedisKey,
+  dispatchClaimKey,
+  DISPATCH_CLAIM_TTL_SECONDS
+} from "./outbound.js";
 import { resolveVariables } from "./personalize.js";
 import { matchAutoReply } from "./autoreply.js";
 import { evaluateAutomationRules } from "./automation.js";
+import { processMediaFetch } from "./media.js";
 
 const config = loadConfig();
 const logger = new Logger("notification-worker", config.logLevel as "debug" | "info" | "warn" | "error");
 let eventBus = createEventBus(config);
-const redis = getRedisClient(config);
+let redis = getRedisClient(config);
+/** Phone-number-id → tenant/channel lookup (defaults to the DB-backed resolver; overridable via WorkerDeps). */
+let resolveChannel: typeof resolveChannelByPhoneNumberId = resolveChannelByPhoneNumberId;
 
 interface InboundEvent {
   phoneNumberId?: string;
@@ -103,12 +114,13 @@ export interface WorkerMetaClient {
     tenantId: string,
     payload: Record<string, unknown>
   ): Promise<{ messageId?: string; accepted: boolean }>;
-  markRead(
-    phoneNumberId: string,
-    messageId: string,
+  markRead(phoneNumberId: string, messageId: string, tenantId: string, accessToken?: string): Promise<void>;
+  /** Downloads inbound media bytes for a Graph media id. Throws on any non-success outcome. */
+  fetchMedia(
+    mediaId: string,
     tenantId: string,
     accessToken?: string
-  ): Promise<void>;
+  ): Promise<{ buffer: Buffer; mimeType?: string; fileSizeBytes?: number }>;
 }
 
 const defaultMetaClient: WorkerMetaClient = {
@@ -146,6 +158,37 @@ const defaultMetaClient: WorkerMetaClient = {
     } catch (error) {
       logger.warn("mark_read_failed", { error: error instanceof Error ? error.message : String(error) });
     }
+  },
+  async fetchMedia(mediaId, tenantId, accessToken) {
+    const url = new URL(`${config.metaAdapterUrl}/internal/v1/whatsapp/media/${encodeURIComponent(mediaId)}/download`);
+    if (accessToken) {
+      url.searchParams.set("accessToken", accessToken);
+    }
+    const response = await fetch(url, {
+      headers: {
+        "x-tenant-id": tenantId,
+        "x-request-id": randomUUID(),
+        "x-internal-secret": config.internalServiceSecret
+      },
+      signal: AbortSignal.timeout(60_000)
+    });
+    if (!response.ok) {
+      let detail = "";
+      try {
+        const body = (await response.json()) as { error?: string };
+        detail = body.error ? `_${body.error}` : "";
+      } catch {
+        // Non-JSON error body; fall back to the bare status.
+      }
+      throw new Error(`meta_adapter_media_fetch_failed_${response.status}${detail}`);
+    }
+    const buffer = Buffer.from(await response.arrayBuffer());
+    const contentLength = response.headers.get("content-length");
+    return {
+      buffer,
+      mimeType: response.headers.get("content-type") ?? undefined,
+      fileSizeBytes: contentLength ? Number(contentLength) : buffer.length
+    };
   }
 };
 
@@ -446,13 +489,46 @@ async function handleOutbound(event: EventEnvelope): Promise<void> {
     logger.warn("outbound_invalid_command", { eventId: event.id });
     return;
   }
-  const channel = await resolveSendChannel(command.tenantId, command.channelId);
 
-  const call = buildOutboundAdapterCall(command, channel);
+  // Replay guard: a redelivered outbox row is re-published with a NEW envelope id, so
+  // claim on the caller-assigned dispatchId (stable across replay) instead of event.id.
+  // No dispatchId means no guard — current unguarded behavior is unchanged.
+  const claimKey = command.dispatchId ? dispatchClaimKey(command.dispatchId) : undefined;
+  if (claimKey) {
+    const claimed = await claimRedisKey(redis, claimKey, DISPATCH_CLAIM_TTL_SECONDS);
+    if (!claimed) {
+      // Skip branch stays outside the try below: a skip must not release another
+      // in-flight attempt's claim.
+      logger.info("outbound_replay_skipped", {
+        conversationId: command.conversationId,
+        dispatchId: command.dispatchId
+      });
+      return;
+    }
+  }
+
+  // Everything from the successful claim through a completed send is guarded: any
+  // exception here (channel resolution, payload building, or the adapter call itself)
+  // releases the claim so a retry with the same dispatchId can resend instead of being
+  // silently dropped as an "already claimed" replay. On success the claim is left in
+  // place — it's the 24h dedupe record.
   let result: { messageId?: string; accepted: boolean };
+  let persistedPayload: Record<string, unknown>;
   try {
+    const channel = await resolveSendChannel(command.tenantId, command.channelId);
+    const call = buildOutboundAdapterCall(command, channel);
+    persistedPayload = call.persistedPayload;
     result = await callMetaAdapter(call.endpoint, command.tenantId, call.payload);
   } catch (error) {
+    if (claimKey) {
+      // Release the claim so redelivery of this dispatchId can retry the send.
+      await releaseRedisKey(redis, claimKey).catch((releaseError) =>
+        logger.warn("dispatch_claim_release_failed", {
+          key: claimKey,
+          error: releaseError instanceof Error ? releaseError.message : String(releaseError)
+        })
+      );
+    }
     logger.error("outbound_adapter_failed", {
       conversationId: command.conversationId,
       error: error instanceof Error ? error.message : String(error)
@@ -466,7 +542,7 @@ async function handleOutbound(event: EventEnvelope): Promise<void> {
     status: result.accepted ? "sent" : "queued",
     category: "service" as MessageCategory,
     externalMessageId: result.messageId,
-    payload: call.persistedPayload
+    payload: persistedPayload
   });
   incCounter("whatsapp_messages_sent_total", "Outbound WhatsApp template sends.", {
     result: result.accepted ? "accepted" : "queued"
@@ -482,17 +558,87 @@ async function markRead(channel: ChannelCredentials, messageId: string | undefin
   await metaClient.markRead(channel.phoneNumberId, messageId, tenantId, channel.accessToken);
 }
 
+/**
+ * Builds and enqueues a MediaFetchRequested outbox row for inbound media. Idempotent
+ * downstream (media.ts's upsertPending short-circuits by media id), so calling this more
+ * than once for the same media is always safe. Shared by handleInbound's main path and its
+ * replay-guard skip branch, which re-enqueues when a prior run committed the message but
+ * then failed to enqueue the media fetch (self-healing an otherwise-permanent orphaned-media
+ * window — see the skip branch for details).
+ */
+async function defaultEnqueueMediaFetch(
+  channel: { tenantId: string; channelId: string },
+  phoneNumberId: string | undefined,
+  conversationId: string,
+  messageId: string,
+  media: { id: string; mimeType?: string; sha256?: string; filename?: string }
+): Promise<void> {
+  await withTenant(channel.tenantId, async (client) => {
+    await outboxRepository.enqueue(client, channel.tenantId, {
+      topic: EventTopics.MediaFetchRequested,
+      payload: {
+        tenantId: channel.tenantId,
+        channelId: channel.channelId,
+        phoneNumberId,
+        conversationId,
+        messageId,
+        mediaId: media.id,
+        mimeType: media.mimeType,
+        filename: media.filename,
+        sha256: media.sha256
+      } satisfies MediaFetchRequest
+    });
+  });
+}
+/** Overridable via WorkerDeps (see registerWorkerConsumers) so tests can avoid touching Postgres. */
+let enqueueMediaFetch: typeof defaultEnqueueMediaFetch = defaultEnqueueMediaFetch;
+
 async function handleInbound(event: EventEnvelope): Promise<void> {
   incCounter("events_consumed_total", "Events consumed from the bus.", { topic: EventTopics.WhatsAppInboundReceived });
   const inbound = event.payload as InboundEvent;
   if (!inbound.phoneNumberId || !inbound.from) {
     return;
   }
-  const channel = await resolveChannelByPhoneNumberId(inbound.phoneNumberId);
+  const channel = await resolveChannel(inbound.phoneNumberId);
   if (!channel) {
     logger.warn("inbound_unroutable", { phoneNumberId: inbound.phoneNumberId });
     return;
   }
+
+  // Replay guard: a redelivered outbox row is re-published with a NEW envelope id, so
+  // event.id-keyed dedupe wouldn't catch it. Skip if we've already recorded this exact
+  // WhatsApp message — prevents both a duplicate message row and a duplicate auto-reply.
+  if (inbound.messageId) {
+    const existing = await messageRepository.findByExternalId(channel.tenantId, inbound.messageId);
+    if (existing) {
+      logger.info("inbound_replay_skipped", { tenantId: channel.tenantId, messageId: inbound.messageId });
+      // Self-healing: a prior run may have committed the message row but then failed to
+      // enqueue the media fetch (separate transaction; a transient DB error between the two
+      // leaves the media permanently orphaned, since replays never reach the main path below).
+      // Re-enqueue unless it's already linked — idempotent downstream, so this is harmless even
+      // if the original enqueue actually succeeded. No extra DB reads when there's no media.
+      const replayMedia = inbound.media as
+        | { id?: string; mimeType?: string; sha256?: string; filename?: string }
+        | undefined;
+      const replayMediaId = replayMedia?.id;
+      if (replayMediaId && !existing.payload?.mediaAsset) {
+        await enqueueMediaFetch(channel, inbound.phoneNumberId, existing.conversationId, existing.id, {
+          id: replayMediaId,
+          mimeType: replayMedia?.mimeType,
+          filename: replayMedia?.filename,
+          sha256: replayMedia?.sha256
+        });
+        logger.info("media_fetch_reenqueued_on_replay", {
+          tenantId: channel.tenantId,
+          conversationId: existing.conversationId,
+          messageId: existing.id,
+          mediaId: replayMediaId
+        });
+      }
+      return;
+    }
+  }
+
   const contact = await contactRepository.findOrCreateByPhone(channel.tenantId, inbound.from);
   const conversation = await conversationRepository.findOrCreate(channel.tenantId, contact.id, channel.channelId);
 
@@ -517,7 +663,7 @@ async function handleInbound(event: EventEnvelope): Promise<void> {
       payload[field] = inbound[field];
     }
   }
-  await messageRepository.create(channel.tenantId, {
+  const createdMessage = await messageRepository.create(channel.tenantId, {
     conversationId: conversation.id,
     direction: "inbound",
     status: "delivered",
@@ -525,6 +671,25 @@ async function handleInbound(event: EventEnvelope): Promise<void> {
     payload
   });
   logger.info("inbound_recorded", { tenantId: channel.tenantId, messageId: inbound.messageId, type: inbound.type });
+
+  // Inbound media (image/video/audio/document/sticker): enqueue an async fetch of the
+  // bytes via the outbox. Idempotent by media id (see media.ts's upsertPending
+  // short-circuit), so redelivery of this outbox row or a future replay is safe.
+  const media = inbound.media as { id?: string; mimeType?: string; sha256?: string; filename?: string } | undefined;
+  const mediaId = media?.id;
+  if (mediaId) {
+    await enqueueMediaFetch(channel, inbound.phoneNumberId, conversation.id, createdMessage.id, {
+      id: mediaId,
+      mimeType: media?.mimeType,
+      filename: media?.filename,
+      sha256: media?.sha256
+    });
+    logger.info("media_fetch_enqueued", {
+      tenantId: channel.tenantId,
+      conversationId: conversation.id,
+      mediaId
+    });
+  }
 
   // Send a read receipt (best-effort) using the resolved channel's credentials.
   const sendChannel = await resolveSendChannel(channel.tenantId, channel.channelId);
@@ -557,11 +722,8 @@ async function handleInbound(event: EventEnvelope): Promise<void> {
     const interactivePayload = inbound.interactive as
       | { button_reply?: { title?: string }; list_reply?: { title?: string } }
       | undefined;
-    const interactiveTitle =
-      interactivePayload?.button_reply?.title ?? interactivePayload?.list_reply?.title;
-    const text = (typeof inbound.text === "string" && inbound.text)
-      ? inbound.text
-      : interactiveTitle;
+    const interactiveTitle = interactivePayload?.button_reply?.title ?? interactivePayload?.list_reply?.title;
+    const text = typeof inbound.text === "string" && inbound.text ? inbound.text : interactiveTitle;
     const matched = matchAutoReply(text, rules);
     if (matched && matched.replyText) {
       await withTenant(channel.tenantId, async (client) => {
@@ -573,7 +735,8 @@ async function handleInbound(event: EventEnvelope): Promise<void> {
             conversationId: conversation.id,
             contactPhoneE164: contact.phoneE164,
             kind: "text",
-            text: matched.replyText
+            text: matched.replyText,
+            dispatchId: randomUUID()
           } satisfies WhatsAppOutboundRequest
         });
       });
@@ -635,8 +798,9 @@ async function runNewMessageAutomation(
               channelId,
               contactPhoneE164: contact.phoneE164,
               templateName: action.templateName,
-              templateLanguage: action.templateLanguage
-            }
+              templateLanguage: action.templateLanguage,
+              dispatchId: randomUUID()
+            } satisfies AutomationTemplateRequest
           });
         });
       }
@@ -739,54 +903,92 @@ async function handleAutomationTemplate(event: EventEnvelope): Promise<void> {
     return;
   }
 
-  // At-least-once delivery guard: skip if this event was already processed.
-  const claimed = await redis.set(`atreq:${event.id}`, "1", "EX", 3600, "NX");
+  // At-least-once delivery guard: skip if this dispatch was already processed. Prefer the
+  // caller-assigned dispatchId (stable across outbox replay) over event.id, which is
+  // regenerated on every republish and so wouldn't catch a replayed redelivery.
+  const claimKey = `atreq:${req.dispatchId ?? event.id}`;
+  const claimed = await claimRedisKey(redis, claimKey, 3600);
   if (!claimed) {
-    logger.info("automation_template_duplicate_skipped", { eventId: event.id });
+    // Skip branch stays outside the try below: a skip must not release another
+    // in-flight attempt's claim.
+    logger.info("automation_template_duplicate_skipped", { eventId: event.id, dispatchId: req.dispatchId });
     return;
   }
 
-  // Resolve contact and enforce consent + policy before sending
-  const contact = await contactRepository.findOrCreateByPhone(req.tenantId, req.contactPhoneE164);
-  if (contact.optedOut) {
-    logger.warn("automation_template_opted_out", { tenantId: req.tenantId, contactId: contact.id });
-    return;
-  }
-  const hasConsent = await consentRepository.hasActiveConsent(req.tenantId, contact.id);
-  if (!hasConsent) {
-    logger.warn("automation_template_no_consent", { tenantId: req.tenantId, contactId: contact.id });
-    return;
-  }
-  const settings = await whatsappSettingsRepository.getByTenant(req.tenantId);
-  const policyCheck = evaluateOutboundPolicy({
-    hasActiveConsent: true,
-    isInside24hWindow: false,
-    template: { category: (req as any).templateCategory ?? "marketing", status: "approved" } as import("@hyfib/shared-core").Template,
-    requestedCategory: ((req as any).templateCategory ?? "marketing") as import("@hyfib/shared-core").MessageCategory,
-    isOptedOut: false,
-    currentHourLocal: getCurrentHourInTz(contact.timezone ?? "UTC"),
-    quietHours: (settings as unknown as { quietHours?: import("@hyfib/shared-core").QuietHoursConfig })?.quietHours,
-    frequencyCap: undefined
-  });
-  if (!policyCheck.allowed) {
-    logger.warn("automation_template_policy_blocked", { tenantId: req.tenantId, contactId: contact.id, reason: policyCheck.reason });
-    return;
-  }
+  // Everything from the successful claim through a completed send is guarded: any
+  // exception here (contact lookup, consent/policy checks, channel resolution, or the
+  // adapter call itself) releases the claim so a retry with the same dispatchId can
+  // resend instead of being silently dropped as an "already claimed" replay. Business
+  // declines (opted-out, no consent, policy-blocked, no channel) `return` rather than
+  // throw, so they fall through normally and the claim is kept: a replay would decline
+  // the same way deterministically, so keeping it is harmless and simpler than releasing.
+  let result: { messageId?: string; accepted: boolean };
+  let contact: Awaited<ReturnType<typeof contactRepository.findOrCreateByPhone>>;
+  let channelId: string;
+  try {
+    // Resolve contact and enforce consent + policy before sending
+    contact = await contactRepository.findOrCreateByPhone(req.tenantId, req.contactPhoneE164);
+    if (contact.optedOut) {
+      logger.warn("automation_template_opted_out", { tenantId: req.tenantId, contactId: contact.id });
+      return;
+    }
+    const hasConsent = await consentRepository.hasActiveConsent(req.tenantId, contact.id);
+    if (!hasConsent) {
+      logger.warn("automation_template_no_consent", { tenantId: req.tenantId, contactId: contact.id });
+      return;
+    }
+    const settings = await whatsappSettingsRepository.getByTenant(req.tenantId);
+    const policyCheck = evaluateOutboundPolicy({
+      hasActiveConsent: true,
+      isInside24hWindow: false,
+      template: {
+        category: (req as any).templateCategory ?? "marketing",
+        status: "approved"
+      } as import("@hyfib/shared-core").Template,
+      requestedCategory: ((req as any).templateCategory ?? "marketing") as import("@hyfib/shared-core").MessageCategory,
+      isOptedOut: false,
+      currentHourLocal: getCurrentHourInTz(contact.timezone ?? "UTC"),
+      quietHours: (settings as unknown as { quietHours?: import("@hyfib/shared-core").QuietHoursConfig })?.quietHours,
+      frequencyCap: undefined
+    });
+    if (!policyCheck.allowed) {
+      logger.warn("automation_template_policy_blocked", {
+        tenantId: req.tenantId,
+        contactId: contact.id,
+        reason: policyCheck.reason
+      });
+      return;
+    }
 
-  const channelId = req.channelId ?? (await channelRepository.firstActive(req.tenantId))?.id;
-  if (!channelId) {
-    logger.warn("automation_template_no_channel", { tenantId: req.tenantId });
-    return;
+    const resolvedChannelId = req.channelId ?? (await channelRepository.firstActive(req.tenantId))?.id;
+    if (!resolvedChannelId) {
+      logger.warn("automation_template_no_channel", { tenantId: req.tenantId });
+      return;
+    }
+    channelId = resolvedChannelId;
+    const channel = await resolveSendChannel(req.tenantId, channelId);
+    result = await callMetaAdapter("/internal/v1/whatsapp/send-template", req.tenantId, {
+      phoneNumberId: channel.phoneNumberId,
+      to: req.contactPhoneE164,
+      templateName: req.templateName,
+      templateLanguage: req.templateLanguage,
+      parameters: [],
+      accessToken: channel.accessToken
+    });
+  } catch (error) {
+    // Release the claim so redelivery of this dispatch can retry the send.
+    await releaseRedisKey(redis, claimKey).catch((releaseError) =>
+      logger.warn("dispatch_claim_release_failed", {
+        key: claimKey,
+        error: releaseError instanceof Error ? releaseError.message : String(releaseError)
+      })
+    );
+    logger.error("automation_template_send_failed", {
+      tenantId: req.tenantId,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    throw error; // Re-throw so the broker can retry.
   }
-  const channel = await resolveSendChannel(req.tenantId, channelId);
-  const result = await callMetaAdapter("/internal/v1/whatsapp/send-template", req.tenantId, {
-    phoneNumberId: channel.phoneNumberId,
-    to: req.contactPhoneE164,
-    templateName: req.templateName,
-    templateLanguage: req.templateLanguage,
-    parameters: [],
-    accessToken: channel.accessToken
-  });
   const conversation = await conversationRepository.findOrCreate(req.tenantId, contact.id, channelId);
   await messageRepository.create(req.tenantId, {
     conversationId: conversation.id,
@@ -796,9 +998,38 @@ async function handleAutomationTemplate(event: EventEnvelope): Promise<void> {
     externalMessageId: result.messageId,
     payload: { source: "automation", templateName: req.templateName }
   });
-  logger.info("automation_template_sent", { tenantId: req.tenantId, contactPhoneE164: req.contactPhoneE164, externalMessageId: result.messageId });
+  logger.info("automation_template_sent", {
+    tenantId: req.tenantId,
+    contactPhoneE164: req.contactPhoneE164,
+    externalMessageId: result.messageId
+  });
   incCounter("automation_template_sends_total", "Automation template sends.", {
     result: result.accepted ? "accepted" : "queued"
+  });
+}
+
+/**
+ * Downloads and stores an inbound media asset (see media.ts for the flow).
+ * No dispatchId/claim needed here — processMediaFetch is idempotent by media
+ * id, and failures rethrow so the outbox's backoff/dead-letter is the retry
+ * engine.
+ */
+async function handleMediaFetch(event: EventEnvelope): Promise<void> {
+  incCounter("events_consumed_total", "Events consumed from the bus.", { topic: EventTopics.MediaFetchRequested });
+  const req = event.payload as MediaFetchRequest;
+  if (!req.tenantId || !req.channelId || !req.conversationId || !req.messageId || !req.mediaId) {
+    logger.warn("media_fetch_invalid_request", { eventId: event.id });
+    return;
+  }
+  await processMediaFetch(req, {
+    media: mediaRepository,
+    messages: {
+      mergePayloadById: (tenantId, messageId, patch) => messageRepository.mergePayloadById(tenantId, messageId, patch)
+    },
+    resolveChannel: resolveSendChannel,
+    fetchMedia: (mediaId, tenantId, accessToken) => metaClient.fetchMedia(mediaId, tenantId, accessToken),
+    publish: (topic, payload, tenantId) => eventBus.publish(topic, payload, tenantId),
+    logger
   });
 }
 
@@ -807,6 +1038,12 @@ export interface WorkerDeps {
   eventBus?: EventBus;
   /** Direct in-process meta transport (app-server). Falls back to HTTP fetch. */
   metaClient?: WorkerMetaClient;
+  /** Redis client used by replay-claim guards (app-server may share one client). Falls back to the shared client. */
+  redis?: ReturnType<typeof getRedisClient>;
+  /** Phone-number-id → tenant/channel lookup. Falls back to the DB-backed resolver. */
+  resolveChannel?: typeof resolveChannelByPhoneNumberId;
+  /** Media-fetch outbox enqueue. Falls back to the DB-backed withTenant/outboxRepository path. */
+  enqueueMediaFetch?: typeof defaultEnqueueMediaFetch;
 }
 
 /**
@@ -827,6 +1064,15 @@ export function registerWorkerConsumers(deps: WorkerDeps = {}): void {
   if (deps.metaClient) {
     metaClient = deps.metaClient;
   }
+  if (deps.redis) {
+    redis = deps.redis;
+  }
+  if (deps.resolveChannel) {
+    resolveChannel = deps.resolveChannel;
+  }
+  if (deps.enqueueMediaFetch) {
+    enqueueMediaFetch = deps.enqueueMediaFetch;
+  }
   eventBus.subscribe(EventTopics.CampaignDispatchRequested, "campaign-dispatch", handleDispatch);
   eventBus.subscribe(EventTopics.CampaignDispatchResult, "campaign-results", handleDispatchResult);
   eventBus.subscribe(EventTopics.CampaignRunRequested, "campaign-run", handleCampaignRun);
@@ -834,6 +1080,7 @@ export function registerWorkerConsumers(deps: WorkerDeps = {}): void {
   eventBus.subscribe(EventTopics.WhatsAppStatusUpdated, "status-updates", handleStatus);
   eventBus.subscribe(EventTopics.WhatsAppOutboundRequested, "outbound-messages", handleOutbound);
   eventBus.subscribe(EventTopics.AutomationTemplateRequested, "automation-templates", handleAutomationTemplate);
+  eventBus.subscribe(EventTopics.MediaFetchRequested, "media-fetch", handleMediaFetch);
 }
 
 const server = createServer(async (req, res) => {

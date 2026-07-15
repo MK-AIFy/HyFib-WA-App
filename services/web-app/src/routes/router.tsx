@@ -18,8 +18,6 @@ import { AiToolsPage } from "@/pages/AiToolsPage";
 import { SettingsPage } from "@/pages/SettingsPage";
 import { TeamsPage } from "@/pages/TeamsPage";
 import { UsersPage } from "@/pages/UsersPage";
-import { TenantsPage } from "@/pages/TenantsPage";
-import { RegisterPage } from "@/pages/RegisterPage";
 import { RequireAuth, RequireRole } from "./guards";
 
 function ShellRoute() {
@@ -46,7 +44,6 @@ function ShellRoute() {
 
 export const router = createBrowserRouter([
   { path: "/login", element: <LoginPage /> },
-  { path: "/register", element: <RegisterPage /> },
   { path: "/onboarding", element: <OnboardingPage /> },
   {
     element: <RequireAuth />,
@@ -71,10 +68,6 @@ export const router = createBrowserRouter([
           {
             element: <RequireRole roles={["platform_owner", "tenant_admin"]} />,
             children: [{ path: "users", element: <UsersPage /> }]
-          },
-          {
-            element: <RequireRole roles={["platform_owner"]} />,
-            children: [{ path: "tenants", element: <TenantsPage /> }]
           },
           { path: "settings", element: <SettingsPage /> }
         ]

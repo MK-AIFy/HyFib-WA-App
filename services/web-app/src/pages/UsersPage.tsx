@@ -15,7 +15,14 @@ import { api } from "@/lib/api";
 import { titleCase } from "@/lib/format";
 import { useCreate, useList } from "@/hooks/use-resource";
 
-const ROLES: Role[] = ["tenant_admin", "marketing_manager", "sales_agent", "support_agent", "analyst", "compliance_auditor"];
+const ROLES: Role[] = [
+  "tenant_admin",
+  "marketing_manager",
+  "sales_agent",
+  "support_agent",
+  "analyst",
+  "compliance_auditor"
+];
 
 export function UsersPage() {
   const qc = useQueryClient();

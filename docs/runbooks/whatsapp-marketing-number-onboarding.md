@@ -17,7 +17,8 @@ Automation helpers:
   - `http://localhost:18080` (`api-gateway` direct)
   - `http://localhost:3001` (`web-portal` direct)
 - Core API routes:
-  - `/api/v1/tenants`, `/api/v1/users`, `/api/v1/channels/whatsapp`, `/api/v1/templates`, `/api/v1/campaigns`, `/api/v1/contacts`, `/api/v1/analytics`, `/api/v1/audit`
+  - `/api/v1/users`, `/api/v1/channels/whatsapp`, `/api/v1/templates`, `/api/v1/campaigns`, `/api/v1/contacts`, `/api/v1/analytics`, `/api/v1/audit`
+  - Note: `/api/v1/tenants` is retired (404) — this deployment is single-organization. See `docs/runbooks/single-org-deployment.md`.
   - `GET/POST /api/v1/webhooks/meta/whatsapp`
 - Internal onboarding routes (via Docker network):
   - `meta-adapter`:
@@ -70,13 +71,14 @@ curl -A "Mozilla/5.0" http://localhost/health
 
 Note: `http://localhost` with default curl user-agent may return `403` due nginx bot filtering.
 
-5. Tenant onboarding
+5. Resolve org (fixed single-org tenant) + create admin user
 
 ```bash
-TENANT_ID=$(curl -s -X POST http://localhost:18080/api/v1/tenants \
-  -H 'content-type: application/json' \
-  -H 'x-role: platform_owner' \
-  -d '{"name":"Acme Commerce"}' | jq -r '.id')
+# The backend serves a single fixed org (`POST /api/v1/tenants` is retired,
+# 404). infra/postgres/init/013_auth.sql seeds this id on fresh installs;
+# ORG_TENANT_ID overrides it for pinned deployments — see
+# docs/runbooks/single-org-deployment.md.
+TENANT_ID="${ORG_TENANT_ID:-00000000-0000-0000-0000-000000000001}"
 
 curl -s -X POST http://localhost:18080/api/v1/users \
   -H 'content-type: application/json' \
@@ -160,7 +162,7 @@ docker compose logs --tail 100 api-gateway webhook-ingestor notification-worker 
 
 - Startup: all containers `Up` in `docker compose ps`.
 - Gateway health: `GET /health` returns `200`.
-- RBAC: tenant creation works with `x-role: platform_owner`; restricted roles fail appropriately.
+- RBAC: `POST /api/v1/users` works with `x-role: tenant_admin`/`platform_owner`; restricted roles fail appropriately.
 - Onboarding: subscribe/register/channel attach succeed with valid Meta credentials.
 - Campaign flow: template + campaign + dispatch returns success, then audit and analytics reflect activity.
 - Webhook readiness: verify token path `GET /api/v1/webhooks/meta/whatsapp` responds correctly when Meta challenge is sent.

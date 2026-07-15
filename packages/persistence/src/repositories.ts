@@ -16,6 +16,7 @@ import type {
   FrequencyCapConfig,
   Message,
   MessageCategory,
+  MessageSearchResult,
   Order,
   QuietHoursConfig,
   Role,
@@ -1371,11 +1372,15 @@ interface ConversationRow {
   channel_id: string;
   last_message_at: Date | null;
   last_inbound_at: Date | null;
+  last_read_at: Date | null;
   assigned_user_id: string | null;
   state: string;
+  archived_at: Date | null;
+  pinned_at: Date | null;
   contact_name: string | null;
   contact_phone: string | null;
   last_message: string | null;
+  unread_count: number;
 }
 
 function mapConversation(row: ConversationRow): Conversation {
@@ -1389,33 +1394,57 @@ function mapConversation(row: ConversationRow): Conversation {
     lastMessage: row.last_message ?? undefined,
     lastMessageAt: row.last_message_at?.toISOString(),
     lastInboundAt: row.last_inbound_at?.toISOString(),
+    lastReadAt: row.last_read_at?.toISOString(),
+    unreadCount: row.unread_count,
     assignedUserId: row.assigned_user_id ?? undefined,
-    state: (row.state ?? "open") as Conversation["state"]
+    state: (row.state ?? "open") as Conversation["state"],
+    archivedAt: row.archived_at?.toISOString(),
+    pinnedAt: row.pinned_at?.toISOString()
   };
 }
 
 const CONV_SELECT = `
   SELECT c.id, c.tenant_id, c.contact_id, c.channel_id,
-         c.last_message_at, c.last_inbound_at, c.assigned_user_id, c.state,
+         c.last_message_at, c.last_inbound_at, c.last_read_at, c.assigned_user_id, c.state,
+         c.archived_at, c.pinned_at,
          NULLIF(TRIM(CONCAT_WS(' ', co.first_name, co.last_name)), '') AS contact_name,
          co.phone_e164 AS contact_phone,
          (SELECT m.payload->>'text'
           FROM messages m
           WHERE m.conversation_id = c.id
-          ORDER BY m.created_at DESC LIMIT 1) AS last_message
+          ORDER BY m.created_at DESC LIMIT 1) AS last_message,
+         (SELECT COUNT(*)::int FROM messages m
+          WHERE m.conversation_id = c.id AND m.direction = 'inbound'
+            AND m.created_at > COALESCE(c.last_read_at, '-infinity'::timestamptz)) AS unread_count
   FROM conversations c
   LEFT JOIN contacts co ON co.id = c.contact_id`;
+
+/**
+ * Escapes `%`, `_`, and `\` in a raw search fragment so it can be embedded
+ * in a LIKE/ILIKE pattern (wrapped in `%...%` by the caller) without the
+ * fragment's own characters being interpreted as wildcards. Module-level
+ * and reusable — message search (a later task) needs the same escaping.
+ */
+export function escapeLike(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
+}
 
 export const conversationRepository = {
   async list(
     tenantId: string,
-    opts?: { state?: string; assignedUserId?: string; limit?: number; offset?: number }
+    opts?: { state?: string; assignedUserId?: string; q?: string; archived?: boolean; limit?: number; offset?: number }
   ): Promise<{ items: Conversation[]; total: number }> {
     const limit = opts?.limit ?? 50;
     const offset = opts?.offset ?? 0;
+    const q = opts?.q?.trim();
     return withTenant(tenantId, async (client) => {
       const conditions: string[] = [];
       const params: unknown[] = [];
+      // Archived conversations are excluded from the default (inbox) list —
+      // this is a deliberate contract change, not a bug. Pass archived:true
+      // to see the archive instead. Always present (not conditional on
+      // opts?.archived being set) so the COUNT and items queries agree.
+      conditions.push(opts?.archived ? `c.archived_at IS NOT NULL` : `c.archived_at IS NULL`);
       if (opts?.state) {
         params.push(opts.state);
         conditions.push(`c.state = $${params.length}`);
@@ -1424,13 +1453,29 @@ export const conversationRepository = {
         params.push(opts.assignedUserId);
         conditions.push(`c.assigned_user_id = $${params.length}`);
       }
+      if (q) {
+        params.push(`%${escapeLike(q)}%`);
+        conditions.push(
+          `(co.phone_e164 ILIKE $${params.length} OR (coalesce(co.first_name,'') || ' ' || coalesce(co.last_name,'')) ILIKE $${params.length})`
+        );
+      }
       const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+      // The q condition references co.* (the contacts join), so the COUNT
+      // query must join contacts too when q is present, or `total` will
+      // diverge from `items`. Without q, keep the cheap conversations-only
+      // COUNT path.
       const totalResult = await client.query<{ total: string }>(
-        `SELECT COUNT(*)::text AS total FROM conversations c ${where}`,
+        q
+          ? `SELECT COUNT(*)::text AS total FROM conversations c LEFT JOIN contacts co ON co.id = c.contact_id ${where}`
+          : `SELECT COUNT(*)::text AS total FROM conversations c ${where}`,
         params
       );
+      // Pinned conversations sort first, most-recently-pinned first, then
+      // fall back to the existing recency ordering.
       const result = await client.query<ConversationRow>(
-        `${CONV_SELECT} ${where} ORDER BY c.last_message_at DESC NULLS LAST LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+        `${CONV_SELECT} ${where}
+         ORDER BY (c.pinned_at IS NOT NULL) DESC, c.pinned_at DESC NULLS LAST, c.last_message_at DESC NULLS LAST
+         LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
         [...params, limit, offset]
       );
       return { items: result.rows.map(mapConversation), total: Number(totalResult.rows[0]?.total ?? "0") };
@@ -1481,6 +1526,30 @@ export const conversationRepository = {
   async setState(tenantId: string, conversationId: string, state: "open" | "pending" | "closed"): Promise<void> {
     await withTenant(tenantId, async (client) => {
       await client.query("UPDATE conversations SET state = $2 WHERE id = $1", [conversationId, state]);
+    });
+  },
+  /** Advances the read watermark to now(). Idempotent by construction — no counter to race. */
+  async markRead(tenantId: string, conversationId: string): Promise<void> {
+    await withTenant(tenantId, async (client) => {
+      await client.query("UPDATE conversations SET last_read_at = now() WHERE id = $1", [conversationId]);
+    });
+  },
+  /** Sets or clears archived_at. Idempotent — archiving an already-archived conversation is a no-op timestamp refresh. */
+  async setArchived(tenantId: string, conversationId: string, archived: boolean): Promise<void> {
+    await withTenant(tenantId, async (client) => {
+      await client.query("UPDATE conversations SET archived_at = CASE WHEN $2 THEN now() ELSE NULL END WHERE id = $1", [
+        conversationId,
+        archived
+      ]);
+    });
+  },
+  /** Sets or clears pinned_at. Idempotent, same shape as setArchived. */
+  async setPinned(tenantId: string, conversationId: string, pinned: boolean): Promise<void> {
+    await withTenant(tenantId, async (client) => {
+      await client.query("UPDATE conversations SET pinned_at = CASE WHEN $2 THEN now() ELSE NULL END WHERE id = $1", [
+        conversationId,
+        pinned
+      ]);
     });
   },
   /** Returns the timestamp of the last inbound message for a contact across all channels (for 24h window check). */
@@ -1586,6 +1655,30 @@ function mapMessage(row: MessageRow): Message {
   };
 }
 
+interface MessageSearchRow {
+  id: string;
+  conversation_id: string;
+  direction: string;
+  status: string;
+  created_at: Date;
+  text: string | null;
+  contact_name: string | null;
+  contact_phone: string | null;
+}
+
+function mapMessageSearchResult(row: MessageSearchRow): MessageSearchResult {
+  return {
+    id: row.id,
+    conversationId: row.conversation_id,
+    direction: row.direction as MessageSearchResult["direction"],
+    status: row.status as MessageSearchResult["status"],
+    createdAt: row.created_at.toISOString(),
+    text: row.text ?? "",
+    contactName: row.contact_name ?? undefined,
+    contactPhone: row.contact_phone ?? undefined
+  };
+}
+
 export const messageRepository = {
   async create(
     tenantId: string,
@@ -1643,6 +1736,20 @@ export const messageRepository = {
          WHERE external_message_id = $1`,
         [externalMessageId, status, patch]
       );
+      return (result.rowCount ?? 0) > 0;
+    });
+  },
+  /**
+   * Merges arbitrary keys into a message's JSONB payload by primary key,
+   * without touching existing fields not present in the patch. Used by the
+   * media pipeline to attach fetch status onto the originating message.
+   */
+  async mergePayloadById(tenantId: string, messageId: string, patch: Record<string, unknown>): Promise<boolean> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query(`UPDATE messages SET payload = payload || $2::jsonb WHERE id = $1`, [
+        messageId,
+        JSON.stringify(patch)
+      ]);
       return (result.rowCount ?? 0) > 0;
     });
   },
@@ -1725,6 +1832,55 @@ export const messageRepository = {
       );
       return new Map(result.rows.map((r) => [r.contact_id, Number(r.count)]));
     });
+  },
+  /**
+   * Global substring search across a tenant's message text (newest first),
+   * optionally scoped to a single conversation. Backed by the pg_trgm GIN
+   * expression index from migration 020_message_search.sql — the ILIKE
+   * expression below (`coalesce(m.payload->>'text','')`) must stay
+   * identical to the indexed expression (`coalesce(payload->>'text','')`;
+   * table aliases don't affect expression-index matching) or Postgres will
+   * silently fall back to a sequential scan.
+   */
+  async search(
+    tenantId: string,
+    options: { q: string; conversationId?: string; limit?: number; offset?: number }
+  ): Promise<{ items: MessageSearchResult[]; total: number }> {
+    const limit = options.limit ?? 25;
+    const offset = options.offset ?? 0;
+    return withTenant(tenantId, async (client) => {
+      const conditions: string[] = [`coalesce(m.payload->>'text','') ILIKE $1`];
+      const params: unknown[] = [`%${escapeLike(options.q)}%`];
+      if (options.conversationId) {
+        params.push(options.conversationId);
+        conditions.push(`m.conversation_id = $${params.length}`);
+      }
+      const where = `WHERE ${conditions.join(" AND ")}`;
+      // Every condition above references only messages-table columns
+      // (m.payload, m.conversation_id) — neither the conversations nor the
+      // contacts join contributes to the filter, so COUNT can skip both.
+      // messages carries tenant_id directly and this connection runs under
+      // FORCE ROW LEVEL SECURITY (see withTenant), so the plain filter is
+      // already tenant-scoped without a join.
+      const totalResult = await client.query<{ total: string }>(
+        `SELECT COUNT(*)::text AS total FROM messages m ${where}`,
+        params
+      );
+      const result = await client.query<MessageSearchRow>(
+        `SELECT m.id, m.conversation_id, m.direction, m.status, m.created_at,
+                m.payload->>'text' AS text,
+                NULLIF(TRIM(CONCAT_WS(' ', co.first_name, co.last_name)), '') AS contact_name,
+                co.phone_e164 AS contact_phone
+         FROM messages m
+         JOIN conversations c ON c.id = m.conversation_id
+         LEFT JOIN contacts co ON co.id = c.contact_id
+         ${where}
+         ORDER BY m.created_at DESC
+         LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+        [...params, limit, offset]
+      );
+      return { items: result.rows.map(mapMessageSearchResult), total: Number(totalResult.rows[0]?.total ?? "0") };
+    });
   }
 };
 
@@ -1739,6 +1895,17 @@ export interface OutboxRow {
   topic: string;
   payload: Record<string, unknown>;
   status: string;
+  created_at: Date;
+  attempts: number;
+  next_attempt_at: Date;
+  last_error: string | null;
+}
+
+export interface OutboxDeadRow {
+  id: string;
+  topic: string;
+  attempts: number;
+  last_error: string | null;
   created_at: Date;
 }
 
@@ -1769,6 +1936,37 @@ export const outboxRepository = {
   },
   async markProcessed(id: string): Promise<void> {
     await query("SELECT outbox_mark_processed($1)", [id]);
+  },
+  /**
+   * Record a failed dispatch attempt (bypasses RLS via SECURITY DEFINER fn, like claim/markProcessed —
+   * the relay operates without a tenant context). Backs off exponentially and moves the row to 'dead'
+   * once it has been attempted p_max_attempts times; see outbox_mark_failed in 015_outbox_durability.sql.
+   */
+  async markFailed(id: string, error: string): Promise<void> {
+    await query("SELECT outbox_mark_failed($1, $2, $3)", [id, error, 8]);
+  },
+  /** List dead-lettered events for a tenant (RLS-scoped). */
+  async listDead(tenantId: string, limit: number): Promise<OutboxDeadRow[]> {
+    const clampedLimit = Math.min(Math.max(limit, 1), 200);
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<OutboxDeadRow>(
+        `SELECT id, topic, attempts, last_error, created_at
+         FROM outbox_events WHERE status = 'dead' ORDER BY created_at DESC LIMIT $1`,
+        [clampedLimit]
+      );
+      return result.rows;
+    });
+  },
+  /** Reset a dead-lettered event back to pending for redelivery (RLS-scoped; returns false if not found/not dead). */
+  async replayDead(tenantId: string, id: string): Promise<boolean> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query(
+        `UPDATE outbox_events SET status = 'pending', attempts = 0, next_attempt_at = now(), last_error = NULL
+         WHERE id = $1 AND status = 'dead'`,
+        [id]
+      );
+      return (result.rowCount ?? 0) > 0;
+    });
   }
 };
 
@@ -2697,6 +2895,171 @@ export const billingRepository = {
         []
       );
       return Number(result.rows[0]?.count ?? "0");
+    });
+  }
+};
+
+export type MediaAssetStatus = "pending" | "stored" | "failed";
+
+export interface MediaAssetMeta {
+  id: string;
+  metaMediaId: string;
+  messageId?: string;
+  conversationId?: string;
+  mimeType?: string;
+  filename?: string;
+  sha256?: string;
+  fileSizeBytes?: number;
+  status: MediaAssetStatus;
+  error?: string;
+  createdAt: string;
+  fetchedAt?: string;
+}
+
+export interface MediaAssetForServing {
+  status: MediaAssetStatus;
+  bytes?: Buffer;
+  mimeType?: string;
+  filename?: string;
+  fileSizeBytes?: number;
+}
+
+interface MediaAssetMetaRow {
+  id: string;
+  meta_media_id: string;
+  message_id: string | null;
+  conversation_id: string | null;
+  mime_type: string | null;
+  filename: string | null;
+  sha256: string | null;
+  file_size_bytes: string | null;
+  status: string;
+  error: string | null;
+  created_at: Date;
+  fetched_at: Date | null;
+}
+
+function mapMediaAssetMeta(row: MediaAssetMetaRow): MediaAssetMeta {
+  return {
+    id: row.id,
+    metaMediaId: row.meta_media_id,
+    messageId: row.message_id ?? undefined,
+    conversationId: row.conversation_id ?? undefined,
+    mimeType: row.mime_type ?? undefined,
+    filename: row.filename ?? undefined,
+    sha256: row.sha256 ?? undefined,
+    fileSizeBytes: row.file_size_bytes != null ? Number(row.file_size_bytes) : undefined,
+    status: row.status as MediaAssetStatus,
+    error: row.error ?? undefined,
+    createdAt: row.created_at.toISOString(),
+    fetchedAt: row.fetched_at ? row.fetched_at.toISOString() : undefined
+  };
+}
+
+/**
+ * Storage for fetched inbound media bytes (see 016_media_assets.sql). Rows
+ * are created `pending` when a webhook message references a media id, then
+ * transition to `stored` (bytes present) or `failed` (error present) once
+ * the meta-adapter attempts the Graph API fetch — see MediaFetchRequest /
+ * MediaStored in @hyfib/shared-core.
+ */
+export const mediaRepository = {
+  /**
+   * Creates the pending row for a newly-seen (tenant, metaMediaId), or is a
+   * no-op re-affirmation if it already exists. `message_id` is COALESCEd so
+   * a later webhook referencing the same media id never clobbers the
+   * message that first introduced it.
+   */
+  async upsertPending(
+    tenantId: string,
+    input: {
+      metaMediaId: string;
+      messageId: string;
+      conversationId: string;
+      mimeType?: string;
+      filename?: string;
+      sha256?: string;
+    }
+  ): Promise<{ id: string; status: MediaAssetStatus }> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<{ id: string; status: string }>(
+        `INSERT INTO media_assets (tenant_id, meta_media_id, message_id, conversation_id, mime_type, filename, sha256)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (tenant_id, meta_media_id) DO UPDATE
+           SET message_id = COALESCE(media_assets.message_id, EXCLUDED.message_id)
+         RETURNING id, status`,
+        [
+          tenantId,
+          input.metaMediaId,
+          input.messageId,
+          input.conversationId,
+          input.mimeType ?? null,
+          input.filename ?? null,
+          input.sha256 ?? null
+        ]
+      );
+      const row = result.rows[0]!;
+      return { id: row.id, status: row.status as MediaAssetStatus };
+    });
+  },
+  /** Persists fetched bytes and transitions the row to `stored`, clearing any prior error. */
+  async markStored(
+    tenantId: string,
+    id: string,
+    input: { bytes: Buffer; mimeType?: string; fileSizeBytes: number }
+  ): Promise<boolean> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query(
+        `UPDATE media_assets
+         SET bytes = $2, mime_type = COALESCE($3, mime_type), file_size_bytes = $4,
+             status = 'stored', fetched_at = now(), error = NULL
+         WHERE id = $1`,
+        [id, input.bytes, input.mimeType ?? null, input.fileSizeBytes]
+      );
+      return (result.rowCount ?? 0) > 0;
+    });
+  },
+  /** Records a failed fetch attempt. Leaves `bytes` untouched (there may be none). */
+  async recordError(tenantId: string, id: string, error: string): Promise<boolean> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query(
+        `UPDATE media_assets SET status = 'failed', error = left($2, 2000) WHERE id = $1`,
+        [id, error]
+      );
+      return (result.rowCount ?? 0) > 0;
+    });
+  },
+  /** Metadata lookup for UI/API consumers — never returns the `bytes` column. */
+  async getMeta(tenantId: string, id: string): Promise<MediaAssetMeta | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<MediaAssetMetaRow>(
+        `SELECT id, meta_media_id, message_id, conversation_id, mime_type, filename, sha256,
+                file_size_bytes, status, error, created_at, fetched_at
+         FROM media_assets WHERE id = $1`,
+        [id]
+      );
+      return result.rows[0] ? mapMediaAssetMeta(result.rows[0]) : undefined;
+    });
+  },
+  /** Fetches the bytes + serving metadata for the gateway serve route (later task). Null-safe when still `pending`. */
+  async getForServing(tenantId: string, id: string): Promise<MediaAssetForServing | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<{
+        bytes: Buffer | null;
+        mime_type: string | null;
+        filename: string | null;
+        file_size_bytes: string | null;
+        status: string;
+      }>(`SELECT bytes, mime_type, filename, file_size_bytes, status FROM media_assets WHERE id = $1`, [id]);
+      const row = result.rows[0];
+      if (!row) return undefined;
+      return {
+        status: row.status as MediaAssetStatus,
+        bytes: row.bytes ?? undefined,
+        mimeType: row.mime_type ?? undefined,
+        filename: row.filename ?? undefined,
+        fileSizeBytes: row.file_size_bytes != null ? Number(row.file_size_bytes) : undefined
+      };
     });
   }
 };

@@ -24,6 +24,7 @@ import {
   conversationRepository,
   healthCheck,
   linkClickRepository,
+  mediaRepository,
   messageRepository,
   orderRepository,
   outboxRepository,
@@ -88,14 +89,21 @@ import {
 } from "./validation.js";
 import { filterSendableContacts } from "./campaign.js";
 import { canCreateContact, canCreateOrder } from "./authorization.js";
+import { buildMediaHeaders } from "./media-headers.js";
 import { SseHub } from "./sse-hub.js";
 import { parseCsv, serializeContactsCsv, extractMultipartFile } from "./csv.js";
+import { resolveOrgTenant } from "./single-org.js";
+import { runOutboxRelayOnce } from "./outbox-relay.js";
+import { classifyRoute, API_RATE_LIMITS } from "./rate-limit.js";
+import {
+  SESSION_COOKIE,
+  parseCookies,
+  serializeSessionCookie,
+  clearSessionCookieValue,
+  csrfViolation
+} from "./cookies.js";
 
 // ─── Request body interfaces ───────────────────────────────────────────────────
-
-interface CreateTenantRequest {
-  name: string;
-}
 
 interface CreateUserRequest {
   email: string;
@@ -395,14 +403,40 @@ function tokenHash(token: string): string {
   return createHash("sha256").update(token).digest("hex");
 }
 
-const PLATFORM_TENANT_ID = "00000000-0000-0000-0000-000000000001";
+// Resolved once at boot by bootstrapPlatformAdmin() and reused by the
+// dev-mode auth header fallback (resolveAuth) as the default tenant.
+let orgTenantId: string | undefined;
 
-// Creates the platform_owner account from env vars on first boot only.
-// No password hash is ever committed to source control (see 013_auth.sql).
+// Resolves the single organization this deployment serves, then creates the
+// platform_owner account from env vars on first boot only. No password hash
+// is ever committed to source control (see 013_auth.sql).
 async function bootstrapPlatformAdmin(): Promise<void> {
+  const org = await resolveOrgTenant({
+    listTenants: tenantRepository.list,
+    getTenantById: tenantRepository.getById,
+    updateTenant: tenantRepository.update,
+    env: { orgTenantId: config.orgTenantId, orgName: config.orgName },
+    log: (msg, meta) => logger.info(msg, meta)
+  });
+  orgTenantId = org.id;
+
   const email = process.env.BOOTSTRAP_ADMIN_EMAIL;
   const password = process.env.BOOTSTRAP_ADMIN_PASSWORD;
-  if (!email || !password) return;
+  if (!email || !password) {
+    // Self-registration is disabled, so if the org has no users yet there is
+    // no way to create the first one — surface this loudly rather than fail
+    // silently at first login.
+    const userCount = await tenantRepository.getUserCount(org.id);
+    if (userCount === 0) {
+      logger.warn("no_admin_bootstrap_configured", {
+        tenantId: org.id,
+        detail:
+          "BOOTSTRAP_ADMIN_EMAIL/BOOTSTRAP_ADMIN_PASSWORD are not set and this org has no users. " +
+          "Registration is disabled, so there is no way to create the first user."
+      });
+    }
+    return;
+  }
   if (!EMAIL.test(email) || password.length < 8) {
     logger.warn("bootstrap_admin_invalid_credentials");
     return;
@@ -410,13 +444,13 @@ async function bootstrapPlatformAdmin(): Promise<void> {
   const existing = await userRepository.findByEmailForAuth(email);
   if (existing) return;
   const passwordHash = await hashPassword(password);
-  const user = await userRepository.create(PLATFORM_TENANT_ID, {
+  const user = await userRepository.create(org.id, {
     email,
     displayName: "Platform Admin",
     roles: ["platform_owner"],
     passwordHash
   });
-  logger.info("platform_admin_bootstrapped", { userId: user.id, email });
+  logger.info("platform_admin_bootstrapped", { userId: user.id, email, tenantId: org.id });
 }
 
 function getClientIp(req: IncomingMessage): string {
@@ -432,31 +466,69 @@ async function isAuthRateLimited(scope: string): Promise<boolean> {
   return !allowed;
 }
 
-// ─── Auth resolution: Bearer token (session) → header fallback (dev) ──────────
+// ─── Session cookie helpers ─────────────────────────────────────────────────
+
+const SESSION_TTL = 30 * 24 * 60 * 60; // 30 days
+
+/** Marks the cookie Secure whenever the connection is (or terminates) TLS. */
+function isSecureRequest(req: IncomingMessage): boolean {
+  return config.nodeEnv === "production" || req.headers["x-forwarded-proto"] === "https";
+}
+
+function setSessionCookie(res: ServerResponse, token: string, req: IncomingMessage): void {
+  res.setHeader(
+    "Set-Cookie",
+    serializeSessionCookie(token, { secure: isSecureRequest(req), maxAgeSeconds: SESSION_TTL })
+  );
+}
+
+function clearSessionCookie(res: ServerResponse, req: IncomingMessage): void {
+  res.setHeader("Set-Cookie", clearSessionCookieValue(isSecureRequest(req)));
+}
+
+function cookieHeaderOf(req: IncomingMessage): string | undefined {
+  return req.headers["cookie"];
+}
+
+// ─── Auth resolution: Bearer token (session) → cookie (session) → Keycloak → dev fallback
+
+/** Resolves an opaque session token (Bearer or cookie) to an AuthContext, or undefined if unknown/expired. */
+async function resolveSessionToken(rawToken: string): Promise<AuthContext | undefined> {
+  const session = await sessionRepository.findByToken(tokenHash(rawToken));
+  if (!session) return undefined;
+  // Must resolve roles through a tenant-scoped read: users has FORCE RLS,
+  // so a bare pool query silently returns zero rows (empty roles → 403s).
+  const user = await userRepository.getById(session.tenantId, session.userId);
+  const roles = normalizeRoles(user?.roles ?? []);
+  return { subject: session.userId, tenantId: session.tenantId, roles };
+}
 
 async function resolveAuth(req: IncomingMessage): Promise<AuthContext> {
-  // 1. Bearer session token (works in all modes)
+  // 1. Bearer session token (works in all modes) — takes precedence over the cookie.
   const authHeader = req.headers["authorization"];
   if (authHeader?.startsWith("Bearer ")) {
-    const rawToken = authHeader.slice(7);
-    const session = await sessionRepository.findByToken(tokenHash(rawToken));
-    if (session) {
-      // Must resolve roles through a tenant-scoped read: users has FORCE RLS,
-      // so a bare pool query silently returns zero rows (empty roles → 403s).
-      const user = await userRepository.getById(session.tenantId, session.userId);
-      const roles = normalizeRoles(user?.roles ?? []);
-      return { subject: session.userId, tenantId: session.tenantId, roles };
-    }
+    const authCtx = await resolveSessionToken(authHeader.slice(7));
+    if (authCtx) return authCtx;
+  }
+
+  // 2. HttpOnly session cookie (browser clients that have switched off Bearer).
+  const cookieToken = parseCookies(cookieHeaderOf(req))[SESSION_COOKIE];
+  if (cookieToken) {
+    const authCtx = await resolveSessionToken(cookieToken);
+    if (authCtx) return authCtx;
   }
 
   if (config.authEnabled) {
     return authenticator.authenticate(authHeader);
   }
 
-  // Dev-mode header fallback
+  // Dev-mode header fallback. An explicit x-tenant-id still wins; otherwise
+  // default to the single resolved org (undefined until bootstrap has run).
   const roleHeader = req.headers["x-role"];
   const roles = normalizeRoles(typeof roleHeader === "string" ? roleHeader.split(",") : []);
-  const tenantId = typeof req.headers["x-tenant-id"] === "string" ? (req.headers["x-tenant-id"] as string) : undefined;
+  const headerTenantId =
+    typeof req.headers["x-tenant-id"] === "string" ? (req.headers["x-tenant-id"] as string) : undefined;
+  const tenantId = headerTenantId ?? orgTenantId;
   const actorId = typeof req.headers["x-actor-id"] === "string" ? (req.headers["x-actor-id"] as string) : undefined;
   return { subject: actorId ?? "dev-subject", tenantId, roles };
 }
@@ -531,7 +603,8 @@ async function runAutomation(
                 channelId,
                 contactPhoneE164: contact.phoneE164,
                 templateName: action.templateName,
-                templateLanguage: action.templateLanguage
+                templateLanguage: action.templateLanguage,
+                dispatchId: randomUUID()
               }
             });
           });
@@ -876,7 +949,8 @@ async function sendConversationMessage(
         product: body.product,
         catalog: body.catalog,
         flow: body.flow,
-        actorId: asActorUuid(auth.subject)
+        actorId: asActorUuid(auth.subject),
+        dispatchId: randomUUID()
       }
     });
   });
@@ -892,18 +966,28 @@ function startOutboxRelay(): NodeJS.Timeout {
     running = true;
     void (async () => {
       try {
-        const batch = await outboxRepository.claim(50);
-        for (const row of batch) {
-          await eventBus.publish(
-            row.topic as (typeof EventTopics)[keyof typeof EventTopics],
-            row.payload,
-            row.tenant_id ?? undefined
-          );
-          await outboxRepository.markProcessed(row.id);
-          incCounter("events_published_total", "Events published to the bus.", { topic: row.topic });
-        }
-      } catch (error) {
-        logger.error("outbox_relay_error", { error: error instanceof Error ? error.message : String(error) });
+        await runOutboxRelayOnce(
+          {
+            claim: (limit) => outboxRepository.claim(limit),
+            publish: (topic, payload, tenantId) =>
+              eventBus.publish(topic as (typeof EventTopics)[keyof typeof EventTopics], payload, tenantId),
+            markProcessed: (id) => outboxRepository.markProcessed(id),
+            markFailed: (id, error) => outboxRepository.markFailed(id, error),
+            counters: {
+              published: (topic) => incCounter("events_published_total", "Events published to the bus.", { topic }),
+              failed: (topic) =>
+                incCounter("outbox_publish_failures_total", "Outbox row publish attempts that failed.", { topic }),
+              dead: (topic) =>
+                incCounter(
+                  "outbox_events_dead_total",
+                  "Outbox rows moved to dead-letter status after exhausting retries.",
+                  { topic }
+                )
+            },
+            logger
+          },
+          50
+        );
       } finally {
         running = false;
       }
@@ -1126,6 +1210,9 @@ function registerSseForwarding(): void {
   eventBus.subscribe(EventTopics.WhatsAppStatusUpdated, `${sseQueuePrefix}.status`, forwardEventToSse, {
     ephemeral: true
   });
+  eventBus.subscribe(EventTopics.MediaStored, `${sseQueuePrefix}.media`, forwardEventToSse, {
+    ephemeral: true
+  });
   sseHub.startKeepAlive();
 }
 
@@ -1136,6 +1223,16 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   const path = parseUrlPath(req.url);
   const ctx = requestContext(req);
   incCounter("http_requests_total", "Total HTTP requests received.", { service: "api-gateway" });
+
+  // ─── CSRF gate ────────────────────────────────────────────────────────────
+  // Runs before every route dispatch, including webhooks/login/register: the
+  // path-exemptions inside csrfViolation() guarantee those are unaffected.
+  // Only blocks mutating, cookie-authenticated requests with no Bearer header
+  // and no x-requested-with marker — see cookies.ts for the full rationale.
+  if (csrfViolation(method, path, req.headers)) {
+    sendJson(res, 403, { error: "csrf_header_required" });
+    return;
+  }
 
   if (path === "/metrics") {
     sendMetrics(res);
@@ -1203,7 +1300,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 401, { error: "Invalid webhook signature" });
       return;
     }
-    if (await webhookIdempotency.isDuplicate(`webhook:${normalizedSignature}`)) {
+    const signatureKey = `webhook:${normalizedSignature}`;
+    if (await webhookIdempotency.isDuplicate(signatureKey)) {
       sendJson(res, 200, { status: "duplicate_ignored" });
       return;
     }
@@ -1230,8 +1328,60 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         }
       }
     }
-    const { ok, body: proxyBody } = await ingestWebhookProxy({ rawBody, signature: normalizedSignature });
-    sendJson(res, ok ? 200 : 502, { requestId: ctx.requestId, upstream: proxyBody });
+    try {
+      // Two call paths land here, and only one of them throws:
+      //  1. In-process proxy (app-server monolith, proxyWebhookToIngestor):
+      //     processForwardedWebhook/ingestMetaWebhook throws when the outbox
+      //     enqueue/publish fails (e.g. DB outage) — handled by the catch
+      //     block below. It returns normally (ok:false) only when the
+      //     signature failed to verify downstream, with body.status ===
+      //     "invalid_signature" — not a processing failure.
+      //  2. Standalone HTTP proxy (defaultIngestWebhookProxy): fetch() only
+      //     throws on network errors, not HTTP error statuses, so a 5xx from
+      //     the webhook-ingestor service (e.g. its own DB outage) surfaces as
+      //     a normal ok:false return here, never via the catch block.
+      const { ok, body: proxyBody } = await ingestWebhookProxy({ rawBody, signature: normalizedSignature });
+      if (!ok) {
+        const isInvalidSignature =
+          typeof proxyBody === "object" &&
+          proxyBody !== null &&
+          (proxyBody as { status?: unknown }).status === "invalid_signature";
+        if (!isInvalidSignature) {
+          // Genuine processing failure reported without a throw (path 2
+          // above, and defensively any future non-throwing failure of path
+          // 1). Release the signature key so Meta's retry of the same
+          // delivery isn't swallowed as a duplicate. Invalid-signature
+          // responses intentionally skip this — pre-existing dedupe
+          // semantics for bad signatures stay unchanged.
+          try {
+            await webhookIdempotency.release(signatureKey);
+          } catch (releaseError) {
+            logger.warn("idempotency_release_failed", {
+              key: signatureKey,
+              error: releaseError instanceof Error ? releaseError.message : String(releaseError)
+            });
+          }
+        }
+      }
+      sendJson(res, ok ? 200 : 502, { requestId: ctx.requestId, upstream: proxyBody });
+    } catch (error) {
+      // The signature-level idempotency key was claimed before this call.
+      // Processing failed (e.g. outbox enqueue hit a DB outage) before the
+      // webhook was durably recorded, so release the key: Meta will retry
+      // the same delivery and it must not be swallowed as a duplicate. Guard
+      // the release itself: if it also fails, log that separately and still
+      // respond based on the ORIGINAL error, not the release failure.
+      try {
+        await webhookIdempotency.release(signatureKey);
+      } catch (releaseError) {
+        logger.warn("idempotency_release_failed", {
+          key: signatureKey,
+          error: releaseError instanceof Error ? releaseError.message : String(releaseError)
+        });
+      }
+      logger.error("webhook_ingest_failed", { error: error instanceof Error ? error.message : String(error) });
+      sendJson(res, 502, { error: "webhook_processing_unavailable" });
+    }
     return;
   }
 
@@ -1241,58 +1391,13 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   }
 
   // ─── Auth routes (unauthenticated) ────────────────────────────────────────
-  const SESSION_TTL = 30 * 24 * 60 * 60; // 30 days
-
+  // Retired: this deployment is single-organization (see single-org.ts /
+  // bootstrapPlatformAdmin). The route is matched deliberately so callers get
+  // an explicit 410 instead of a 404 fall-through.
   if (path === "/auth/register" && method === "POST") {
-    if (await isAuthRateLimited(`register:${getClientIp(req)}`)) {
-      sendJson(res, 429, { error: "Too many registration attempts. Try again later." });
-      return;
-    }
-    const body = await readJsonBody<{ orgName: string; email: string; password: string; displayName?: string }>(req);
-    if (!body.orgName || !body.email || !body.password) {
-      sendJson(res, 400, { error: "orgName, email and password are required" });
-      return;
-    }
-    if (!EMAIL.test(body.email)) {
-      sendJson(res, 400, { error: "Invalid email address" });
-      return;
-    }
-    if (body.password.length < 8) {
-      sendJson(res, 400, { error: "Password must be at least 8 characters" });
-      return;
-    }
-    // Check email not already taken
-    const existing = await userRepository.findByEmailForAuth(body.email);
-    if (existing) {
-      sendJson(res, 409, { error: "An account with this email already exists" });
-      return;
-    }
-    const tenant = await tenantRepository.create(body.orgName);
-    const pwHash = await hashPassword(body.password);
-    const user = await userRepository.create(tenant.id, {
-      email: body.email,
-      displayName: body.displayName ?? body.email.split("@")[0]!,
-      roles: ["tenant_admin"],
-      passwordHash: pwHash
-    });
-    const rawToken = randomUUID() + randomUUID();
-    await sessionRepository.create({
-      userId: user.id,
-      tenantId: tenant.id,
-      tokenHash: tokenHash(rawToken),
-      ttlSeconds: SESSION_TTL
-    });
-    logger.info("user_registered", { tenantId: tenant.id, userId: user.id, email: body.email });
-    sendJson(res, 201, {
-      token: rawToken,
-      user: {
-        id: user.id,
-        email: user.email,
-        displayName: user.displayName,
-        roles: user.roles,
-        tenantId: tenant.id,
-        tenant
-      }
+    sendJson(res, 410, {
+      error: "registration_disabled",
+      detail: "This deployment is single-organization; ask an admin to invite you."
     });
     return;
   }
@@ -1337,6 +1442,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       tokenHash: tokenHash(rawToken),
       ttlSeconds: SESSION_TTL
     });
+    setSessionCookie(res, rawToken, req);
     logger.info("user_login", { tenantId: found.tenantId, userId: found.id, email: body.email });
     sendJson(res, 200, {
       token: rawToken,
@@ -1353,21 +1459,51 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   }
 
   if (path === "/auth/logout" && method === "POST") {
+    // Task 19 Part 2: a plain `bearerToken ?? cookieToken` (the previous
+    // behavior) revokes only the FIRST token present — a stale/wrong bearer
+    // (e.g. leftover localStorage value from before Task 18's cookie
+    // migration) alongside a valid, live cookie session would leave that
+    // cookie session un-revoked while still reporting success. deleteByToken
+    // is a no-op DELETE when the hash matches no row, so attempting it for
+    // both distinct tokens (when present) is harmless and revokes whichever
+    // one(s) actually resolve to a live session. The cookie is always
+    // cleared regardless of what (if anything) was found server-side.
     const authHeader = req.headers["authorization"];
-    if (authHeader?.startsWith("Bearer ")) {
-      await sessionRepository.deleteByToken(tokenHash(authHeader.slice(7)));
+    const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : undefined;
+    const cookieToken = parseCookies(cookieHeaderOf(req))[SESSION_COOKIE];
+    if (bearerToken) {
+      await sessionRepository.deleteByToken(tokenHash(bearerToken));
     }
+    if (cookieToken && cookieToken !== bearerToken) {
+      await sessionRepository.deleteByToken(tokenHash(cookieToken));
+    }
+    clearSessionCookie(res, req);
     sendJson(res, 200, { status: "logged_out" });
     return;
   }
 
   if (path === "/auth/me" && method === "GET") {
+    // Task 19 Part 2: bearer takes precedence (matches resolveAuth), but a
+    // stale/wrong bearer must not shadow a live cookie session — the
+    // previous `bearerToken ?? cookieToken` never looked at the cookie once
+    // *any* bearer header was present, so a leftover/invalid localStorage
+    // token (e.g. from before Task 18's cookie migration) 401'd callers who
+    // had a perfectly valid cookie session. Fall through to the cookie only
+    // when the bearer is present but doesn't resolve to a live session.
     const authHeader = req.headers["authorization"];
-    if (!authHeader?.startsWith("Bearer ")) {
+    const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : undefined;
+    const cookieToken = parseCookies(cookieHeaderOf(req))[SESSION_COOKIE];
+
+    let rawToken = bearerToken;
+    let session = rawToken ? await sessionRepository.findByToken(tokenHash(rawToken)) : undefined;
+    if (!session && cookieToken && cookieToken !== bearerToken) {
+      rawToken = cookieToken;
+      session = await sessionRepository.findByToken(tokenHash(rawToken));
+    }
+    if (!rawToken) {
       sendJson(res, 401, { error: "Not authenticated" });
       return;
     }
-    const session = await sessionRepository.findByToken(tokenHash(authHeader.slice(7)));
     if (!session) {
       sendJson(res, 401, { error: "Session expired or invalid" });
       return;
@@ -1378,6 +1514,15 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return;
     }
     const tenant = await tenantRepository.getById(session.tenantId);
+    // Silent upgrade: an existing localStorage/Bearer session gets an
+    // HttpOnly cookie issued the first time it hits /auth/me without one
+    // already present. Cookie-authenticated calls (bearerToken absent, or a
+    // stale bearer that fell through to a cookie above) never re-set —
+    // `!cookieToken` is false in both those cases, so nothing changed for
+    // them.
+    if (bearerToken && !cookieToken) {
+      setSessionCookie(res, bearerToken, req);
+    }
     sendJson(res, 200, {
       id: u.id,
       email: u.email,
@@ -1405,75 +1550,30 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
 
-  // ─── Tenants ──────────────────────────────────────────────────────────────
-  if (path === "/api/v1/tenants") {
-    if (method === "GET") {
-      if (!hasAnyRole(auth, ["platform_owner"])) {
-        sendJson(res, 403, { error: "Only platform_owner can list tenants" });
-        return;
-      }
-      sendJson(res, 200, { items: await tenantRepository.list() });
+  // ─── General API rate limiting ───────────────────────────────────────────
+  // Placed after auth resolves (subject is known) and before any route
+  // handler runs, so every /api/v1/* route below is covered. /auth/login,
+  // /auth/register, /auth/logout, and /auth/me are handled earlier in the
+  // auth-routes section above and all return before resolveAuth() runs, so
+  // this gate structurally never sees them — login/register already have
+  // their own 5/min limiter (isAuthRateLimited), and logout/me are cheap,
+  // session-guarded reads/writes that don't warrant a bolted-on IP-keyed
+  // check of their own (see classifyRoute's doc comment in rate-limit.ts,
+  // rule 5, for the full rationale — Task 19 Part 2).
+  const rlClass = classifyRoute(method, path);
+  if (rlClass !== "exempt") {
+    const subject = asActorUuid(auth.subject) ?? getClientIp(req);
+    const { allowed, waitMs } = await checkRateLimit(
+      getRedisClient(config),
+      `api:${rlClass}:${subject}`,
+      API_RATE_LIMITS[rlClass]
+    );
+    if (!allowed) {
+      incCounter("rate_limited_total", "Requests rejected by the general API rate limiter.", { class: rlClass });
+      res.setHeader("Retry-After", String(Math.ceil(waitMs / 1000)));
+      sendJson(res, 429, { error: "rate_limited", retryAfterSeconds: Math.ceil(waitMs / 1000) });
       return;
     }
-    if (method === "POST") {
-      if (!hasAnyRole(auth, ["platform_owner"])) {
-        sendJson(res, 403, { error: "Only platform_owner can create tenants" });
-        return;
-      }
-      const payload = await readJsonBody<CreateTenantRequest>(req);
-      if (!payload.name?.trim()) {
-        sendJson(res, 400, { error: "name is required" });
-        return;
-      }
-      const tenant = await tenantRepository.create(payload.name.trim());
-      await audit(tenant.id, auth, {
-        action: "tenant.created",
-        resourceType: "Tenant",
-        resourceId: tenant.id,
-        payload: { name: tenant.name }
-      });
-      sendJson(res, 201, { ...tenant });
-      return;
-    }
-    sendJson(res, 405, { error: "Method not allowed" });
-    return;
-  }
-
-  // PATCH /api/v1/tenants/:id — platform_owner updates limits / status / plan
-  if (path.startsWith("/api/v1/tenants/") && method === "PATCH") {
-    if (!hasAnyRole(auth, ["platform_owner"])) {
-      sendJson(res, 403, { error: "Only platform_owner can update tenant settings" });
-      return;
-    }
-    const tid = extractPathSegment(path, "/api/v1/tenants/");
-    if (!tid || !UUID.test(tid)) {
-      sendJson(res, 400, { error: "Invalid tenant id" });
-      return;
-    }
-    const body = await readJsonBody<{ name?: string; status?: string; maxUsers?: number; plan?: string }>(req);
-    const updated = await tenantRepository.update(tid, body);
-    if (!updated) {
-      sendJson(res, 404, { error: "Tenant not found" });
-      return;
-    }
-    sendJson(res, 200, updated as unknown as Record<string, unknown>);
-    return;
-  }
-
-  // GET /api/v1/tenants/:id/users — platform_owner lists users of any tenant
-  if (path.match(/^\/api\/v1\/tenants\/[^/]+\/users$/) && method === "GET") {
-    if (!hasAnyRole(auth, ["platform_owner"])) {
-      sendJson(res, 403, { error: "Insufficient role" });
-      return;
-    }
-    const tid = extractPathSegment(path, "/api/v1/tenants/");
-    if (!tid || !UUID.test(tid)) {
-      sendJson(res, 400, { error: "Invalid tenant id" });
-      return;
-    }
-    const users = await userRepository.list(tid);
-    sendJson(res, 200, { items: users });
-    return;
   }
 
   // ─── Tenant-scoped routes ─────────────────────────────────────────────────
@@ -1538,17 +1638,6 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       if (invalidRoles.length > 0) {
         sendJson(res, 400, { error: `Invalid roles: ${invalidRoles.join(", ")}` });
         return;
-      }
-      // Enforce per-tenant user limit
-      const tenant = await tenantRepository.getById(tenantId);
-      if (tenant) {
-        const currentCount = await tenantRepository.getUserCount(tenantId);
-        if (currentCount >= tenant.maxUsers) {
-          sendJson(res, 422, {
-            error: `User limit reached (${tenant.maxUsers}). Contact HyFib support to increase your plan.`
-          });
-          return;
-        }
       }
       const existingUser = await userRepository.findByEmailForAuth(emailTrimmed);
       if (existingUser) {
@@ -2584,9 +2673,12 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   if (path === "/api/v1/conversations" && method === "GET") {
     const query = parseQuery(req.url);
     const page = parseListQuery(query);
+    const q = (query.get("q") ?? "").trim().slice(0, 200) || undefined;
     const { items, total } = await conversationRepository.list(tenantId, {
       state: query.get("state") ?? undefined,
       assignedUserId: query.get("assignee") ?? undefined,
+      q,
+      archived: query.get("archived") === "true",
       limit: page.limit,
       offset: page.offset
     });
@@ -2661,6 +2753,62 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
 
+  if (path.startsWith("/api/v1/conversations/") && path.endsWith("/archive") && method === "POST") {
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "support_agent", "sales_agent", "marketing_manager"])) {
+      sendJson(res, 403, { error: "Insufficient role" });
+      return;
+    }
+    const conversationId = extractPathSegment(path, "/api/v1/conversations/");
+    if (!conversationId || !UUID.test(conversationId)) {
+      sendJson(res, 400, { error: "Invalid conversation id" });
+      return;
+    }
+    const body = await readJsonBody<{ archived: boolean }>(req);
+    if (typeof body.archived !== "boolean") {
+      sendJson(res, 400, { error: "archived must be a boolean" });
+      return;
+    }
+    await conversationRepository.setArchived(tenantId, conversationId, body.archived);
+    sseHub.broadcast(tenantId, "conversation.archived", randomUUID(), { conversationId, archived: body.archived });
+    sendJson(res, 200, { status: "archived", conversationId, archived: body.archived });
+    return;
+  }
+
+  if (path.startsWith("/api/v1/conversations/") && path.endsWith("/pin") && method === "POST") {
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "support_agent", "sales_agent", "marketing_manager"])) {
+      sendJson(res, 403, { error: "Insufficient role" });
+      return;
+    }
+    const conversationId = extractPathSegment(path, "/api/v1/conversations/");
+    if (!conversationId || !UUID.test(conversationId)) {
+      sendJson(res, 400, { error: "Invalid conversation id" });
+      return;
+    }
+    const body = await readJsonBody<{ pinned: boolean }>(req);
+    if (typeof body.pinned !== "boolean") {
+      sendJson(res, 400, { error: "pinned must be a boolean" });
+      return;
+    }
+    await conversationRepository.setPinned(tenantId, conversationId, body.pinned);
+    sseHub.broadcast(tenantId, "conversation.pinned", randomUUID(), { conversationId, pinned: body.pinned });
+    sendJson(res, 200, { status: "pinned", conversationId, pinned: body.pinned });
+    return;
+  }
+
+  // Auth-only (no role gate): marking read is low-privilege and high-frequency,
+  // same posture as GET .../messages. No audit entry — high-frequency, low-value.
+  if (path.startsWith("/api/v1/conversations/") && path.endsWith("/read") && method === "POST") {
+    const conversationId = extractPathSegment(path, "/api/v1/conversations/");
+    if (!conversationId || !UUID.test(conversationId)) {
+      sendJson(res, 400, { error: "Invalid conversation id" });
+      return;
+    }
+    await conversationRepository.markRead(tenantId, conversationId);
+    sseHub.broadcast(tenantId, "conversation.read", randomUUID(), { conversationId });
+    sendJson(res, 200, { status: "read", conversationId });
+    return;
+  }
+
   // ─── Conversation internal notes ──────────────────────────────────────────
   if (path.startsWith("/api/v1/conversations/") && path.endsWith("/notes")) {
     const conversationId = extractPathSegment(path, "/api/v1/conversations/");
@@ -2697,6 +2845,35 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return;
     }
     sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+
+  // Global message search: substring match over payload->>'text' via the
+  // pg_trgm expression index from migration 020. Exact path — must match
+  // the "/api/v1/messages/search" string classifyRoute lists as expensive
+  // (rate-limit.ts EXPENSIVE_EXACT) so this route gets the tighter 10/min
+  // budget instead of the general "read" class.
+  if (path === "/api/v1/messages/search" && method === "GET") {
+    const query = parseQuery(req.url);
+    const rawQ = (query.get("q") ?? "").trim();
+    if (rawQ.length < 2) {
+      sendJson(res, 400, { error: "q must be at least 2 characters" });
+      return;
+    }
+    const q = rawQ.slice(0, 200);
+    const conversationId = query.get("conversationId") ?? undefined;
+    if (conversationId && !UUID.test(conversationId)) {
+      sendJson(res, 400, { error: "conversationId must be a valid id" });
+      return;
+    }
+    const page = parseListQuery(query);
+    const { items, total } = await messageRepository.search(tenantId, {
+      q,
+      conversationId,
+      limit: page.limit,
+      offset: page.offset
+    });
+    sendJson(res, 200, { items, total, limit: page.limit, offset: page.offset });
     return;
   }
 
@@ -2738,6 +2915,44 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return;
     }
     sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+
+  // ─── Media serving ────────────────────────────────────────────────────────
+  if (path.startsWith("/api/v1/media/") && method === "GET") {
+    const assetId = extractPathSegment(path, "/api/v1/media/");
+    if (!assetId || !UUID.test(assetId)) {
+      sendJson(res, 400, { error: "Invalid media id" });
+      return;
+    }
+    const asset = await mediaRepository.getForServing(tenantId, assetId);
+    if (!asset) {
+      sendJson(res, 404, { error: "media_not_found" });
+      return;
+    }
+    if (asset.status !== "stored") {
+      sendJson(res, 409, { error: "media_not_ready", status: asset.status });
+      return;
+    }
+    if (!asset.bytes) {
+      // Data invariant violation: a `stored` row should always carry bytes.
+      logger.error("media_stored_without_bytes", { tenantId, assetId });
+      sendJson(res, 500, { error: "media_corrupt" });
+      return;
+    }
+    const headers = buildMediaHeaders({
+      mimeType: asset.mimeType,
+      filename: asset.filename,
+      byteLength: asset.bytes.length
+    });
+    res.statusCode = 200;
+    for (const [key, value] of Object.entries(headers)) {
+      res.setHeader(key, value);
+    }
+    incCounter("media_served_total", "Media assets served via the authenticated media route.", {
+      service: "api-gateway"
+    });
+    res.end(asset.bytes);
     return;
   }
 
@@ -3116,6 +3331,45 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     const auditPage = parseListQuery(auditQuery, 50, 200);
     const items = await auditRepository.list(tenantId, auditPage);
     sendJson(res, 200, { items, limit: auditPage.limit, offset: auditPage.offset });
+    return;
+  }
+
+  // ─── Outbox dead-letters (admin) ──────────────────────────────────────────
+  if (path === "/api/v1/admin/dead-letters" && method === "GET") {
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin"])) {
+      sendJson(res, 403, { error: "Insufficient role" });
+      return;
+    }
+    const dlQuery = parseQuery(req.url);
+    const limit = clampInt(dlQuery.get("limit"), 1, 200, 50);
+    const items = await outboxRepository.listDead(tenantId, limit);
+    sendJson(res, 200, { items });
+    return;
+  }
+
+  if (path.startsWith("/api/v1/admin/dead-letters/") && path.endsWith("/replay") && method === "POST") {
+    const deadLetterId = extractPathSegment(path, "/api/v1/admin/dead-letters/");
+    if (!deadLetterId || !UUID.test(deadLetterId)) {
+      sendJson(res, 400, { error: "Invalid dead letter id" });
+      return;
+    }
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin"])) {
+      sendJson(res, 403, { error: "Insufficient role" });
+      return;
+    }
+    const replayed = await outboxRepository.replayDead(tenantId, deadLetterId);
+    if (!replayed) {
+      sendJson(res, 404, { error: "dead_letter_not_found" });
+      return;
+    }
+    incCounter("outbox_events_replayed_total", "Dead-lettered outbox events manually replayed.");
+    await audit(tenantId, auth, {
+      action: "outbox.dead_letter.replayed",
+      resourceType: "OutboxEvent",
+      resourceId: deadLetterId,
+      payload: { status: "replayed" }
+    });
+    sendJson(res, 200, { status: "replayed", id: deadLetterId });
     return;
   }
 

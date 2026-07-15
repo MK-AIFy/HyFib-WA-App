@@ -73,7 +73,12 @@ function CreateSegment() {
       {
         name: v.name,
         definition: {
-          tags: v.tags ? v.tags.split(",").map((t) => t.trim()).filter(Boolean) : undefined,
+          tags: v.tags
+            ? v.tags
+                .split(",")
+                .map((t) => t.trim())
+                .filter(Boolean)
+            : undefined,
           country: v.country || undefined
         }
       },
