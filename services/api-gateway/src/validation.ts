@@ -1,4 +1,4 @@
-import type { WhatsAppInteractivePayload } from "@hyfib/shared-core";
+import type { TemplateComponent, WhatsAppInteractivePayload } from "@hyfib/shared-core";
 
 export type ValidationResult<T> = { ok: true; value: T } | { ok: false; error: string };
 
@@ -290,5 +290,66 @@ export function validateInteractivePayload(input: unknown): ValidationResult<Wha
     return { ok: false, error: `a list message supports at most ${TOTAL_ROWS_MAX} rows in total` };
   }
   value.sections = cleanSections;
+  return { ok: true, value };
+}
+
+const TEMPLATE_NAME_MAX = 512;
+const TEMPLATE_LANGUAGE_MAX = 10;
+const TEMPLATE_PARAMETERS_MAX = 50;
+const TEMPLATE_PARAMETER_MAX = 1024;
+
+export interface TemplateSendPayload {
+  templateName: string;
+  templateLanguage: string;
+  parameters?: string[];
+  components?: TemplateComponent[];
+}
+
+/**
+ * Validates a template-send request for the agent conversation-send route.
+ * Trims templateName/templateLanguage; `parameters`/`components` pass through
+ * unmodified when present (`components`, if malformed, is caught downstream
+ * by the meta-adapter's Graph call — this route only bounds the caller input
+ * enough to prevent abuse, mirroring validateInteractivePayload).
+ */
+export function validateTemplatePayload(input: unknown): ValidationResult<TemplateSendPayload> {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return { ok: false, error: "template must be an object" };
+  }
+  const candidate = input as Record<string, unknown>;
+
+  const nameCheck = boundedText(candidate.templateName, TEMPLATE_NAME_MAX);
+  if (!nameCheck.ok) {
+    return { ok: false, error: `template.templateName ${nameCheck.error}` };
+  }
+  const languageCheck = boundedText(candidate.templateLanguage, TEMPLATE_LANGUAGE_MAX);
+  if (!languageCheck.ok) {
+    return { ok: false, error: `template.templateLanguage ${languageCheck.error}` };
+  }
+
+  const value: TemplateSendPayload = {
+    templateName: nameCheck.value,
+    templateLanguage: languageCheck.value
+  };
+
+  if (candidate.parameters !== undefined) {
+    if (!Array.isArray(candidate.parameters) || candidate.parameters.length > TEMPLATE_PARAMETERS_MAX) {
+      return { ok: false, error: `template.parameters must be an array of at most ${TEMPLATE_PARAMETERS_MAX} strings` };
+    }
+    for (const param of candidate.parameters) {
+      if (typeof param !== "string" || param.length > TEMPLATE_PARAMETER_MAX) {
+        return {
+          ok: false,
+          error: `each template.parameters entry must be a string of at most ${TEMPLATE_PARAMETER_MAX} characters`
+        };
+      }
+    }
+    value.parameters = candidate.parameters;
+  }
+
+  if (candidate.components !== undefined) {
+    value.components = candidate.components as TemplateComponent[];
+  }
+
   return { ok: true, value };
 }

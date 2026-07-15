@@ -73,6 +73,7 @@ import {
   type Role,
   type Segment,
   type Template,
+  type TemplateComponent,
   type VariableMapping,
   type WhatsAppInteractivePayload,
   type WhatsAppMediaKind
@@ -85,7 +86,8 @@ import {
   parseOptionalIsoDate,
   clampInt,
   validateInteractivePayload,
-  validateCampaignBody
+  validateCampaignBody,
+  validateTemplatePayload
 } from "./validation.js";
 import { filterSendableContacts } from "./campaign.js";
 import { canCreateContact, canCreateOrder } from "./authorization.js";
@@ -127,7 +129,7 @@ interface UpdateWhatsAppSettingsRequest {
 }
 
 interface SendMessageRequest {
-  kind?: "text" | "media" | "interactive" | "product" | "catalog" | "flow";
+  kind?: "text" | "media" | "interactive" | "product" | "catalog" | "flow" | "template";
   text?: string;
   previewUrl?: boolean;
   media?: { mediaType: WhatsAppMediaKind; link?: string; mediaId?: string; caption?: string; filename?: string };
@@ -147,6 +149,12 @@ interface SendMessageRequest {
     ctaButtonText: string;
     headerText?: string;
     footerText?: string;
+  };
+  template?: {
+    templateName: string;
+    templateLanguage: string;
+    parameters?: string[];
+    components?: TemplateComponent[];
   };
 }
 
@@ -903,7 +911,7 @@ async function sendConversationMessage(
     return { status: 422, body: { error: "contact_opted_out" } };
   }
 
-  const VALID_MESSAGE_KINDS = ["text", "media", "interactive", "product", "catalog", "flow"] as const;
+  const VALID_MESSAGE_KINDS = ["text", "media", "interactive", "product", "catalog", "flow", "template"] as const;
   const kind = body.kind ?? "text";
   if (!VALID_MESSAGE_KINDS.includes(kind as (typeof VALID_MESSAGE_KINDS)[number])) {
     return { status: 400, body: { error: `kind must be one of: ${VALID_MESSAGE_KINDS.join(", ")}` } };
@@ -928,6 +936,14 @@ async function sendConversationMessage(
   }
   if (kind === "flow" && (!body.flow?.flowId || !body.flow?.bodyText)) {
     return { status: 400, body: { error: "flow.flowId and flow.bodyText are required" } };
+  }
+  let template: SendMessageRequest["template"] | undefined;
+  if (kind === "template") {
+    const validated = validateTemplatePayload(body.template);
+    if (!validated.ok) {
+      return { status: 400, body: { error: validated.error } };
+    }
+    template = validated.value;
   }
 
   let interactive: WhatsAppInteractivePayload | undefined;
@@ -955,6 +971,7 @@ async function sendConversationMessage(
         product: body.product,
         catalog: body.catalog,
         flow: body.flow,
+        template,
         actorId: asActorUuid(auth.subject),
         dispatchId: randomUUID()
       }

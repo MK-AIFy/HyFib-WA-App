@@ -513,11 +513,17 @@ export interface WhatsAppOutboundRequest {
   channelId: string;
   conversationId: string;
   contactPhoneE164: string;
-  kind: "text" | "media" | "interactive" | "product" | "catalog" | "flow";
+  kind: "text" | "media" | "interactive" | "product" | "catalog" | "flow" | "template";
   text?: string;
   previewUrl?: boolean;
   media?: { mediaType: WhatsAppMediaKind; link?: string; mediaId?: string; caption?: string; filename?: string };
   interactive?: WhatsAppInteractivePayload;
+  template?: {
+    templateName: string;
+    templateLanguage: string;
+    parameters?: string[];
+    components?: TemplateComponent[];
+  };
   product?: { catalogId: string; productRetailerId: string; bodyText?: string };
   catalog?: {
     catalogId: string;

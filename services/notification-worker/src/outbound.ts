@@ -51,6 +51,21 @@ export interface OutboundAdapterCall {
  * so each kind's wiring can be unit-tested.
  */
 export function buildOutboundAdapterCall(command: WhatsAppOutboundRequest, channel: SendChannel): OutboundAdapterCall {
+  if (command.kind === "template" && command.template) {
+    return {
+      endpoint: "/internal/v1/whatsapp/send-template",
+      payload: {
+        phoneNumberId: channel.phoneNumberId,
+        to: command.contactPhoneE164,
+        templateName: command.template.templateName,
+        templateLanguage: command.template.templateLanguage,
+        parameters: command.template.parameters ?? [],
+        components: command.template.components,
+        accessToken: channel.accessToken
+      },
+      persistedPayload: { kind: "template", template: command.template, actorId: command.actorId }
+    };
+  }
   if (command.kind === "product" && command.product) {
     return {
       endpoint: "/internal/v1/whatsapp/send-product",

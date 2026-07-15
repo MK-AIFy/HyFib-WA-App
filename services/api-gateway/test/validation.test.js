@@ -7,7 +7,8 @@ import {
   parseListQuery,
   parseOptionalIsoDate,
   validateCampaignBody,
-  validateInteractivePayload
+  validateInteractivePayload,
+  validateTemplatePayload
 } from "../dist/validation.js";
 
 test("parseListQuery clamps limit and defaults offset", () => {
@@ -240,4 +241,79 @@ test("rejects duplicate row ids across sections", () => {
   });
   assert.equal(result.ok, false);
   assert.match(result.error, /unique/);
+});
+
+test("validateTemplatePayload accepts a minimal valid payload and trims name/language", () => {
+  const result = validateTemplatePayload({ templateName: "  order_confirmation  ", templateLanguage: " en_US " });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.value, { templateName: "order_confirmation", templateLanguage: "en_US" });
+});
+
+test("validateTemplatePayload accepts optional parameters and components", () => {
+  const components = [{ type: "body", parameters: [{ type: "text", text: "12345" }] }];
+  const result = validateTemplatePayload({
+    templateName: "shipping_update",
+    templateLanguage: "en_US",
+    parameters: ["12345"],
+    components
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.value.parameters, ["12345"]);
+  assert.deepEqual(result.value.components, components);
+});
+
+test("validateTemplatePayload rejects non-object input", () => {
+  assert.equal(validateTemplatePayload(undefined).ok, false);
+  assert.equal(validateTemplatePayload("x").ok, false);
+  assert.equal(validateTemplatePayload([]).ok, false);
+});
+
+test("validateTemplatePayload requires templateName", () => {
+  const result = validateTemplatePayload({ templateLanguage: "en_US" });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /templateName/);
+});
+
+test("validateTemplatePayload requires templateLanguage", () => {
+  const result = validateTemplatePayload({ templateName: "order_confirmation" });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /templateLanguage/);
+});
+
+test("validateTemplatePayload rejects a templateLanguage longer than 10 characters", () => {
+  const result = validateTemplatePayload({ templateName: "x", templateLanguage: "en_US_extra_long" });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /templateLanguage/);
+});
+
+test("validateTemplatePayload rejects non-array parameters", () => {
+  const result = validateTemplatePayload({ templateName: "x", templateLanguage: "en_US", parameters: "not-an-array" });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /parameters/);
+});
+
+test("validateTemplatePayload rejects more than 50 parameters", () => {
+  const result = validateTemplatePayload({
+    templateName: "x",
+    templateLanguage: "en_US",
+    parameters: Array.from({ length: 51 }, (_, i) => `p${i}`)
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /parameters/);
+});
+
+test("validateTemplatePayload rejects a non-string parameter entry", () => {
+  const result = validateTemplatePayload({ templateName: "x", templateLanguage: "en_US", parameters: [123] });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /string/);
+});
+
+test("validateTemplatePayload rejects a parameter entry longer than 1024 characters", () => {
+  const result = validateTemplatePayload({
+    templateName: "x",
+    templateLanguage: "en_US",
+    parameters: ["a".repeat(1025)]
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /1024/);
 });

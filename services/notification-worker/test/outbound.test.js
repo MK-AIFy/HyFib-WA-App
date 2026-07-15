@@ -61,3 +61,33 @@ test("channel without a token omits accessToken from persistence but keeps undef
   assert.equal(call.payload.accessToken, undefined);
   assert.equal(call.payload.phoneNumberId, "PN-2");
 });
+
+test("template command maps to send-template with parameters defaulted to an empty array", () => {
+  const template = { templateName: "order_confirmation", templateLanguage: "en_US" };
+  const call = buildOutboundAdapterCall({ ...base, kind: "template", template }, channel);
+  assert.equal(call.endpoint, "/internal/v1/whatsapp/send-template");
+  assert.equal(call.payload.phoneNumberId, "PN-1");
+  assert.equal(call.payload.to, "+15551230000");
+  assert.equal(call.payload.templateName, "order_confirmation");
+  assert.equal(call.payload.templateLanguage, "en_US");
+  assert.deepEqual(call.payload.parameters, []);
+  assert.equal(call.payload.accessToken, "tok-1");
+  assert.deepEqual(call.persistedPayload, { kind: "template", template, actorId: "actor-1" });
+});
+
+test("template command passes through explicit parameters and components", () => {
+  const template = {
+    templateName: "shipping_update",
+    templateLanguage: "en_US",
+    parameters: ["12345"],
+    components: [{ type: "body", parameters: [{ type: "text", text: "12345" }] }]
+  };
+  const call = buildOutboundAdapterCall({ ...base, kind: "template", template }, channel);
+  assert.deepEqual(call.payload.parameters, ["12345"]);
+  assert.deepEqual(call.payload.components, template.components);
+});
+
+test("template kind without a payload falls back to text", () => {
+  const call = buildOutboundAdapterCall({ ...base, kind: "template", text: "fallback" }, channel);
+  assert.equal(call.endpoint, "/internal/v1/whatsapp/send-text");
+});
