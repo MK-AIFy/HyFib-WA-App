@@ -55,9 +55,7 @@ export function Topbar({ navItems, tenantName, displayName, role, sseStatus, onL
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end">
-          <DropdownMenuLabel className="font-normal text-muted-foreground">
-            {role.replace(/_/g, " ")}
-          </DropdownMenuLabel>
+          <DropdownMenuLabel className="font-normal text-muted-foreground">{role.replace(/_/g, " ")}</DropdownMenuLabel>
           <DropdownMenuSeparator />
           <DropdownMenuItem onSelect={onLogout} variant="destructive">
             <LogOut className="size-4" aria-hidden="true" />

@@ -114,12 +114,7 @@ export interface WorkerMetaClient {
     tenantId: string,
     payload: Record<string, unknown>
   ): Promise<{ messageId?: string; accepted: boolean }>;
-  markRead(
-    phoneNumberId: string,
-    messageId: string,
-    tenantId: string,
-    accessToken?: string
-  ): Promise<void>;
+  markRead(phoneNumberId: string, messageId: string, tenantId: string, accessToken?: string): Promise<void>;
   /** Downloads inbound media bytes for a Graph media id. Throws on any non-success outcome. */
   fetchMedia(
     mediaId: string,
@@ -680,9 +675,7 @@ async function handleInbound(event: EventEnvelope): Promise<void> {
   // Inbound media (image/video/audio/document/sticker): enqueue an async fetch of the
   // bytes via the outbox. Idempotent by media id (see media.ts's upsertPending
   // short-circuit), so redelivery of this outbox row or a future replay is safe.
-  const media = inbound.media as
-    | { id?: string; mimeType?: string; sha256?: string; filename?: string }
-    | undefined;
+  const media = inbound.media as { id?: string; mimeType?: string; sha256?: string; filename?: string } | undefined;
   const mediaId = media?.id;
   if (mediaId) {
     await enqueueMediaFetch(channel, inbound.phoneNumberId, conversation.id, createdMessage.id, {
@@ -729,11 +722,8 @@ async function handleInbound(event: EventEnvelope): Promise<void> {
     const interactivePayload = inbound.interactive as
       | { button_reply?: { title?: string }; list_reply?: { title?: string } }
       | undefined;
-    const interactiveTitle =
-      interactivePayload?.button_reply?.title ?? interactivePayload?.list_reply?.title;
-    const text = (typeof inbound.text === "string" && inbound.text)
-      ? inbound.text
-      : interactiveTitle;
+    const interactiveTitle = interactivePayload?.button_reply?.title ?? interactivePayload?.list_reply?.title;
+    const text = typeof inbound.text === "string" && inbound.text ? inbound.text : interactiveTitle;
     const matched = matchAutoReply(text, rules);
     if (matched && matched.replyText) {
       await withTenant(channel.tenantId, async (client) => {
@@ -951,7 +941,10 @@ async function handleAutomationTemplate(event: EventEnvelope): Promise<void> {
     const policyCheck = evaluateOutboundPolicy({
       hasActiveConsent: true,
       isInside24hWindow: false,
-      template: { category: (req as any).templateCategory ?? "marketing", status: "approved" } as import("@hyfib/shared-core").Template,
+      template: {
+        category: (req as any).templateCategory ?? "marketing",
+        status: "approved"
+      } as import("@hyfib/shared-core").Template,
       requestedCategory: ((req as any).templateCategory ?? "marketing") as import("@hyfib/shared-core").MessageCategory,
       isOptedOut: false,
       currentHourLocal: getCurrentHourInTz(contact.timezone ?? "UTC"),
@@ -959,7 +952,11 @@ async function handleAutomationTemplate(event: EventEnvelope): Promise<void> {
       frequencyCap: undefined
     });
     if (!policyCheck.allowed) {
-      logger.warn("automation_template_policy_blocked", { tenantId: req.tenantId, contactId: contact.id, reason: policyCheck.reason });
+      logger.warn("automation_template_policy_blocked", {
+        tenantId: req.tenantId,
+        contactId: contact.id,
+        reason: policyCheck.reason
+      });
       return;
     }
 
@@ -1001,7 +998,11 @@ async function handleAutomationTemplate(event: EventEnvelope): Promise<void> {
     externalMessageId: result.messageId,
     payload: { source: "automation", templateName: req.templateName }
   });
-  logger.info("automation_template_sent", { tenantId: req.tenantId, contactPhoneE164: req.contactPhoneE164, externalMessageId: result.messageId });
+  logger.info("automation_template_sent", {
+    tenantId: req.tenantId,
+    contactPhoneE164: req.contactPhoneE164,
+    externalMessageId: result.messageId
+  });
   incCounter("automation_template_sends_total", "Automation template sends.", {
     result: result.accepted ? "accepted" : "queued"
   });

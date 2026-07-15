@@ -80,9 +80,7 @@ export function OnboardingPage() {
             <div className="flex flex-col gap-1.5">
               <Label htmlFor="phoneNumberId">Phone Number ID</Label>
               <Input id="phoneNumberId" aria-invalid={!!errors.phoneNumberId} {...register("phoneNumberId")} />
-              {errors.phoneNumberId ? (
-                <p className="text-xs text-destructive">{errors.phoneNumberId.message}</p>
-              ) : null}
+              {errors.phoneNumberId ? <p className="text-xs text-destructive">{errors.phoneNumberId.message}</p> : null}
             </div>
             <div className="flex flex-col gap-1.5">
               <Label htmlFor="displayPhoneNumber">Display Phone Number</Label>

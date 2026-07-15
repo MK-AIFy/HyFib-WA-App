@@ -66,10 +66,7 @@ export function ChatPane({ conversation, onBack }: { conversation: Conversation;
         >
           <Archive className="size-4" aria-hidden="true" />
         </Button>
-        <Select
-          value={conversation.state}
-          onValueChange={(v) => setState.mutate(v as "open" | "pending" | "closed")}
-        >
+        <Select value={conversation.state} onValueChange={(v) => setState.mutate(v as "open" | "pending" | "closed")}>
           <SelectTrigger className="w-32" aria-label="Conversation state">
             <SelectValue />
           </SelectTrigger>
@@ -94,9 +91,7 @@ export function ChatPane({ conversation, onBack }: { conversation: Conversation;
                   key={m.id}
                   className={cn(
                     "max-w-[75%] rounded-lg px-3 py-2 text-sm",
-                    m.direction === "outbound"
-                      ? "self-end bg-primary/15 text-foreground"
-                      : "self-start bg-secondary"
+                    m.direction === "outbound" ? "self-end bg-primary/15 text-foreground" : "self-start bg-secondary"
                   )}
                 >
                   {media ? <MediaAttachment media={media} /> : null}

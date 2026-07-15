@@ -65,7 +65,10 @@ test("happy path: every row is published and marked processed, none marked faile
     logger
   });
 
-  assert.deepEqual(published.map((p) => p.topic), ["whatsapp.outbound.requested", "whatsapp.outbound.requested"]);
+  assert.deepEqual(
+    published.map((p) => p.topic),
+    ["whatsapp.outbound.requested", "whatsapp.outbound.requested"]
+  );
   assert.deepEqual(markedProcessed, ["a", "b"]);
   assert.deepEqual(markedFailed, []);
   assert.deepEqual(counters.published_calls, ["whatsapp.outbound.requested", "whatsapp.outbound.requested"]);

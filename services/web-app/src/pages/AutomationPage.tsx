@@ -71,11 +71,7 @@ function RulesTable() {
             <TableCell>{titleCase(r.triggerType)}</TableCell>
             <TableCell>{titleCase(r.actionType)}</TableCell>
             <TableCell>
-              <Switch
-                checked={r.enabled}
-                onCheckedChange={(v) => toggle(r.id, v)}
-                aria-label={`Toggle ${r.name}`}
-              />
+              <Switch checked={r.enabled} onCheckedChange={(v) => toggle(r.id, v)} aria-label={`Toggle ${r.name}`} />
             </TableCell>
           </TableRow>
         ))}

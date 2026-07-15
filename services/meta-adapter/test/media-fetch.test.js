@@ -52,7 +52,12 @@ function downloadResponseWithFailingBody({ status = 200, contentType, contentLen
 test("fetchMediaDirect: happy path returns buffer + mime + sha256, both calls carry the bearer token", async () => {
   const bytes = Buffer.from("fake-image-bytes");
   const { fetchImpl, calls } = queuedFetch([
-    resolveResponse({ url: "https://lookaside.fbsbx.com/blob/1", mime_type: "image/png", sha256: "abc123", file_size: bytes.length }),
+    resolveResponse({
+      url: "https://lookaside.fbsbx.com/blob/1",
+      mime_type: "image/png",
+      sha256: "abc123",
+      file_size: bytes.length
+    }),
     downloadResponse(bytes, { contentType: "image/png" })
   ]);
 

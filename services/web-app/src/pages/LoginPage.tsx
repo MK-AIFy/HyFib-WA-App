@@ -57,7 +57,13 @@ export function LoginPage() {
             ) : null}
             <div className="flex flex-col gap-1.5">
               <Label htmlFor="email">Email</Label>
-              <Input id="email" type="email" autoComplete="email" aria-invalid={!!errors.email} {...register("email")} />
+              <Input
+                id="email"
+                type="email"
+                autoComplete="email"
+                aria-invalid={!!errors.email}
+                {...register("email")}
+              />
               {errors.email ? <p className="text-xs text-destructive">{errors.email.message}</p> : null}
             </div>
             <div className="flex flex-col gap-1.5">

@@ -81,7 +81,12 @@ test("handleOutbound: dispatchId claim — first call sends, replayed dispatchId
 
   const originalGetCredentials = channelRepository.getCredentials;
   const originalCreate = messageRepository.create;
-  channelRepository.getCredentials = async () => ({ id: "c-1", wabaId: "waba-1", phoneNumberId: "PN-1", accessToken: "tok" });
+  channelRepository.getCredentials = async () => ({
+    id: "c-1",
+    wabaId: "waba-1",
+    phoneNumberId: "PN-1",
+    accessToken: "tok"
+  });
   messageRepository.create = async () => {
     createCalls++;
     return { id: "m-1" };
@@ -113,16 +118,18 @@ test("handleOutbound: send failure releases the dispatch claim and rethrows", as
   });
 
   const originalGetCredentials = channelRepository.getCredentials;
-  channelRepository.getCredentials = async () => ({ id: "c-1", wabaId: "waba-1", phoneNumberId: "PN-1", accessToken: "tok" });
+  channelRepository.getCredentials = async () => ({
+    id: "c-1",
+    wabaId: "waba-1",
+    phoneNumberId: "PN-1",
+    accessToken: "tok"
+  });
 
   try {
     registerWorkerConsumers({ eventBus: bus, redis, metaClient });
     const handleOutbound = bus.handlers.get(EventTopics.WhatsAppOutboundRequested);
 
-    await assert.rejects(
-      () => handleOutbound(outboundEvent("env-1", "dispatch-fail")),
-      /meta_adapter_rejected_500/
-    );
+    await assert.rejects(() => handleOutbound(outboundEvent("env-1", "dispatch-fail")), /meta_adapter_rejected_500/);
     assert.equal(redis.store.has("outb:dispatch-fail"), false, "claim key must be released after send failure");
   } finally {
     channelRepository.getCredentials = originalGetCredentials;
@@ -229,7 +236,12 @@ test("handleOutbound: no dispatchId sends without touching the redis guard", asy
 
   const originalGetCredentials = channelRepository.getCredentials;
   const originalCreate = messageRepository.create;
-  channelRepository.getCredentials = async () => ({ id: "c-1", wabaId: "waba-1", phoneNumberId: "PN-1", accessToken: "tok" });
+  channelRepository.getCredentials = async () => ({
+    id: "c-1",
+    wabaId: "waba-1",
+    phoneNumberId: "PN-1",
+    accessToken: "tok"
+  });
   messageRepository.create = async () => ({ id: "m-1" });
 
   try {

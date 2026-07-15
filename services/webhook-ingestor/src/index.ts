@@ -29,109 +29,108 @@ const ingestDeps = { eventBus, idempotency, logger };
 
 const server = createServer(async (req, res) => {
   try {
-  const path = parseUrlPath(req.url);
-  const method = req.method ?? "GET";
-  const ctx = requestContext(req);
+    const path = parseUrlPath(req.url);
+    const method = req.method ?? "GET";
+    const ctx = requestContext(req);
 
-  if (path === "/metrics") {
-    sendMetrics(res);
-    return;
-  }
-
-  if (path === "/health") {
-    sendJson(res, 200, {
-      service: "webhook-ingestor",
-      status: "ok",
-      timestamp: new Date().toISOString()
-    });
-    return;
-  }
-
-  if (path === "/internal/v1/webhooks/meta/whatsapp") {
-    if (method !== "POST") {
-      methodNotAllowed(res);
+    if (path === "/metrics") {
+      sendMetrics(res);
       return;
     }
 
-    const raw = await readRawBody(req);
-    let rawBody = raw;
-    let signature = req.headers["x-hub-signature-256"];
-    let tenantId: string | undefined = ctx.tenantId;
+    if (path === "/health") {
+      sendJson(res, 200, {
+        service: "webhook-ingestor",
+        status: "ok",
+        timestamp: new Date().toISOString()
+      });
+      return;
+    }
 
-    if (req.headers["content-type"]?.includes("application/json")) {
-      const forwarded = safeJsonParse(raw) as unknown as ForwardedWebhook;
-      if (typeof forwarded.rawBody === "string") {
-        rawBody = forwarded.rawBody;
-        signature = forwarded.signature;
-        tenantId = forwarded.tenantId ?? tenantId;
+    if (path === "/internal/v1/webhooks/meta/whatsapp") {
+      if (method !== "POST") {
+        methodNotAllowed(res);
+        return;
       }
-    }
 
-    const normalizedSignature = typeof signature === "string" ? signature : undefined;
+      const raw = await readRawBody(req);
+      let rawBody = raw;
+      let signature = req.headers["x-hub-signature-256"];
+      let tenantId: string | undefined = ctx.tenantId;
 
-    if (!verifyMetaSignature(rawBody, normalizedSignature, config.metaAppSecret)) {
-      logger.warn("webhook_signature_invalid", { requestId: ctx.requestId });
-      sendJson(res, 401, { error: "Invalid webhook signature" });
+      if (req.headers["content-type"]?.includes("application/json")) {
+        const forwarded = safeJsonParse(raw) as unknown as ForwardedWebhook;
+        if (typeof forwarded.rawBody === "string") {
+          rawBody = forwarded.rawBody;
+          signature = forwarded.signature;
+          tenantId = forwarded.tenantId ?? tenantId;
+        }
+      }
+
+      const normalizedSignature = typeof signature === "string" ? signature : undefined;
+
+      if (!verifyMetaSignature(rawBody, normalizedSignature, config.metaAppSecret)) {
+        logger.warn("webhook_signature_invalid", { requestId: ctx.requestId });
+        sendJson(res, 401, { error: "Invalid webhook signature" });
+        return;
+      }
+
+      const payload = safeJsonParse(rawBody);
+      const scopedTenant = deriveTenantId(payload, tenantId);
+      const summary = await ingestMetaWebhook(payload, scopedTenant, ingestDeps);
+
+      logger.info("webhook_ingested", {
+        requestId: ctx.requestId,
+        tenantId: scopedTenant,
+        inbound: summary.inbound,
+        statuses: summary.statuses,
+        duplicates: summary.duplicates
+      });
+
+      sendJson(res, 200, {
+        status: "accepted",
+        requestId: ctx.requestId,
+        tenantId: scopedTenant,
+        ...summary
+      });
       return;
     }
 
-    const payload = safeJsonParse(rawBody);
-    const scopedTenant = deriveTenantId(payload, tenantId);
-    const summary = await ingestMetaWebhook(payload, scopedTenant, ingestDeps);
+    if (path === "/internal/v1/webhooks/meta/whatsapp/replay") {
+      if (method !== "POST") {
+        methodNotAllowed(res);
+        return;
+      }
 
-    logger.info("webhook_ingested", {
-      requestId: ctx.requestId,
-      tenantId: scopedTenant,
-      inbound: summary.inbound,
-      statuses: summary.statuses,
-      duplicates: summary.duplicates
-    });
+      const providedSecret =
+        typeof req.headers["x-internal-secret"] === "string" ? req.headers["x-internal-secret"] : "";
+      if (config.internalServiceSecret !== "" && providedSecret !== config.internalServiceSecret) {
+        logger.warn("replay_unauthorized", { requestId: ctx.requestId });
+        sendJson(res, 401, { error: "Unauthorized" });
+        return;
+      }
 
-    sendJson(res, 200, {
-      status: "accepted",
-      requestId: ctx.requestId,
-      tenantId: scopedTenant,
-      ...summary
-    });
-    return;
-  }
+      const raw = await readRawBody(req);
+      const payload = safeJsonParse(raw);
+      const summary = await ingestMetaWebhook(payload, ctx.tenantId, ingestDeps);
 
-  if (path === "/internal/v1/webhooks/meta/whatsapp/replay") {
-    if (method !== "POST") {
-      methodNotAllowed(res);
+      logger.info("webhook_replayed", {
+        requestId: ctx.requestId,
+        tenantId: ctx.tenantId,
+        inbound: summary.inbound,
+        statuses: summary.statuses,
+        duplicates: summary.duplicates
+      });
+
+      sendJson(res, 200, {
+        status: "replayed",
+        requestId: ctx.requestId,
+        ...summary
+      });
       return;
     }
 
-    const providedSecret = typeof req.headers["x-internal-secret"] === "string"
-      ? req.headers["x-internal-secret"]
-      : "";
-    if (config.internalServiceSecret !== "" && providedSecret !== config.internalServiceSecret) {
-      logger.warn("replay_unauthorized", { requestId: ctx.requestId });
-      sendJson(res, 401, { error: "Unauthorized" });
-      return;
-    }
-
-    const raw = await readRawBody(req);
-    const payload = safeJsonParse(raw);
-    const summary = await ingestMetaWebhook(payload, ctx.tenantId, ingestDeps);
-
-    logger.info("webhook_replayed", {
-      requestId: ctx.requestId,
-      tenantId: ctx.tenantId,
-      inbound: summary.inbound,
-      statuses: summary.statuses,
-      duplicates: summary.duplicates
-    });
-
-    sendJson(res, 200, {
-      status: "replayed",
-      requestId: ctx.requestId,
-      ...summary
-    });
-    return;
-  }
-
-  notFound(res);
+    notFound(res);
   } catch (error) {
     logger.error("webhook_handler_error", { error: error instanceof Error ? error.message : String(error) });
     if (!res.headersSent) {

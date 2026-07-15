@@ -39,11 +39,19 @@ export function AiToolsPage() {
             <form className="flex flex-col gap-3" onSubmit={(e) => void handleSubmit((v) => draft.mutate(v))(e)}>
               <div className="flex flex-col gap-1.5">
                 <Label htmlFor="objective">Objective</Label>
-                <Input id="objective" placeholder="Re-engage lapsed customers" {...register("objective", { required: true })} />
+                <Input
+                  id="objective"
+                  placeholder="Re-engage lapsed customers"
+                  {...register("objective", { required: true })}
+                />
               </div>
               <div className="flex flex-col gap-1.5">
                 <Label htmlFor="audienceDescription">Audience</Label>
-                <Input id="audienceDescription" placeholder="Customers inactive 30+ days" {...register("audienceDescription", { required: true })} />
+                <Input
+                  id="audienceDescription"
+                  placeholder="Customers inactive 30+ days"
+                  {...register("audienceDescription", { required: true })}
+                />
               </div>
               <div className="flex flex-col gap-1.5">
                 <Label htmlFor="offer">Offer</Label>

@@ -146,10 +146,7 @@ test("a failed inbound publish releases exactly the inbound message's key and re
   const bus = fakeBusFailingOnCall(1);
   const idem = fakeIdempotency();
 
-  await assert.rejects(
-    () => ingestMetaWebhook(payload, "tenant-1", { eventBus: bus, idempotency: idem }),
-    /db down/
-  );
+  await assert.rejects(() => ingestMetaWebhook(payload, "tenant-1", { eventBus: bus, idempotency: idem }), /db down/);
   // The status loop never runs because the inbound publish threw first.
   assert.deepEqual(idem.releases, ["inbound:wamid.1"]);
   assert.equal(bus.published.length, 0);
@@ -166,10 +163,7 @@ test("a failed status publish releases exactly the status's key and rethrows; re
   const bus = fakeBusFailingOnCall(2);
   const idem = fakeIdempotency();
 
-  await assert.rejects(
-    () => ingestMetaWebhook(payload, "tenant-1", { eventBus: bus, idempotency: idem }),
-    /db down/
-  );
+  await assert.rejects(() => ingestMetaWebhook(payload, "tenant-1", { eventBus: bus, idempotency: idem }), /db down/);
   assert.deepEqual(idem.releases, ["status:wamid.1:delivered"]);
   // The inbound message's publish succeeded and was NOT released.
   assert.equal(bus.published.length, 1);
@@ -211,8 +205,5 @@ test("release() throwing without a logger dep still propagates the original erro
   const bus = fakeBusFailingOnCall(1);
   const idem = fakeIdempotencyReleaseThrows();
 
-  await assert.rejects(
-    () => ingestMetaWebhook(payload, "tenant-1", { eventBus: bus, idempotency: idem }),
-    /db down/
-  );
+  await assert.rejects(() => ingestMetaWebhook(payload, "tenant-1", { eventBus: bus, idempotency: idem }), /db down/);
 });

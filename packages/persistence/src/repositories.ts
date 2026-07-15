@@ -1537,19 +1537,19 @@ export const conversationRepository = {
   /** Sets or clears archived_at. Idempotent — archiving an already-archived conversation is a no-op timestamp refresh. */
   async setArchived(tenantId: string, conversationId: string, archived: boolean): Promise<void> {
     await withTenant(tenantId, async (client) => {
-      await client.query(
-        "UPDATE conversations SET archived_at = CASE WHEN $2 THEN now() ELSE NULL END WHERE id = $1",
-        [conversationId, archived]
-      );
+      await client.query("UPDATE conversations SET archived_at = CASE WHEN $2 THEN now() ELSE NULL END WHERE id = $1", [
+        conversationId,
+        archived
+      ]);
     });
   },
   /** Sets or clears pinned_at. Idempotent, same shape as setArchived. */
   async setPinned(tenantId: string, conversationId: string, pinned: boolean): Promise<void> {
     await withTenant(tenantId, async (client) => {
-      await client.query(
-        "UPDATE conversations SET pinned_at = CASE WHEN $2 THEN now() ELSE NULL END WHERE id = $1",
-        [conversationId, pinned]
-      );
+      await client.query("UPDATE conversations SET pinned_at = CASE WHEN $2 THEN now() ELSE NULL END WHERE id = $1", [
+        conversationId,
+        pinned
+      ]);
     });
   },
   /** Returns the timestamp of the last inbound message for a contact across all channels (for 24h window check). */

@@ -204,7 +204,10 @@ test("processMediaFetch: fetch failure records the error and rethrows the same e
     logger
   };
 
-  await assert.rejects(() => processMediaFetch(baseRequest(), deps), (error) => error === originalError);
+  await assert.rejects(
+    () => processMediaFetch(baseRequest(), deps),
+    (error) => error === originalError
+  );
 
   assert.equal(recordErrorCalls.length, 1);
   assert.deepEqual(recordErrorCalls[0], { tenantId: "t-1", id: "asset-1", message: originalError.message });
@@ -243,7 +246,10 @@ test("processMediaFetch: recordError failure does not mask the original error", 
     logger
   };
 
-  await assert.rejects(() => processMediaFetch(baseRequest(), deps), (error) => error === originalError);
+  await assert.rejects(
+    () => processMediaFetch(baseRequest(), deps),
+    (error) => error === originalError
+  );
   assert.ok(
     logger.logs.warn.some((entry) => entry.message === "media_fetch_record_error_failed"),
     "the recordError failure should be logged, not swallowed silently"

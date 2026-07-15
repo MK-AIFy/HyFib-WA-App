@@ -70,9 +70,7 @@ describe("ChatPane — pin/archive header controls", () => {
 
     await user.click(await screen.findByRole("button", { name: "Archive conversation" }));
 
-    await waitFor(() =>
-      expect(postMock).toHaveBeenCalledWith("/api/v1/conversations/c1/archive", { archived: true })
-    );
+    await waitFor(() => expect(postMock).toHaveBeenCalledWith("/api/v1/conversations/c1/archive", { archived: true }));
   });
 
   it("clicking 'Unarchive conversation' (already archived) fires useArchiveConversation with {id, archived: false}", async () => {
@@ -81,9 +79,7 @@ describe("ChatPane — pin/archive header controls", () => {
 
     await user.click(await screen.findByRole("button", { name: "Unarchive conversation" }));
 
-    await waitFor(() =>
-      expect(postMock).toHaveBeenCalledWith("/api/v1/conversations/c1/archive", { archived: false })
-    );
+    await waitFor(() => expect(postMock).toHaveBeenCalledWith("/api/v1/conversations/c1/archive", { archived: false }));
   });
 
   it("pin and archive mutations are independent — clicking one does not fire the other", async () => {

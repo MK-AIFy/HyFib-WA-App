@@ -37,11 +37,7 @@ function extractPhoneNumberId(payload: unknown): string | undefined {
  */
 export function createDurableWebhookBus(inner: EventBus, deps: DurableWebhookBusDeps): EventBus {
   return {
-    async publish<TPayload>(
-      topic: EventTopic,
-      payload: TPayload,
-      tenantId?: string
-    ): Promise<EventEnvelope<TPayload>> {
+    async publish<TPayload>(topic: EventTopic, payload: TPayload, tenantId?: string): Promise<EventEnvelope<TPayload>> {
       const phoneNumberId = extractPhoneNumberId(payload);
       const resolvedTenantId = phoneNumberId ? await deps.resolveTenant(phoneNumberId) : undefined;
 

@@ -40,30 +40,34 @@ async function seedMessage(tenant, conversation, payload, overrides = {}) {
   });
 }
 
-test("substring hit in the middle of a word is returned with text + contact context; total is correct", { skip }, async () => {
-  const { tenant, channel } = await seedTenantWithChannel("Msg Search Substring");
-  const { contact, conversation } = await seedConversation(tenant, channel, {
-    phoneE164: "+15551230001",
-    firstName: "Hyper",
-    lastName: "Active"
-  });
-  await seedMessage(tenant, conversation, { text: "the system is hyperactive today" });
-  // Unrelated message in a different conversation should not match.
-  const { conversation: other } = await seedConversation(tenant, channel, {
-    phoneE164: "+15551230002",
-    firstName: "Quiet",
-    lastName: "One"
-  });
-  await seedMessage(tenant, other, { text: "nothing interesting here" });
+test(
+  "substring hit in the middle of a word is returned with text + contact context; total is correct",
+  { skip },
+  async () => {
+    const { tenant, channel } = await seedTenantWithChannel("Msg Search Substring");
+    const { contact, conversation } = await seedConversation(tenant, channel, {
+      phoneE164: "+15551230001",
+      firstName: "Hyper",
+      lastName: "Active"
+    });
+    await seedMessage(tenant, conversation, { text: "the system is hyperactive today" });
+    // Unrelated message in a different conversation should not match.
+    const { conversation: other } = await seedConversation(tenant, channel, {
+      phoneE164: "+15551230002",
+      firstName: "Quiet",
+      lastName: "One"
+    });
+    await seedMessage(tenant, other, { text: "nothing interesting here" });
 
-  const { items, total } = await messageRepository.search(tenant.id, { q: "peract" });
-  assert.equal(total, 1, "only the message containing the substring should match");
-  assert.equal(items.length, 1);
-  assert.equal(items[0].text, "the system is hyperactive today");
-  assert.equal(items[0].conversationId, conversation.id);
-  assert.equal(items[0].contactName, "Hyper Active");
-  assert.equal(items[0].contactPhone, contact.phoneE164);
-});
+    const { items, total } = await messageRepository.search(tenant.id, { q: "peract" });
+    assert.equal(total, 1, "only the message containing the substring should match");
+    assert.equal(items.length, 1);
+    assert.equal(items[0].text, "the system is hyperactive today");
+    assert.equal(items[0].conversationId, conversation.id);
+    assert.equal(items[0].contactName, "Hyper Active");
+    assert.equal(items[0].contactPhone, contact.phoneE164);
+  }
+);
 
 test("match is case-insensitive", { skip }, async () => {
   const { tenant, channel } = await seedTenantWithChannel("Msg Search CaseInsensitive");
@@ -104,29 +108,33 @@ test("conversationId scopes results to only that conversation's hits", { skip },
   assert.equal(scoped.items[0].conversationId, convA.id);
 });
 
-test("messages without payload.text never match; a literal % in q is treated literally, not as a wildcard", { skip }, async () => {
-  const { tenant, channel } = await seedTenantWithChannel("Msg Search NoTextAndPercent");
-  const { conversation } = await seedConversation(tenant, channel, {
-    phoneE164: "+15551260001",
-    firstName: "Media",
-    lastName: "Only"
-  });
-  // Media-only message: no `text` key in payload at all.
-  await seedMessage(tenant, conversation, { mediaId: "asset-123", mimeType: "image/jpeg" });
-  // Contains the literal substring "50%".
-  await seedMessage(tenant, conversation, { text: "Get 50% off now" });
-  // Contains "50" but NOT the literal "50%" — if the raw q were passed
-  // through unescaped, "%50%%" would incorrectly match this row too.
-  await seedMessage(tenant, conversation, { text: "Best 500 choice" });
+test(
+  "messages without payload.text never match; a literal % in q is treated literally, not as a wildcard",
+  { skip },
+  async () => {
+    const { tenant, channel } = await seedTenantWithChannel("Msg Search NoTextAndPercent");
+    const { conversation } = await seedConversation(tenant, channel, {
+      phoneE164: "+15551260001",
+      firstName: "Media",
+      lastName: "Only"
+    });
+    // Media-only message: no `text` key in payload at all.
+    await seedMessage(tenant, conversation, { mediaId: "asset-123", mimeType: "image/jpeg" });
+    // Contains the literal substring "50%".
+    await seedMessage(tenant, conversation, { text: "Get 50% off now" });
+    // Contains "50" but NOT the literal "50%" — if the raw q were passed
+    // through unescaped, "%50%%" would incorrectly match this row too.
+    await seedMessage(tenant, conversation, { text: "Best 500 choice" });
 
-  const broadSearch = await messageRepository.search(tenant.id, { q: "asset" });
-  assert.equal(broadSearch.total, 0, "media-only messages with no payload.text should never match");
+    const broadSearch = await messageRepository.search(tenant.id, { q: "asset" });
+    assert.equal(broadSearch.total, 0, "media-only messages with no payload.text should never match");
 
-  const percentSearch = await messageRepository.search(tenant.id, { q: "50%" });
-  assert.equal(percentSearch.total, 1, "only the message with the literal '50%' substring should match");
-  assert.equal(percentSearch.items.length, 1);
-  assert.equal(percentSearch.items[0].text, "Get 50% off now");
-});
+    const percentSearch = await messageRepository.search(tenant.id, { q: "50%" });
+    assert.equal(percentSearch.total, 1, "only the message with the literal '50%' substring should match");
+    assert.equal(percentSearch.items.length, 1);
+    assert.equal(percentSearch.items[0].text, "Get 50% off now");
+  }
+);
 
 test("results are ordered newest-first, and limit/offset paging works", { skip }, async () => {
   const { tenant, channel } = await seedTenantWithChannel("Msg Search Paging");
@@ -156,7 +164,10 @@ test("results are ordered newest-first, and limit/offset paging works", { skip }
   const page1 = await messageRepository.search(tenant.id, { q: "pagetoken", limit: 2, offset: 0 });
   assert.equal(page1.total, 3, "total should reflect the full match count regardless of paging");
   assert.equal(page1.items.length, 2);
-  assert.deepEqual(page1.items.map((m) => m.id), [created[2].id, created[1].id]);
+  assert.deepEqual(
+    page1.items.map((m) => m.id),
+    [created[2].id, created[1].id]
+  );
 
   const page2 = await messageRepository.search(tenant.id, { q: "pagetoken", limit: 2, offset: 2 });
   assert.equal(page2.total, 3);

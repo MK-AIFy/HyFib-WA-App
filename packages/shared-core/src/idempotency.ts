@@ -46,13 +46,7 @@ export class IdempotencyStore {
  * without importing ioredis into shared-core.
  */
 export interface RedisSetNx {
-  set(
-    key: string,
-    value: string,
-    expiryMode: string,
-    time: number,
-    setMode: string
-  ): Promise<string | null>;
+  set(key: string, value: string, expiryMode: string, time: number, setMode: string): Promise<string | null>;
   del(key: string): Promise<number>;
 }
 
@@ -72,13 +66,7 @@ export class RedisIdempotencyStore {
   async isDuplicate(key: string): Promise<boolean> {
     // Returns "OK" when the key was newly set (first time = not a duplicate).
     // Returns null when the key already existed (duplicate).
-    const result = await this.redis.set(
-      `${this.keyPrefix}${key}`,
-      "1",
-      "EX",
-      this.ttlSeconds,
-      "NX"
-    );
+    const result = await this.redis.set(`${this.keyPrefix}${key}`, "1", "EX", this.ttlSeconds, "NX");
     return result === null;
   }
 

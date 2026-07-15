@@ -33,84 +33,92 @@ async function seedMessage(tenantName, contactPhone) {
   return { tenant: t, conversation, message };
 }
 
-test("upsertPending is idempotent on (tenant, metaMediaId) and preserves message_id via COALESCE", { skip }, async () => {
-  const { tenant, conversation, message } = await seedMessage("Media Tenant A", "+15551110001");
+test(
+  "upsertPending is idempotent on (tenant, metaMediaId) and preserves message_id via COALESCE",
+  { skip },
+  async () => {
+    const { tenant, conversation, message } = await seedMessage("Media Tenant A", "+15551110001");
 
-  const first = await mediaRepository.upsertPending(tenant.id, {
-    metaMediaId: "meta-media-1",
-    messageId: message.id,
-    conversationId: conversation.id,
-    mimeType: "image/jpeg"
-  });
-  assert.equal(first.status, "pending");
+    const first = await mediaRepository.upsertPending(tenant.id, {
+      metaMediaId: "meta-media-1",
+      messageId: message.id,
+      conversationId: conversation.id,
+      mimeType: "image/jpeg"
+    });
+    assert.equal(first.status, "pending");
 
-  // A second webhook referencing the same media id, but naively passing a
-  // different (e.g. null-ish placeholder) messageId — the original must win.
-  const otherMessage = await messageRepository.create(tenant.id, {
-    conversationId: conversation.id,
-    direction: "inbound",
-    status: "delivered",
-    payload: { type: "image", mediaId: "meta-media-1" }
-  });
-  const second = await mediaRepository.upsertPending(tenant.id, {
-    metaMediaId: "meta-media-1",
-    messageId: otherMessage.id,
-    conversationId: conversation.id,
-    mimeType: "image/jpeg"
-  });
+    // A second webhook referencing the same media id, but naively passing a
+    // different (e.g. null-ish placeholder) messageId — the original must win.
+    const otherMessage = await messageRepository.create(tenant.id, {
+      conversationId: conversation.id,
+      direction: "inbound",
+      status: "delivered",
+      payload: { type: "image", mediaId: "meta-media-1" }
+    });
+    const second = await mediaRepository.upsertPending(tenant.id, {
+      metaMediaId: "meta-media-1",
+      messageId: otherMessage.id,
+      conversationId: conversation.id,
+      mimeType: "image/jpeg"
+    });
 
-  assert.equal(second.id, first.id, "same (tenant, metaMediaId) must resolve to the same row");
+    assert.equal(second.id, first.id, "same (tenant, metaMediaId) must resolve to the same row");
 
-  const meta = await mediaRepository.getMeta(tenant.id, first.id);
-  assert.equal(meta.messageId, message.id, "message_id from the first insert must be preserved (COALESCE)");
-});
+    const meta = await mediaRepository.getMeta(tenant.id, first.id);
+    assert.equal(meta.messageId, message.id, "message_id from the first insert must be preserved (COALESCE)");
+  }
+);
 
-test("markStored round-trips bytes and transitions pending -> stored; recordError transitions -> failed", { skip }, async () => {
-  const { tenant, conversation, message } = await seedMessage("Media Tenant B", "+15551110002");
+test(
+  "markStored round-trips bytes and transitions pending -> stored; recordError transitions -> failed",
+  { skip },
+  async () => {
+    const { tenant, conversation, message } = await seedMessage("Media Tenant B", "+15551110002");
 
-  const created = await mediaRepository.upsertPending(tenant.id, {
-    metaMediaId: "meta-media-2",
-    messageId: message.id,
-    conversationId: conversation.id
-  });
-  assert.equal(created.status, "pending");
+    const created = await mediaRepository.upsertPending(tenant.id, {
+      metaMediaId: "meta-media-2",
+      messageId: message.id,
+      conversationId: conversation.id
+    });
+    assert.equal(created.status, "pending");
 
-  const bytes = Buffer.from("hello media bytes", "utf8");
-  const stored = await mediaRepository.markStored(tenant.id, created.id, {
-    bytes,
-    mimeType: "image/png",
-    fileSizeBytes: bytes.length
-  });
-  assert.equal(stored, true);
+    const bytes = Buffer.from("hello media bytes", "utf8");
+    const stored = await mediaRepository.markStored(tenant.id, created.id, {
+      bytes,
+      mimeType: "image/png",
+      fileSizeBytes: bytes.length
+    });
+    assert.equal(stored, true);
 
-  const serving = await mediaRepository.getForServing(tenant.id, created.id);
-  assert.equal(serving.status, "stored");
-  assert.ok(Buffer.isBuffer(serving.bytes));
-  assert.equal(serving.bytes.equals(bytes), true, "stored bytes must round-trip exactly");
-  assert.equal(serving.mimeType, "image/png");
-  assert.equal(serving.fileSizeBytes, bytes.length);
+    const serving = await mediaRepository.getForServing(tenant.id, created.id);
+    assert.equal(serving.status, "stored");
+    assert.ok(Buffer.isBuffer(serving.bytes));
+    assert.equal(serving.bytes.equals(bytes), true, "stored bytes must round-trip exactly");
+    assert.equal(serving.mimeType, "image/png");
+    assert.equal(serving.fileSizeBytes, bytes.length);
 
-  const meta = await mediaRepository.getMeta(tenant.id, created.id);
-  assert.equal(meta.status, "stored");
-  assert.equal(meta.error, undefined);
+    const meta = await mediaRepository.getMeta(tenant.id, created.id);
+    assert.equal(meta.status, "stored");
+    assert.equal(meta.error, undefined);
 
-  // A second, independent asset that fails instead of succeeding.
-  const failing = await mediaRepository.upsertPending(tenant.id, {
-    metaMediaId: "meta-media-2-fail",
-    messageId: message.id,
-    conversationId: conversation.id
-  });
-  const errored = await mediaRepository.recordError(tenant.id, failing.id, "Graph API 404: media not found");
-  assert.equal(errored, true);
+    // A second, independent asset that fails instead of succeeding.
+    const failing = await mediaRepository.upsertPending(tenant.id, {
+      metaMediaId: "meta-media-2-fail",
+      messageId: message.id,
+      conversationId: conversation.id
+    });
+    const errored = await mediaRepository.recordError(tenant.id, failing.id, "Graph API 404: media not found");
+    assert.equal(errored, true);
 
-  const failedMeta = await mediaRepository.getMeta(tenant.id, failing.id);
-  assert.equal(failedMeta.status, "failed");
-  assert.equal(failedMeta.error, "Graph API 404: media not found");
+    const failedMeta = await mediaRepository.getMeta(tenant.id, failing.id);
+    assert.equal(failedMeta.status, "failed");
+    assert.equal(failedMeta.error, "Graph API 404: media not found");
 
-  const failedServing = await mediaRepository.getForServing(tenant.id, failing.id);
-  assert.equal(failedServing.status, "failed");
-  assert.equal(failedServing.bytes, undefined, "a failed fetch must not have bytes");
-});
+    const failedServing = await mediaRepository.getForServing(tenant.id, failing.id);
+    assert.equal(failedServing.status, "failed");
+    assert.equal(failedServing.bytes, undefined, "a failed fetch must not have bytes");
+  }
+);
 
 test("RLS: a second tenant cannot read another tenant's media asset", { skip }, async () => {
   const owner = await seedMessage("Media Tenant Owner", "+15551110003");
@@ -137,33 +145,37 @@ test("RLS: a second tenant cannot read another tenant's media asset", { skip }, 
   assert.ok(metaAsOwner);
 });
 
-test("mergePayloadById merges keys into an existing message payload without clobbering other fields", { skip }, async () => {
-  const { tenant, conversation } = await seedMessage("Media Tenant Merge", "+15551110004");
-  const message = await messageRepository.create(tenant.id, {
-    conversationId: conversation.id,
-    direction: "inbound",
-    status: "delivered",
-    payload: { type: "image", mediaId: "meta-media-4", caption: "keep me" }
-  });
+test(
+  "mergePayloadById merges keys into an existing message payload without clobbering other fields",
+  { skip },
+  async () => {
+    const { tenant, conversation } = await seedMessage("Media Tenant Merge", "+15551110004");
+    const message = await messageRepository.create(tenant.id, {
+      conversationId: conversation.id,
+      direction: "inbound",
+      status: "delivered",
+      payload: { type: "image", mediaId: "meta-media-4", caption: "keep me" }
+    });
 
-  const merged = await messageRepository.mergePayloadById(tenant.id, message.id, {
-    mediaStatus: "stored",
-    mediaAssetId: "some-asset-id"
-  });
-  assert.equal(merged, true);
+    const merged = await messageRepository.mergePayloadById(tenant.id, message.id, {
+      mediaStatus: "stored",
+      mediaAssetId: "some-asset-id"
+    });
+    assert.equal(merged, true);
 
-  const thread = await messageRepository.listByConversation(tenant.id, conversation.id, { limit: 10 });
-  const target = thread.find((m) => m.id === message.id);
-  assert.equal(target.payload.caption, "keep me", "pre-existing fields must survive the merge");
-  assert.equal(target.payload.mediaId, "meta-media-4");
-  assert.equal(target.payload.mediaStatus, "stored");
-  assert.equal(target.payload.mediaAssetId, "some-asset-id");
+    const thread = await messageRepository.listByConversation(tenant.id, conversation.id, { limit: 10 });
+    const target = thread.find((m) => m.id === message.id);
+    assert.equal(target.payload.caption, "keep me", "pre-existing fields must survive the merge");
+    assert.equal(target.payload.mediaId, "meta-media-4");
+    assert.equal(target.payload.mediaStatus, "stored");
+    assert.equal(target.payload.mediaAssetId, "some-asset-id");
 
-  const missing = await messageRepository.mergePayloadById(tenant.id, "00000000-0000-0000-0000-000000000000", {
-    x: 1
-  });
-  assert.equal(missing, false, "merging a non-existent message id returns false");
-});
+    const missing = await messageRepository.mergePayloadById(tenant.id, "00000000-0000-0000-0000-000000000000", {
+      x: 1
+    });
+    assert.equal(missing, false, "merging a non-existent message id returns false");
+  }
+);
 
 test.after(async () => {
   if (!skip) {
