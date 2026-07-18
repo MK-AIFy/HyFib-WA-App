@@ -1,21 +1,21 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Archive, ArrowLeft, Pin } from "lucide-react";
 import type { Conversation } from "@hyfib/shared-core";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
-import { timeAgo } from "@/lib/format";
-import { mediaAssetOf } from "@/lib/media";
 import {
-  messageText,
   useArchiveConversation,
   useMessages,
   usePinConversation,
   useSetConversationState
 } from "@/hooks/use-conversations";
+import { useSessionWindow } from "@/hooks/use-session-window";
 import { Composer } from "./Composer";
-import { MediaAttachment } from "./MediaAttachment";
+import { MessageBubble } from "./MessageBubble";
+import { SessionWindowBanner } from "./SessionWindowBanner";
+import { TemplatePickerDialog } from "./composer/TemplatePickerDialog";
 
 const STATE_BADGE = { open: "green", pending: "yellow", closed: "gray" } as const;
 
@@ -25,6 +25,8 @@ export function ChatPane({ conversation, onBack }: { conversation: Conversation;
   const pinConversation = usePinConversation();
   const archiveConversation = useArchiveConversation();
   const endRef = useRef<HTMLDivElement>(null);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const windowOpen = useSessionWindow(conversation.lastInboundAt);
   const messages = data?.items ?? [];
   const isPinned = Boolean(conversation.pinnedAt);
   const isArchived = Boolean(conversation.archivedAt);
@@ -84,30 +86,16 @@ export function ChatPane({ conversation, onBack }: { conversation: Conversation;
           <p className="text-center text-sm text-muted-foreground">No messages yet</p>
         ) : (
           <div className="flex flex-col gap-2">
-            {messages.map((m) => {
-              const media = mediaAssetOf(m);
-              return (
-                <div
-                  key={m.id}
-                  className={cn(
-                    "max-w-[75%] rounded-lg px-3 py-2 text-sm",
-                    m.direction === "outbound" ? "self-end bg-primary/15 text-foreground" : "self-start bg-secondary"
-                  )}
-                >
-                  {media ? <MediaAttachment media={media} /> : null}
-                  <p className="whitespace-pre-wrap break-words">{messageText(m)}</p>
-                  <p className="mt-1 text-[10px] text-muted-foreground">
-                    {timeAgo(m.createdAt)}
-                    {m.direction === "outbound" ? ` · ${m.status}` : ""}
-                  </p>
-                </div>
-              );
-            })}
+            {messages.map((m) => (
+              <MessageBubble key={m.id} message={m} />
+            ))}
             <div ref={endRef} />
           </div>
         )}
       </div>
+      {!windowOpen ? <SessionWindowBanner onSendTemplate={() => setPickerOpen(true)} /> : null}
       <Composer conversationId={conversation.id} />
+      <TemplatePickerDialog conversationId={conversation.id} open={pickerOpen} onOpenChange={setPickerOpen} />
     </div>
   );
 }

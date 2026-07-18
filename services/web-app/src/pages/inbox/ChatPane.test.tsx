@@ -1,10 +1,19 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import type { Conversation } from "@hyfib/shared-core";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import type { Conversation, Template } from "@hyfib/shared-core";
 import { api } from "@/lib/api";
 import { ChatPane } from "./ChatPane";
+
+vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+
+beforeAll(() => {
+  window.HTMLElement.prototype.hasPointerCapture = vi.fn();
+  window.HTMLElement.prototype.setPointerCapture = vi.fn();
+  window.HTMLElement.prototype.releasePointerCapture = vi.fn();
+  window.HTMLElement.prototype.scrollIntoView = vi.fn();
+});
 
 function conv(overrides: Partial<Conversation> & { id: string }): Conversation {
   return {
@@ -19,13 +28,20 @@ function conv(overrides: Partial<Conversation> & { id: string }): Conversation {
   };
 }
 
-function renderChatPane(conversation: Conversation) {
+function tmpl(overrides: Partial<Template> & { id: string; name: string; body: string }): Template {
+  return { tenantId: "t1", category: "marketing", status: "approved", language: "en", ...overrides };
+}
+
+const HOUR = 60 * 60 * 1000;
+
+function renderChatPane(conversation: Conversation, templates: Template[] = []) {
   const getMock = vi.spyOn(api, "get").mockImplementation((path: string) => {
     if (path.includes("/messages")) return Promise.resolve({ items: [] });
+    if (path.includes("/templates")) return Promise.resolve({ items: templates });
     return Promise.reject(new Error(`Unhandled GET ${path}`));
   });
-  const postMock = vi.spyOn(api, "post").mockResolvedValue({ status: "ok" });
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const postMock = vi.spyOn(api, "post").mockResolvedValue({ status: "message_enqueued", kind: "template" });
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
   render(
     <QueryClientProvider client={client}>
       <ChatPane conversation={conversation} />
@@ -36,6 +52,7 @@ function renderChatPane(conversation: Conversation) {
 
 describe("ChatPane — pin/archive header controls", () => {
   afterEach(() => {
+    vi.clearAllMocks();
     vi.restoreAllMocks();
   });
 
@@ -90,5 +107,44 @@ describe("ChatPane — pin/archive header controls", () => {
 
     await waitFor(() => expect(postMock).toHaveBeenCalledWith("/api/v1/conversations/c1/pin", { pinned: true }));
     expect(postMock).not.toHaveBeenCalledWith("/api/v1/conversations/c1/archive", expect.anything());
+  });
+});
+
+describe("ChatPane — 24h session-window banner", () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+    vi.restoreAllMocks();
+  });
+
+  it("shows the banner when the last inbound is over 24h ago", async () => {
+    renderChatPane(conv({ id: "c1", lastInboundAt: new Date(Date.now() - 25 * HOUR).toISOString() }));
+    expect(await screen.findByRole("button", { name: "Send template" })).toBeInTheDocument();
+  });
+
+  it("hides the banner within the 24h window", () => {
+    renderChatPane(conv({ id: "c1", lastInboundAt: new Date(Date.now() - HOUR).toISOString() }));
+    expect(screen.queryByRole("button", { name: "Send template" })).toBeNull();
+  });
+
+  it("shows the banner when there is no inbound timestamp", async () => {
+    renderChatPane(conv({ id: "c1" }));
+    expect(await screen.findByRole("button", { name: "Send template" })).toBeInTheDocument();
+  });
+
+  it("opens the template picker from the banner and sends a template", async () => {
+    const { postMock } = renderChatPane(conv({ id: "c1" }), [tmpl({ id: "t1", name: "welcome", body: "Hello!" })]);
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole("button", { name: "Send template" }));
+    await user.click(await screen.findByRole("combobox", { name: "Template" }));
+    await user.click(await screen.findByRole("option", { name: "welcome (en)" }));
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() =>
+      expect(postMock).toHaveBeenCalledWith("/api/v1/conversations/c1/messages", {
+        kind: "template",
+        template: { templateName: "welcome", templateLanguage: "en" }
+      })
+    );
   });
 });
