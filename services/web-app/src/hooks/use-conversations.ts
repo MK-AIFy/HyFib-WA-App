@@ -11,6 +11,7 @@ import { api } from "@/lib/api";
 
 export type TemplateSendPayload = NonNullable<WhatsAppOutboundRequest["template"]>;
 export type LocationSendPayload = NonNullable<WhatsAppOutboundRequest["location"]>;
+export type MediaSendPayload = NonNullable<WhatsAppOutboundRequest["media"]>;
 
 /**
  * The set of outbound message kinds the composer can send, as a discriminated
@@ -24,7 +25,8 @@ export type SendMessageBody =
   | { kind: "template"; template: TemplateSendPayload }
   | { kind: "interactive"; interactive: WhatsAppInteractivePayload }
   | { kind: "location"; location: LocationSendPayload }
-  | { kind: "contacts"; contacts: WhatsAppContactCard[] };
+  | { kind: "contacts"; contacts: WhatsAppContactCard[] }
+  | { kind: "media"; media: MediaSendPayload };
 
 interface ListResponse<T> {
   items: T[];

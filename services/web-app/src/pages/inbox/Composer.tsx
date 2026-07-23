@@ -15,7 +15,7 @@ import { useTypingIndicator } from "@/hooks/use-typing-indicator";
 import { AttachMenu } from "./composer/AttachMenu";
 import { sendErrorMessage } from "./composer/send-error";
 
-export function Composer({ conversationId }: { conversationId: string }) {
+export function Composer({ conversationId, channelId }: { conversationId: string; channelId: string }) {
   const [text, setText] = useState("");
   const ref = useRef<HTMLTextAreaElement>(null);
   const send = useSendMessage(conversationId);
@@ -40,7 +40,7 @@ export function Composer({ conversationId }: { conversationId: string }) {
 
   return (
     <div className="flex items-end gap-2 border-t border-border p-3">
-      <AttachMenu conversationId={conversationId} />
+      <AttachMenu conversationId={conversationId} channelId={channelId} />
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <Button variant="ghost" size="icon" aria-label="Saved replies">

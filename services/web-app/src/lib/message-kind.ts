@@ -31,6 +31,30 @@ export function messageKind(m: Pick<Message, "payload">): string {
   return str(p.kind) ?? str(p.type) ?? "text";
 }
 
+export interface OutboundMediaInfo {
+  mediaType: string;
+  caption?: string;
+  filename?: string;
+}
+
+/**
+ * Reads an OUTBOUND persisted media send (`payload.media` carrying `mediaType`,
+ * as written by the worker's send path). Inbound Meta media metadata lives
+ * under the same `media` key but with `mimeType`/`id` instead of `mediaType` —
+ * that shape is owned by mediaAssetOf/MediaAttachment (stored-asset rendering),
+ * so it is deliberately not matched here.
+ */
+export function outboundMediaOf(payload: Payload): OutboundMediaInfo | undefined {
+  const raw = payload.media;
+  if (!raw || typeof raw !== "object") return undefined;
+  const m = raw as Record<string, unknown>;
+  if (typeof m.mediaType !== "string") return undefined;
+  const info: OutboundMediaInfo = { mediaType: m.mediaType };
+  if (typeof m.caption === "string") info.caption = m.caption;
+  if (typeof m.filename === "string") info.filename = m.filename;
+  return info;
+}
+
 export interface LocationInfo {
   latitude: number;
   longitude: number;

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { initials, timeAgo, titleCase } from "./format";
+import { formatBytes, initials, timeAgo, titleCase } from "./format";
 
 describe("format", () => {
   it("initials from a two-word name", () => {
@@ -16,5 +16,12 @@ describe("format", () => {
   });
   it("titleCase converts snake_case", () => {
     expect(titleCase("marketing_manager")).toBe("Marketing Manager");
+  });
+  it("formatBytes renders B, KB and MB with one decimal above KB", () => {
+    expect(formatBytes(512)).toBe("512 B");
+    expect(formatBytes(2048)).toBe("2 KB");
+    expect(formatBytes(1536)).toBe("1.5 KB");
+    expect(formatBytes(5 * 1024 * 1024)).toBe("5 MB");
+    expect(formatBytes(1_572_864)).toBe("1.5 MB");
   });
 });
