@@ -1,0 +1,28 @@
+# HyFib WhatsApp platform — mirrors infra/nginx/nginx.conf routing:
+# /api/*, /auth/*, /health, /r/* → app-server gateway; everything else → SPA.
+# /internal/* is deliberately NOT proxied (service-to-service only).
+# Caddy provisions and renews TLS certificates automatically.
+__DOMAIN__ {
+	encode zstd gzip
+
+	# Security headers on every response — parity with nginx.conf's add_header
+	# set; without these the SPA ships frameable and without CSP/HSTS.
+	header {
+		Strict-Transport-Security "max-age=63072000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'"
+	}
+
+	@backend path /api/* /auth/* /health /r/*
+	handle @backend {
+		reverse_proxy 127.0.0.1:8080
+	}
+
+	handle {
+		root * /opt/hyfib/app/services/web-app/dist
+		try_files {path} /index.html
+		file_server
+	}
+}

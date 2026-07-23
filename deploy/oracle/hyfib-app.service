@@ -1,0 +1,20 @@
+[Unit]
+Description=HyFib WhatsApp platform (modular monolith app-server)
+After=network-online.target postgresql.service redis-server.service
+Wants=network-online.target
+
+[Service]
+User=hyfib
+Group=hyfib
+EnvironmentFile=/etc/hyfib/hyfib.env
+WorkingDirectory=/opt/hyfib/app
+ExecStart=/usr/bin/node services/app-server/dist/main.js
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
