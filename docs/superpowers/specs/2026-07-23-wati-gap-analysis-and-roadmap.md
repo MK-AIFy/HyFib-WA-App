@@ -98,13 +98,15 @@ analytics both depend on it.
 **Design:** mint shortlinks at campaign-dispatch time in `notification-worker`.
 
 1. When personalizing a recipient's template variables, any variable value that
-   is an `http(s)` URL and the campaign has click tracking enabled gets
-   replaced with `${PUBLIC_BASE_URL}/r/${token}` after inserting a
-   `link_clicks` row (token → original URL, campaignId, contactId).
-2. Token: 22-char base62 from `crypto.randomBytes` (no PII, unguessable).
-3. Config: `PUBLIC_BASE_URL` already available to services via @hyfib/config
-   (verify; add if absent). If unset → skip minting (log once), never break sends.
-4. Minting failures must never fail the send: log + fall back to the original URL.
+   is entirely an `http(s)` URL gets replaced with
+   `${platformBaseUrl}/r/${token}` after inserting a `link_clicks` row
+   (token → original URL, campaignId, contactId).
+2. Token: 22-char base64url from `crypto.randomBytes(16)` (no PII, unguessable).
+3. Config: gated behind new opt-in `LINK_TRACKING_ENABLED` env (default false —
+   zero behavior change for existing deployments); shortlink prefix reuses the
+   existing `PLATFORM_BASE_URL`. Per-campaign toggle arrives with the Phase B UI.
+4. Minting failures must never fail the send: `link_tracking_mint_failed` warn
+   log + fall back to the original URL.
 5. The existing `/r/:token` 302 + click recording + `GET
    /api/v1/analytics/link-clicks` complete the loop unchanged.
 

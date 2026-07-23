@@ -27,6 +27,7 @@ export interface PlatformConfig {
   nodeEnv: string;
   logLevel: string;
   platformBaseUrl: string;
+  linkTrackingEnabled: boolean;
   orgTenantId: string;
   orgName: string;
   database: DatabaseConfig;
@@ -124,6 +125,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PlatformConfig
     nodeEnv,
     logLevel: env.LOG_LEVEL ?? "info",
     platformBaseUrl: env.PLATFORM_BASE_URL ?? "http://localhost:8080",
+    linkTrackingEnabled: env.LINK_TRACKING_ENABLED === "true",
     orgTenantId: env.ORG_TENANT_ID ?? "",
     orgName: env.ORG_NAME ?? "",
     database: {

@@ -19,6 +19,7 @@ import {
   contactRepository,
   conversationRepository,
   healthCheck,
+  linkClickRepository,
   mediaRepository,
   messageRepository,
   outboxRepository,
@@ -57,6 +58,7 @@ import {
   DISPATCH_CLAIM_TTL_SECONDS
 } from "./outbound.js";
 import { resolveVariables } from "./personalize.js";
+import { mintTrackedParameters } from "./click-tracking.js";
 import { matchAutoReply } from "./autoreply.js";
 import { evaluateAutomationRules } from "./automation.js";
 import { processMediaFetch } from "./media.js";
@@ -429,7 +431,7 @@ async function handleCampaignRun(event: EventEnvelope): Promise<void> {
         continue;
       }
 
-      const parameters = resolveVariables(run.variableMapping, {
+      let parameters = resolveVariables(run.variableMapping, {
         firstName: contact.firstName,
         lastName: contact.lastName,
         phoneE164: contact.phoneE164,
@@ -437,6 +439,26 @@ async function handleCampaignRun(event: EventEnvelope): Promise<void> {
         tags: contact.tags ?? [],
         timezone: contact.timezone
       });
+
+      if (config.linkTrackingEnabled) {
+        parameters = await mintTrackedParameters(parameters, {
+          baseUrl: config.platformBaseUrl,
+          createLink: (token, destination) =>
+            linkClickRepository.create(run.tenantId, {
+              token,
+              destination,
+              campaignId: run.campaignId,
+              contactId: contact.id
+            }),
+          onError: (err, destination) =>
+            logger.warn("link_tracking_mint_failed", {
+              campaignId: run.campaignId,
+              contactId: contact.id,
+              destination,
+              error: err instanceof Error ? err.message : String(err)
+            })
+        });
+      }
 
       // Rate pacing: acquire a slot from the token bucket; waits if needed.
       await acquireRateLimit(redis, rateScopeKey, ratePerMinute).catch(() => undefined);
