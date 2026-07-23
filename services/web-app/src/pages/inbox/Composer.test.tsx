@@ -23,7 +23,7 @@ function renderComposer(sendRejects = false) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
   render(
     <QueryClientProvider client={client}>
-      <Composer conversationId="c1" />
+      <Composer conversationId="c1" channelId="ch1" />
     </QueryClientProvider>
   );
   return { postMock, user: userEvent.setup() };
@@ -67,5 +67,12 @@ describe("Composer", () => {
     expect(screen.getByRole("menuitem", { name: "Contact card" })).toBeInTheDocument();
     await user.click(screen.getByRole("menuitem", { name: "Location" }));
     expect(await screen.findByRole("dialog")).toHaveTextContent("Send a location");
+  });
+
+  it("offers Photo or file in the attach menu and launches the media dialog", async () => {
+    const { user } = renderComposer();
+    await user.click(screen.getByRole("button", { name: "Attach" }));
+    await user.click(await screen.findByRole("menuitem", { name: "Photo or file" }));
+    expect(await screen.findByRole("dialog")).toHaveTextContent("Send a photo or file");
   });
 });

@@ -17,3 +17,17 @@ export function sendErrorMessage(e: unknown): string {
   }
   return "Failed to send. Try again.";
 }
+
+/**
+ * Media sends add an upload leg before the send, so the gateway's
+ * upload-specific error codes get friendlier wording here; everything else
+ * falls through to the shared mapping above.
+ */
+export function mediaSendErrorMessage(e: unknown): string {
+  if (e instanceof ApiError) {
+    if (e.message === "media_too_large") return "File is larger than 16 MB";
+    if (e.message === "media_upload_failed") return "WhatsApp rejected this file. Try a different format.";
+    if (e.message === "meta_adapter_unavailable") return "Upload service unavailable. Try again shortly.";
+  }
+  return sendErrorMessage(e);
+}

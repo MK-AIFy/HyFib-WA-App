@@ -1,4 +1,4 @@
-import { MapPin } from "lucide-react";
+import { AudioLines, FileText, Film, Image as ImageIcon, MapPin, Sticker } from "lucide-react";
 import type { Message, Template } from "@hyfib/shared-core";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
@@ -12,6 +12,7 @@ import {
   locationOf,
   mapsUrl,
   messageKind,
+  outboundMediaOf,
   safeHttpUrl,
   substituteTemplate,
   templateOf,
@@ -19,6 +20,7 @@ import {
   type InteractivePrompt,
   type InteractiveReply,
   type LocationInfo,
+  type OutboundMediaInfo,
   type TemplateInfo
 } from "@/lib/message-kind";
 import { useList } from "@/hooks/use-resource";
@@ -33,7 +35,10 @@ import { MediaAttachment } from "./MediaAttachment";
  * because a 24h-window rejection surfaces ONLY here (async, never as a send 4xx).
  */
 export function MessageBubble({ message }: { message: Message }) {
-  const media = mediaAssetOf(message);
+  // An outbound media SEND ("media" kind) references bytes that live at Meta —
+  // no local asset will ever be linked, so routing it through MediaAttachment
+  // would show "Attachment processing…" forever. MessageBody owns that kind.
+  const media = messageKind(message) === "media" ? undefined : mediaAssetOf(message);
   const outbound = message.direction === "outbound";
   const failed = outbound && message.status === "failed";
 
@@ -85,8 +90,35 @@ function MessageBody({ message }: { message: Message }) {
       if (t) return <TemplateBody t={t} />;
       break;
     }
+    case "media": {
+      const m = outboundMediaOf(payload);
+      if (m) return <OutboundMediaBody media={m} />;
+      break;
+    }
   }
   return <p className="whitespace-pre-wrap break-words">{messageText(message)}</p>;
+}
+
+const DOCUMENT_MEDIA_LABEL = { label: "Document", Icon: FileText };
+const MEDIA_TYPE_LABELS: Record<string, { label: string; Icon: typeof FileText }> = {
+  image: { label: "Photo", Icon: ImageIcon },
+  video: { label: "Video", Icon: Film },
+  audio: { label: "Audio", Icon: AudioLines },
+  document: DOCUMENT_MEDIA_LABEL,
+  sticker: { label: "Sticker", Icon: Sticker }
+};
+
+function OutboundMediaBody({ media }: { media: OutboundMediaInfo }) {
+  const { label, Icon } = MEDIA_TYPE_LABELS[media.mediaType] ?? DOCUMENT_MEDIA_LABEL;
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-center gap-1.5">
+        <Icon className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+        <span className="font-medium break-words">{media.filename ?? label}</span>
+      </div>
+      {media.caption ? <p className="whitespace-pre-wrap break-words">{media.caption}</p> : null}
+    </div>
+  );
 }
 
 function LocationBody({ loc }: { loc: LocationInfo }) {

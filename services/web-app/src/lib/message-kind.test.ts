@@ -6,6 +6,7 @@ import {
   locationOf,
   mapsUrl,
   messageKind,
+  outboundMediaOf,
   placeholderCount,
   safeHttpUrl,
   substituteTemplate,
@@ -54,6 +55,25 @@ describe("locationOf", () => {
     expect(locationOf({ location: { longitude: 10 } })).toBeUndefined();
     expect(locationOf({ location: { latitude: "abc", longitude: 10 } })).toBeUndefined();
     expect(locationOf({})).toBeUndefined();
+  });
+});
+
+describe("outboundMediaOf", () => {
+  it("reads the outbound send shape (mediaType present)", () => {
+    expect(
+      outboundMediaOf({
+        kind: "media",
+        media: { mediaType: "document", mediaId: "M1", caption: "Q3", filename: "q3.pdf" }
+      })
+    ).toEqual({ mediaType: "document", caption: "Q3", filename: "q3.pdf" });
+  });
+
+  it("ignores inbound Meta media metadata (mimeType shape, no mediaType)", () => {
+    expect(outboundMediaOf({ type: "image", media: { id: "wamid.1", mimeType: "image/jpeg" } })).toBeUndefined();
+  });
+
+  it("returns undefined when there is no media at all", () => {
+    expect(outboundMediaOf({ kind: "text", text: "hi" })).toBeUndefined();
   });
 });
 

@@ -62,6 +62,35 @@ async function request<T>(
   return data as T;
 }
 
+/**
+ * Raw-bytes POST for file uploads (the gateway's media route reads the body as
+ * the file itself, with Content-Type carrying the file's MIME type — never
+ * JSON/multipart). Response handling mirrors request().
+ */
+async function requestBinary<T>(path: string, body: Blob, contentType: string): Promise<T> {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "content-type": contentType, "x-requested-with": "fetch" },
+    body
+  });
+
+  if (res.status === 401) {
+    clearSession();
+    unauthorizedHandler?.();
+    throw new ApiError(401, "Not authenticated");
+  }
+
+  const text = await res.text();
+  const data = text ? (JSON.parse(text) as unknown) : undefined;
+
+  if (!res.ok) {
+    const errBody = (data ?? {}) as { error?: string; detail?: string };
+    throw new ApiError(res.status, errBody.error ?? `Request failed (${res.status})`, errBody.detail);
+  }
+
+  return data as T;
+}
+
 async function requestBlob(path: string): Promise<Blob> {
   const headers: Record<string, string> = { "x-requested-with": "fetch" };
 
@@ -96,6 +125,8 @@ export const api = {
   get: <T>(path: string, extraHeaders?: Record<string, string>): Promise<T> =>
     request<T>("GET", path, undefined, extraHeaders),
   post: <T>(path: string, body?: unknown): Promise<T> => request<T>("POST", path, body),
+  postBinary: <T>(path: string, body: Blob, contentType: string): Promise<T> =>
+    requestBinary<T>(path, body, contentType),
   patch: <T>(path: string, body?: unknown): Promise<T> => request<T>("PATCH", path, body),
   put: <T>(path: string, body?: unknown): Promise<T> => request<T>("PUT", path, body),
   del: <T>(path: string): Promise<T> => request<T>("DELETE", path),

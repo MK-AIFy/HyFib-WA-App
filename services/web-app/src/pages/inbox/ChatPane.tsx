@@ -94,7 +94,7 @@ export function ChatPane({ conversation, onBack }: { conversation: Conversation;
         )}
       </div>
       {!windowOpen ? <SessionWindowBanner onSendTemplate={() => setPickerOpen(true)} /> : null}
-      <Composer conversationId={conversation.id} />
+      <Composer conversationId={conversation.id} channelId={conversation.channelId} />
       <TemplatePickerDialog conversationId={conversation.id} open={pickerOpen} onOpenChange={setPickerOpen} />
     </div>
   );

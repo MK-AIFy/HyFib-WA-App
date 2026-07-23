@@ -44,6 +44,28 @@ function renderBubble(message: Message, templates: Template[] = []) {
 describe("MessageBubble", () => {
   afterEach(() => vi.restoreAllMocks());
 
+  it("renders an outbound media send as filename + caption, never the inbound 'processing' card", () => {
+    renderBubble(
+      msg({
+        id: "mm1",
+        payload: {
+          kind: "media",
+          media: { mediaType: "document", mediaId: "M1", caption: "Q3 report", filename: "q3.pdf" }
+        }
+      })
+    );
+    expect(screen.getByText("q3.pdf")).toBeInTheDocument();
+    expect(screen.getByText("Q3 report")).toBeInTheDocument();
+    expect(screen.queryByText("Attachment processing…")).not.toBeInTheDocument();
+    expect(screen.queryByText("[media]")).not.toBeInTheDocument();
+  });
+
+  it("labels an outbound photo send by media type when it has no filename", () => {
+    renderBubble(msg({ id: "mm2", payload: { kind: "media", media: { mediaType: "image", mediaId: "M2" } } }));
+    expect(screen.getByText("Photo")).toBeInTheDocument();
+    expect(screen.queryByText("Attachment processing…")).not.toBeInTheDocument();
+  });
+
   it("renders an outbound location with name, address, and a safe Open in maps link", () => {
     renderBubble(
       msg({

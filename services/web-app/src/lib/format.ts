@@ -25,6 +25,14 @@ export function initials(name?: string, phone?: string): string {
   return (phone ?? "?").slice(-2);
 }
 
+/** Human-readable file size: whole bytes, else KB/MB with at most one decimal. */
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${Number(kb.toFixed(1))} KB`;
+  return `${Number((kb / 1024).toFixed(1))} MB`;
+}
+
 export function titleCase(value: string): string {
   return value.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 }
