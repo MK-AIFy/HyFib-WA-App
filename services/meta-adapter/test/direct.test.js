@@ -1,6 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { sendTemplateDirect, markReadDirect, sendTypingIndicatorDirect, metaDispatch } from "../dist/index.js";
+import {
+  sendTemplateDirect,
+  markReadDirect,
+  sendTypingIndicatorDirect,
+  metaDispatch,
+  uploadMediaDirect
+} from "../dist/index.js";
 
 test("sendTemplateDirect returns 400 when required fields are missing", async () => {
   const res = await sendTemplateDirect({ phoneNumberId: "PNID" }, "req-1");
@@ -88,4 +94,46 @@ test("metaDispatch returns 404 for an unknown endpoint", async () => {
     "req-x"
   );
   assert.equal(res.status, 404);
+});
+
+// uploadMediaDirect is the in-process media upload used by the gateway in the
+// monolith (the standalone HTTP route delegates to it). Each guard returns 400
+// before any Graph API call, so no network/token is required.
+
+test("uploadMediaDirect returns 400 for an empty-string phoneNumberId (?? keeps it; no env fallback applies)", async () => {
+  const res = await uploadMediaDirect({ buffer: Buffer.from("x"), mimeType: "image/png", phoneNumberId: "" }, "req-m1");
+  assert.equal(res.status, 400);
+  assert.match(res.body.error, /phoneNumberId/);
+});
+
+test("uploadMediaDirect returns 400 when mimeType is missing", async () => {
+  const res = await uploadMediaDirect({ buffer: Buffer.from("x"), mimeType: "", phoneNumberId: "PN" }, "req-m2");
+  assert.equal(res.status, 400);
+  assert.match(res.body.error, /MIME type/);
+});
+
+test("uploadMediaDirect returns 400 for a JSON mimeType (bytes must be raw media)", async () => {
+  const res = await uploadMediaDirect(
+    { buffer: Buffer.from("{}"), mimeType: "application/json", phoneNumberId: "PN" },
+    "req-m3"
+  );
+  assert.equal(res.status, 400);
+  assert.match(res.body.error, /MIME type/);
+});
+
+test("uploadMediaDirect returns 400 when the buffer is empty", async () => {
+  const res = await uploadMediaDirect(
+    { buffer: Buffer.alloc(0), mimeType: "image/png", phoneNumberId: "PN" },
+    "req-m4"
+  );
+  assert.equal(res.status, 400);
+  assert.match(res.body.error, /file bytes/);
+});
+
+test("uploadMediaDirect returns 413 when the buffer exceeds the 16MB cap (no Graph call)", async () => {
+  const oversized = Buffer.alloc(16 * 1024 * 1024 + 1);
+  const res = await uploadMediaDirect({ buffer: oversized, mimeType: "image/png", phoneNumberId: "PN" }, "req-m5");
+  assert.equal(res.status, 413);
+  assert.equal(res.body.error, "media_too_large");
+  assert.equal(res.body.maxBytes, 16 * 1024 * 1024);
 });

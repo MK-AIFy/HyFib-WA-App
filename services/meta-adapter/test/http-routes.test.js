@@ -78,3 +78,36 @@ test("send-interactive cta_url requires ctaDisplayText even when ctaUrl is prese
   assert.equal(res.status, 400);
   assert.match(res.body.error, /ctaDisplayText/);
 });
+
+test("media upload is registered and rejects a JSON content-type (400, not 404)", async () => {
+  const response = await fetch(`${baseUrl}/internal/v1/whatsapp/media?phoneNumberId=PN-1`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({})
+  });
+  assert.equal(response.status, 400);
+  const body = await response.json();
+  assert.match(body.error, /MIME type/);
+});
+
+test("media upload with an empty body returns 400 (file bytes required, proving route→direct delegation)", async () => {
+  const response = await fetch(`${baseUrl}/internal/v1/whatsapp/media?phoneNumberId=PN-1`, {
+    method: "POST",
+    headers: { "Content-Type": "image/png" }
+  });
+  assert.equal(response.status, 400);
+  const body = await response.json();
+  assert.match(body.error, /file bytes/);
+});
+
+test("media upload over the 16MB cap receives a delivered 413 with maxBytes (socket not destroyed first)", async () => {
+  const response = await fetch(`${baseUrl}/internal/v1/whatsapp/media?phoneNumberId=PN-1`, {
+    method: "POST",
+    headers: { "Content-Type": "image/png" },
+    body: Buffer.alloc(16 * 1024 * 1024 + 1)
+  });
+  assert.equal(response.status, 413);
+  const body = await response.json();
+  assert.equal(body.error, "media_too_large");
+  assert.equal(body.maxBytes, 16 * 1024 * 1024);
+});

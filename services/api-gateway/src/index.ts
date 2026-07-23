@@ -95,6 +95,7 @@ import {
 import { filterSendableContacts } from "./campaign.js";
 import { canCreateContact, canCreateOrder } from "./authorization.js";
 import { buildMediaHeaders } from "./media-headers.js";
+import { mapMediaUploadProxyResult } from "./media-upload.js";
 import { SseHub } from "./sse-hub.js";
 import { parseCsv, serializeContactsCsv, extractMultipartFile } from "./csv.js";
 import { resolveOrgTenant } from "./single-org.js";
@@ -397,6 +398,51 @@ async function defaultSendTypingIndicatorProxy(params: {
 }
 
 let sendTypingIndicatorProxy: SendTypingIndicatorProxy = defaultSendTypingIndicatorProxy;
+
+/**
+ * Media upload crosses to the meta-adapter to exchange raw file bytes for a
+ * reusable Meta media id. Injectable so the monolith swaps in an in-process
+ * uploadMediaDirect call instead of an HTTP hop.
+ */
+export type UploadMediaProxy = (params: {
+  phoneNumberId: string;
+  tenantId: string;
+  requestId: string;
+  buffer: Buffer;
+  mimeType: string;
+  filename?: string;
+  accessToken?: string;
+}) => Promise<{ status: number; body: Record<string, unknown> }>;
+
+async function defaultUploadMediaProxy(params: {
+  phoneNumberId: string;
+  tenantId: string;
+  requestId: string;
+  buffer: Buffer;
+  mimeType: string;
+  filename?: string;
+  accessToken?: string;
+}): Promise<{ status: number; body: Record<string, unknown> }> {
+  const uploadUrl = new URL(`${config.metaAdapterUrl}/internal/v1/whatsapp/media`);
+  uploadUrl.searchParams.set("phoneNumberId", params.phoneNumberId);
+  if (params.filename) uploadUrl.searchParams.set("filename", params.filename);
+  const upstream = await fetch(uploadUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": params.mimeType,
+      "x-tenant-id": params.tenantId,
+      "x-request-id": params.requestId,
+      "x-internal-secret": config.internalServiceSecret,
+      ...(params.accessToken ? { "x-access-token": params.accessToken } : {})
+    },
+    body: new Uint8Array(params.buffer),
+    signal: AbortSignal.timeout(30_000)
+  });
+  const body = (await upstream.json()) as Record<string, unknown>;
+  return { status: upstream.status, body };
+}
+
+let uploadMediaProxy: UploadMediaProxy = defaultUploadMediaProxy;
 
 const E164 = /^\+[1-9]\d{7,14}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -2104,43 +2150,56 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     let buffer: Buffer;
     try {
       buffer = await readBinaryBody(req, MEDIA_UPLOAD_MAX_BYTES);
-    } catch {
-      sendJson(res, 413, { error: "media_too_large", maxBytes: MEDIA_UPLOAD_MAX_BYTES });
+    } catch (error) {
+      if ((error as { code?: string }).code === "BODY_TOO_LARGE") {
+        // The socket is intact (readBinaryBody pauses instead of destroying),
+        // so the 413 actually reaches the client; tear down afterwards.
+        sendJson(res, 413, { error: "media_too_large", maxBytes: MEDIA_UPLOAD_MAX_BYTES });
+        res.once("finish", () => req.destroy());
+      } else {
+        req.destroy();
+      }
       return;
     }
     if (buffer.length === 0) {
       sendJson(res, 400, { error: "Request body (file bytes) is required" });
       return;
     }
-    const uploadUrl = new URL(`${config.metaAdapterUrl}/internal/v1/whatsapp/media`);
-    uploadUrl.searchParams.set("phoneNumberId", channel.phoneNumberId);
-    const filename = parseQuery(req.url).get("filename");
-    if (filename) uploadUrl.searchParams.set("filename", filename);
     try {
-      const response = await fetch(uploadUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": mimeType,
-          "x-tenant-id": tenantId,
-          "x-request-id": randomUUID(),
-          "x-internal-secret": config.internalServiceSecret,
-          ...(channel.accessToken ? { "x-access-token": channel.accessToken } : {})
-        },
-        body: new Uint8Array(buffer),
-        signal: AbortSignal.timeout(30_000)
+      const { status, body } = await uploadMediaProxy({
+        phoneNumberId: channel.phoneNumberId,
+        tenantId,
+        requestId: ctx.requestId,
+        buffer,
+        mimeType,
+        // `||` coerces an empty-string filename/token to absent, matching the
+        // adapter's own defaults instead of forwarding "" to Meta.
+        filename: parseQuery(req.url).get("filename") || undefined,
+        accessToken: channel.accessToken || undefined
       });
-      const body = (await response.json()) as { mediaId?: string; error?: string };
-      if (!response.ok || !body.mediaId) {
-        sendJson(res, 502, { error: "media_upload_failed", detail: body.error ?? "meta error" });
+      const outcome = mapMediaUploadProxyResult(status, body);
+      if (outcome.kind !== "uploaded") {
+        sendJson(res, outcome.status, outcome.body);
         return;
       }
-      await audit(tenantId, auth, {
-        action: "channel.media.uploaded",
-        resourceType: "WhatsAppChannel",
-        resourceId: channelId,
-        payload: { mimeType, bytes: buffer.length, mediaId: body.mediaId }
-      });
-      sendJson(res, 201, { mediaId: body.mediaId });
+      // An audit failure must not discard an upload that already succeeded at
+      // Meta (the client would retry and orphan another media id); log loudly
+      // and still answer 201.
+      try {
+        await audit(tenantId, auth, {
+          action: "channel.media.uploaded",
+          resourceType: "WhatsAppChannel",
+          resourceId: channelId,
+          payload: { mimeType, bytes: buffer.length, mediaId: outcome.mediaId }
+        });
+      } catch (auditError) {
+        logger.error("media_upload_audit_failed", {
+          requestId: ctx.requestId,
+          channelId,
+          error: auditError instanceof Error ? auditError.message : String(auditError)
+        });
+      }
+      sendJson(res, 201, { mediaId: outcome.mediaId });
     } catch (error) {
       sendJson(res, 503, {
         error: "meta_adapter_unavailable",
@@ -2352,8 +2411,13 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     let csvBuffer: Buffer;
     try {
       csvBuffer = await readBinaryBody(req, CSV_UPLOAD_MAX_BYTES);
-    } catch {
-      sendJson(res, 413, { error: "csv_too_large", maxBytes: CSV_UPLOAD_MAX_BYTES });
+    } catch (error) {
+      if ((error as { code?: string }).code === "BODY_TOO_LARGE") {
+        sendJson(res, 413, { error: "csv_too_large", maxBytes: CSV_UPLOAD_MAX_BYTES });
+        res.once("finish", () => req.destroy());
+      } else {
+        req.destroy();
+      }
       return;
     }
     if (csvBuffer.length === 0) {
@@ -3596,6 +3660,8 @@ export interface GatewayDeps {
   proxyAi?: AiProxy;
   /** Direct in-process typing-indicator send (no HTTP hop to meta-adapter). */
   proxySendTypingIndicator?: SendTypingIndicatorProxy;
+  /** Direct in-process media upload (no HTTP hop to meta-adapter). */
+  proxyUploadMedia?: UploadMediaProxy;
 }
 
 export interface GatewayModule {
@@ -3631,6 +3697,9 @@ export function createGatewayHandler(deps: GatewayDeps = {}): GatewayModule {
   if (deps.proxySendTypingIndicator) {
     sendTypingIndicatorProxy = deps.proxySendTypingIndicator;
   }
+  // Always assign (with the default as fallback) so a later handler instance
+  // created without the dep does not inherit a previous instance's injection.
+  uploadMediaProxy = deps.proxyUploadMedia ?? defaultUploadMediaProxy;
   registerSseForwarding();
   return {
     handle,

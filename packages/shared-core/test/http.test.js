@@ -32,3 +32,23 @@ test("readBinaryBody resolves empty for an empty body", async () => {
   const result = await pending;
   assert.equal(result.length, 0);
 });
+
+test("readBinaryBody rejects over-limit bodies with code BODY_TOO_LARGE without destroying the stream", async () => {
+  const stream = new PassThrough();
+  const pending = readBinaryBody(stream, 8);
+  stream.write(Buffer.alloc(9, 1));
+
+  await assert.rejects(pending, (err) => err.code === "BODY_TOO_LARGE");
+  // The socket must stay writable so the caller can still deliver a 413
+  // response; the caller is responsible for tearing the request down after.
+  assert.equal(stream.destroyed, false);
+});
+
+test("readBinaryBody propagates stream errors without the BODY_TOO_LARGE code", async () => {
+  const stream = new PassThrough();
+  const pending = readBinaryBody(stream, 8);
+  const boom = new Error("connection reset");
+  stream.emit("error", boom);
+
+  await assert.rejects(pending, (err) => err === boom && err.code === undefined);
+});

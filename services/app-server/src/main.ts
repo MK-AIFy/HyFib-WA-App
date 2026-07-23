@@ -20,12 +20,13 @@ import {
   type ReportsOverviewProxy,
   type UsageProxy,
   type AiProxy,
-  type SendTypingIndicatorProxy
+  type SendTypingIndicatorProxy,
+  type UploadMediaProxy
 } from "@hyfib/api-gateway";
 import { processForwardedWebhook } from "@hyfib/webhook-ingestor";
 import { createDurableWebhookBus } from "./webhook-outbox-bus.js";
 import { createIngestWebhookProxy } from "./ingest-proxy.js";
-import { fetchMediaDirect, metaDispatch } from "@hyfib/meta-adapter";
+import { fetchMediaDirect, metaDispatch, uploadMediaDirect } from "@hyfib/meta-adapter";
 import { registerWorkerConsumers, type WorkerMetaClient } from "@hyfib/notification-worker";
 import { getReportsOverview } from "@hyfib/reporting-service";
 import { getUsage } from "@hyfib/billing-usage-service";
@@ -43,6 +44,8 @@ export interface AppServerDeps {
   proxyAi?: AiProxy;
   /** Direct in-process typing-indicator send; when omitted the gateway proxies over HTTP. */
   proxySendTypingIndicator?: SendTypingIndicatorProxy;
+  /** Direct in-process media upload; when omitted the gateway proxies over HTTP. */
+  proxyUploadMedia?: UploadMediaProxy;
 }
 
 export interface AppServer {
@@ -65,7 +68,8 @@ export function createAppServer(deps: AppServerDeps): AppServer {
     proxyReportsOverview: deps.proxyReportsOverview,
     proxyUsage: deps.proxyUsage,
     proxyAi: deps.proxyAi,
-    proxySendTypingIndicator: deps.proxySendTypingIndicator
+    proxySendTypingIndicator: deps.proxySendTypingIndicator,
+    proxyUploadMedia: deps.proxyUploadMedia
   });
 
   const server = createServer((req, res) => {
@@ -141,7 +145,8 @@ async function main(): Promise<void> {
     proxySendTypingIndicator: async (params) => {
       const { status, body } = await metaDispatch("/internal/v1/whatsapp/send-typing", params, randomUUID());
       return { status, body: body as Record<string, unknown> };
-    }
+    },
+    proxyUploadMedia: async (params) => uploadMediaDirect(params, params.requestId)
   });
 
   // Register worker consumers on the shared bus with a direct in-process meta

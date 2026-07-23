@@ -73,8 +73,14 @@ export async function readBinaryBody(req: IncomingMessage, maxBytes: number): Pr
     req.on("data", (chunk: Buffer) => {
       total += chunk.length;
       if (total > maxBytes) {
-        fail(new Error("Request body too large"));
-        req.destroy();
+        // Stop consuming but leave the socket intact so the caller can still
+        // write a 413 response; destroying here would turn every oversized
+        // upload into a client-side ECONNRESET with no status or body. The
+        // caller tears the request down after replying.
+        req.pause();
+        const error = new Error("Request body too large") as Error & { code: string };
+        error.code = "BODY_TOO_LARGE";
+        fail(error);
         return;
       }
       chunks.push(chunk);

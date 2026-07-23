@@ -681,6 +681,102 @@ export async function fetchMediaDirect(
   return lastFailure ?? { status: 502, error: "meta_media_download_failed" };
 }
 
+export interface MediaUploadParams {
+  buffer: Buffer;
+  mimeType: string;
+  phoneNumberId?: string;
+  filename?: string;
+  accessToken?: string;
+}
+
+/**
+ * Header/query-level media-upload validation, shared between the standalone
+ * route (which runs it BEFORE buffering the body so bad requests cost zero
+ * body bytes) and uploadMediaDirect (which re-checks for direct callers).
+ */
+function validateMediaUploadRequest(
+  phoneNumberId: string | undefined,
+  mimeType: string
+): MetaDispatchResult | undefined {
+  if (!phoneNumberId) {
+    return { status: 400, body: { error: "phoneNumberId is required" } };
+  }
+  if (!mimeType || mimeType.startsWith("application/json")) {
+    return { status: 400, body: { error: "Content-Type must be the media MIME type (e.g. image/jpeg)" } };
+  }
+  return undefined;
+}
+
+// Overall deadline for one upload, mirroring the gateway HTTP proxy's 30s
+// AbortSignal so the monolith's in-process path cannot hold a client
+// connection for graphRequest's full retry budget (60s x 4 + backoff).
+const MEDIA_UPLOAD_DEADLINE_MS = 30_000;
+
+/**
+ * Direct in-process media upload: posts raw file bytes to Graph's
+ * `/<phoneNumberId>/media` edge as multipart form data and returns the
+ * status + JSON body the `/internal/v1/whatsapp/media` endpoint produces.
+ * The gateway calls this in the monolith instead of HTTP; the standalone
+ * route delegates here so the two paths cannot drift.
+ */
+export async function uploadMediaDirect(params: MediaUploadParams, requestId: string): Promise<MetaDispatchResult> {
+  const phoneNumberId = params.phoneNumberId ?? config.whatsappPhoneNumberId;
+  const invalid = validateMediaUploadRequest(phoneNumberId, params.mimeType);
+  if (invalid) {
+    return invalid;
+  }
+  if (params.buffer.length === 0) {
+    return { status: 400, body: { error: "Request body (file bytes) is required" } };
+  }
+  if (params.buffer.length > MEDIA_UPLOAD_MAX_BYTES) {
+    return { status: 413, body: { error: "media_too_large", maxBytes: MEDIA_UPLOAD_MAX_BYTES } };
+  }
+  // `||` (not `??`): empty-string accessToken/filename are treated as absent —
+  // token falls through to the config default (matching fetchMediaDirect and
+  // the HTTP path's length>0 header check), filename to the "upload" default.
+  const token = params.accessToken || undefined;
+  const filename = params.filename || undefined;
+  const doUpload = async (): Promise<MetaDispatchResult> => {
+    try {
+      const form = buildMediaUploadForm({ buffer: params.buffer, mimeType: params.mimeType, filename });
+      const response = await graphRequest(`/${phoneNumberId}/media`, "POST", form, token);
+      if (!response.ok) {
+        const graphError = await parseGraphError(response);
+        logger.warn("meta_media_upload_failed", { requestId, statusCode: response.status });
+        return { status: 502, body: { error: "meta_media_upload_failed", details: graphError } };
+      }
+      const parsed = (await response.json()) as { id?: string };
+      return { status: 201, body: { requestId, mediaId: parsed.id } };
+    } catch (error) {
+      logger.error("meta_media_upload_exception", {
+        requestId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      return {
+        status: 503,
+        body: { error: "meta_adapter_unavailable", details: error instanceof Error ? error.message : String(error) }
+      };
+    }
+  };
+  // On timeout the in-flight Graph call is abandoned (same semantics as the
+  // HTTP proxy's abort) and the caller gets the same 503 the abort produced.
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<MetaDispatchResult>((resolveTimeout) => {
+    timer = setTimeout(() => {
+      logger.warn("meta_media_upload_timeout", { requestId, deadlineMs: MEDIA_UPLOAD_DEADLINE_MS });
+      resolveTimeout({ status: 503, body: { error: "meta_adapter_unavailable", details: "upload_deadline_exceeded" } });
+    }, MEDIA_UPLOAD_DEADLINE_MS);
+    timer.unref();
+  });
+  try {
+    return await Promise.race([doUpload(), deadline]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+}
+
 // Exported (not just used via isMain below) so tests can do real HTTP
 // round-trips against the standalone route table without binding the
 // production port — this is what catches a metaDispatch case shipping
@@ -1147,6 +1243,9 @@ export const server = createServer(async (req, res) => {
 
     // Upload media bytes to Meta to obtain a reusable media id. The raw file is
     // the request body; metadata travels in query/headers so the bytes stay intact.
+    // Cheap header/query validation runs BEFORE buffering the body; body reading
+    // (and its 413 mapping) is the only HTTP-specific step, while the Graph call
+    // lives in uploadMediaDirect, shared with the monolith.
     if (path === "/internal/v1/whatsapp/media") {
       if (method !== "POST") {
         methodNotAllowed(res);
@@ -1154,46 +1253,38 @@ export const server = createServer(async (req, res) => {
       }
       const query = parseQuery(req.url);
       const phoneNumberId = query.get("phoneNumberId") ?? config.whatsappPhoneNumberId;
-      const filename = query.get("filename") ?? undefined;
       const mimeType = typeof req.headers["content-type"] === "string" ? req.headers["content-type"] : "";
+      const invalid = validateMediaUploadRequest(phoneNumberId, mimeType);
+      if (invalid) {
+        sendJson(res, invalid.status, invalid.body);
+        return;
+      }
       const tokenHeader = req.headers["x-access-token"];
-      const accessToken = typeof tokenHeader === "string" && tokenHeader.length > 0 ? tokenHeader : undefined;
-      if (!phoneNumberId) {
-        sendJson(res, 400, { error: "phoneNumberId is required" });
-        return;
-      }
-      if (!mimeType || mimeType.startsWith("application/json")) {
-        sendJson(res, 400, { error: "Content-Type must be the media MIME type (e.g. image/jpeg)" });
-        return;
-      }
       let buffer: Buffer;
       try {
         buffer = await readBinaryBody(req, MEDIA_UPLOAD_MAX_BYTES);
-      } catch {
-        sendJson(res, 413, { error: "media_too_large", maxBytes: MEDIA_UPLOAD_MAX_BYTES });
-        return;
-      }
-      if (buffer.length === 0) {
-        sendJson(res, 400, { error: "Request body (file bytes) is required" });
-        return;
-      }
-      try {
-        const form = buildMediaUploadForm({ buffer, mimeType, filename });
-        const response = await graphRequest(`/${phoneNumberId}/media`, "POST", form, accessToken);
-        if (!response.ok) {
-          const graphError = await parseGraphError(response);
-          logger.warn("meta_media_upload_failed", { requestId: ctx.requestId, statusCode: response.status });
-          sendJson(res, 502, { error: "meta_media_upload_failed", details: graphError });
-          return;
-        }
-        const parsed = (await response.json()) as { id?: string };
-        sendJson(res, 201, { requestId: ctx.requestId, mediaId: parsed.id });
       } catch (error) {
-        sendJson(res, 503, {
-          error: "meta_adapter_unavailable",
-          details: error instanceof Error ? error.message : String(error)
-        });
+        if ((error as { code?: string }).code === "BODY_TOO_LARGE") {
+          // The socket is intact (readBinaryBody pauses instead of destroying),
+          // so the 413 actually reaches the client; tear down afterwards.
+          sendJson(res, 413, { error: "media_too_large", maxBytes: MEDIA_UPLOAD_MAX_BYTES });
+          res.once("finish", () => req.destroy());
+        } else {
+          req.destroy();
+        }
+        return;
       }
+      const { status, body } = await uploadMediaDirect(
+        {
+          buffer,
+          mimeType,
+          phoneNumberId,
+          filename: query.get("filename") ?? undefined,
+          accessToken: typeof tokenHeader === "string" && tokenHeader.length > 0 ? tokenHeader : undefined
+        },
+        ctx.requestId
+      );
+      sendJson(res, status, body);
       return;
     }
 
