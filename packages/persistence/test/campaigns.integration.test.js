@@ -131,6 +131,60 @@ test("claimPendingBatch is tenant-isolated through the claim UPDATE", { skip }, 
   assert.equal(ownClaim.length, 3);
 });
 
+async function readStatus(tenantId, recipientId) {
+  return withTenant(tenantId, async (client) => {
+    const r = await client.query(`SELECT status, skip_reason FROM campaign_recipients WHERE id = $1`, [recipientId]);
+    return r.rows[0];
+  });
+}
+
+test("updateStatus with onlyIfStatus will not clobber an already-advanced row", { skip }, async () => {
+  const { tenant, campaign } = await seedCampaign("Guard", 1);
+  const [recipient] = await campaignRecipientRepository.claimPendingBatch(tenant.id, campaign.id, 1);
+
+  // Simulate the send having already landed and a delivery receipt arriving.
+  await campaignRecipientRepository.updateStatus(tenant.id, recipient.id, { status: "sent" });
+  await campaignRecipientRepository.updateStatus(tenant.id, recipient.id, { status: "delivered" });
+
+  // A late duplicate-suppression write guarded on 'pending' must be a no-op.
+  await campaignRecipientRepository.updateStatus(tenant.id, recipient.id, {
+    status: "policy_skipped",
+    skipReason: "duplicate_send_suppressed",
+    onlyIfStatus: "pending"
+  });
+
+  const after = await readStatus(tenant.id, recipient.id);
+  assert.equal(after.status, "delivered", "a guarded write must not downgrade a delivered recipient");
+  assert.equal(after.skip_reason, null, "a no-op write must not leave a skip_reason behind");
+});
+
+test("updateStatus with onlyIfStatus applies when the row still matches", { skip }, async () => {
+  const { tenant, campaign } = await seedCampaign("GuardApplies", 1);
+  const [recipient] = await campaignRecipientRepository.claimPendingBatch(tenant.id, campaign.id, 1);
+
+  await campaignRecipientRepository.updateStatus(tenant.id, recipient.id, {
+    status: "policy_skipped",
+    skipReason: "duplicate_send_suppressed",
+    onlyIfStatus: "pending"
+  });
+
+  const after = await readStatus(tenant.id, recipient.id);
+  assert.equal(after.status, "policy_skipped");
+  assert.equal(after.skip_reason, "duplicate_send_suppressed");
+});
+
+test("updateStatus without onlyIfStatus keeps its existing unguarded behaviour", { skip }, async () => {
+  const { tenant, campaign } = await seedCampaign("GuardOmitted", 1);
+  const [recipient] = await campaignRecipientRepository.claimPendingBatch(tenant.id, campaign.id, 1);
+
+  await campaignRecipientRepository.updateStatus(tenant.id, recipient.id, { status: "sent" });
+  // No guard passed: the write applies regardless of current status, as before.
+  await campaignRecipientRepository.updateStatus(tenant.id, recipient.id, { status: "failed", error: "boom" });
+
+  const after = await readStatus(tenant.id, recipient.id);
+  assert.equal(after.status, "failed");
+});
+
 test.after(async () => {
   if (!skip) {
     await closePool();

@@ -294,12 +294,26 @@ red-test-first cycle will appear to pass.
 
 Each of these is real, verified, and deliberately deferred:
 
-1. **Duplicate send-log claims strand recipients.** `handleDispatch` returns
-   without touching the recipient row when `tryClaim` finds an existing entry
-   (`services/notification-worker/src/index.ts:261-264`), leaving it `pending`
-   forever. Latent today; **the reclaim sweep in §3.2 turns it into a permanent
-   re-enqueue source across runs.** This is the highest-priority follow-up and
-   should be the next iteration's first item. ~3 lines, in `notification-worker`.
+1. ~~**Duplicate send-log claims strand recipients.**~~ **RESOLVED on this
+   branch.** `handleDispatch` returned without touching the recipient row when
+   `tryClaim` found an existing entry, leaving it `pending` forever — latent
+   before, but the reclaim sweep in §3.2 would have turned it into a permanent
+   re-enqueue source across runs. The suppression is now recorded as
+   `policy_skipped` / `skip_reason = 'duplicate_send_suppressed'`.
+
+   Two things made this more than the ~3 lines originally estimated:
+   `campaignRecipientRepository.updateStatus` was unconditional (`WHERE id = $1`),
+   so a naive write would let an outbox redelivery **downgrade** an already
+   `sent`/`delivered`/`read` row. It gained an optional `onlyIfStatus` guard —
+   additive, defaulted to the previous unguarded behaviour, with a regression
+   test proving a guarded write cannot clobber a `delivered` recipient. The
+   write is also best-effort (`.catch` + `dispatch_duplicate_recipient_update_failed`)
+   because rethrowing would trigger broker retry and re-suppress forever.
+
+   `policy_skipped` was chosen over `failed` deliberately: nothing went wrong,
+   and the funnel's skip bucket is where a deliberate non-send belongs. It also
+   reuses an existing status value, so the hardcoded `tenantAnalytics` buckets
+   (`packages/persistence/src/repositories.ts:2080-2086`) need no change.
 2. Head-of-line blocking (§4).
 3. No writer for `'completed'` / `'paused'` — the pause/cancel iteration.
 4. The unguarded `UPDATE campaigns SET status='running'` at

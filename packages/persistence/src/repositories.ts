@@ -2341,6 +2341,15 @@ export const campaignRecipientRepository = {
       });
     }
   },
+  /**
+   * Writes a recipient's funnel status.
+   *
+   * `onlyIfStatus` makes the write conditional on the row still being in that
+   * status. Omit it for the unconditional behaviour every existing caller
+   * relies on. It exists for late writes that must never move a row backwards
+   * — e.g. suppressing a duplicate dispatch, where an outbox redelivery could
+   * otherwise downgrade an already 'sent'/'delivered'/'read' recipient.
+   */
   async updateStatus(
     tenantId: string,
     recipientId: string,
@@ -2349,6 +2358,7 @@ export const campaignRecipientRepository = {
       externalMessageId?: string;
       error?: string;
       skipReason?: string;
+      onlyIfStatus?: CampaignRecipient["status"];
     }
   ): Promise<void> {
     await withTenant(tenantId, async (client) => {
@@ -2359,8 +2369,16 @@ export const campaignRecipientRepository = {
              error = $4,
              skip_reason = $5,
              sent_at = CASE WHEN $2 = 'sent' THEN now() ELSE sent_at END
-         WHERE id = $1`,
-        [recipientId, update.status, update.externalMessageId ?? null, update.error ?? null, update.skipReason ?? null]
+         WHERE id = $1
+           AND ($6::text IS NULL OR status = $6)`,
+        [
+          recipientId,
+          update.status,
+          update.externalMessageId ?? null,
+          update.error ?? null,
+          update.skipReason ?? null,
+          update.onlyIfStatus ?? null
+        ]
       );
     });
   },

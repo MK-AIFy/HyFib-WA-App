@@ -261,6 +261,28 @@ async function handleDispatch(event: EventEnvelope): Promise<void> {
   const claimed = await campaignSendLog.tryClaim(command.tenantId, command.campaignId, command.contactPhoneE164);
   if (!claimed) {
     logger.info("dispatch_duplicate_skipped", { campaignId: command.campaignId });
+    // Record the suppression on the funnel row, otherwise it stays 'pending'
+    // forever: claimPendingBatch reclaims stale claims, so a permanently-pending
+    // recipient is re-claimed and re-enqueued every stale window and the
+    // campaign never drains. Guarded on 'pending' so an outbox redelivery for a
+    // recipient that already sent cannot downgrade it. Best-effort, like the
+    // quota gate below — a bookkeeping failure must not rethrow, since broker
+    // retry would only re-suppress.
+    if (command.recipientId) {
+      await campaignRecipientRepository
+        .updateStatus(command.tenantId, command.recipientId, {
+          status: "policy_skipped",
+          skipReason: "duplicate_send_suppressed",
+          onlyIfStatus: "pending"
+        })
+        .catch((error) =>
+          logger.warn("dispatch_duplicate_recipient_update_failed", {
+            campaignId: command.campaignId,
+            recipientId: command.recipientId,
+            error: error instanceof Error ? error.message : String(error)
+          })
+        );
+    }
     return;
   }
   try {
