@@ -2474,18 +2474,31 @@ export const campaignRecipientRepository = {
    * pending rows updated all 10 (`Nested Loop Semi Join ... loops=10`).
    * MATERIALIZED forces the CTE to be evaluated exactly once.
    *
+   * A claimed row becomes reclaimable after `staleClaimMinutes` so a process
+   * that dies between claiming and enqueueing does not strand recipients. The
+   * window must exceed one batch's wall time — batchSize / ratePerMinute,
+   * because pacing happens inside the fan-out loop — so the 2-minute constant
+   * outbox_claim uses would be wrong here. Reclaiming too early costs a
+   * duplicate outbox row, never a duplicate send: campaignSendLog.tryClaim is
+   * the exactly-once guard at send time.
+   *
    * The RETURNING list is deliberately the pre-existing column set —
    * `claimed_at` is excluded — so CampaignRecipientRow, mapRecipient, and the
    * exported CampaignRecipient type are unchanged.
    */
-  async claimPendingBatch(tenantId: string, campaignId: string, batchSize: number): Promise<CampaignRecipient[]> {
+  async claimPendingBatch(
+    tenantId: string,
+    campaignId: string,
+    batchSize: number,
+    staleClaimMinutes = 15
+  ): Promise<CampaignRecipient[]> {
     return withTenant(tenantId, async (client) => {
       const result = await client.query<CampaignRecipientRow>(
         `WITH claimed AS MATERIALIZED (
            SELECT c.id FROM campaign_recipients c
            WHERE c.campaign_id = $1
              AND c.status = 'pending'
-             AND c.claimed_at IS NULL
+             AND (c.claimed_at IS NULL OR c.claimed_at < now() - make_interval(mins => $3::int))
            ORDER BY c.created_at
            FOR UPDATE SKIP LOCKED
            LIMIT $2
@@ -2497,7 +2510,7 @@ export const campaignRecipientRepository = {
          RETURNING r.id, r.tenant_id, r.campaign_id, r.contact_id, r.phone_e164, r.status,
                    r.external_message_id, r.error, r.skip_reason,
                    r.sent_at, r.delivered_at, r.read_at, r.created_at`,
-        [campaignId, batchSize]
+        [campaignId, batchSize, staleClaimMinutes]
       );
       return result.rows.map(mapRecipient);
     });

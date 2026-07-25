@@ -95,6 +95,42 @@ test("claimPendingBatch never claims a non-pending recipient", { skip }, async (
   assert.equal(batch[0].contactId, contacts[2].id);
 });
 
+test("claimPendingBatch reclaims a stale claim but leaves a fresh one alone", { skip }, async () => {
+  const { tenant, campaign } = await seedCampaign("Stale", 2);
+
+  const claimed = await campaignRecipientRepository.claimPendingBatch(tenant.id, campaign.id, 2, 15);
+  assert.equal(claimed.length, 2);
+
+  // Nothing is stale yet, so a second claim finds nothing.
+  const immediate = await campaignRecipientRepository.claimPendingBatch(tenant.id, campaign.id, 2, 15);
+  assert.deepEqual(immediate, [], "a claim inside the stale window must not be reclaimed");
+
+  // Backdate exactly one row's claim past the window.
+  await withTenant(tenant.id, async (client) => {
+    await client.query(`UPDATE campaign_recipients SET claimed_at = now() - INTERVAL '30 minutes' WHERE id = $1`, [
+      claimed[0].id
+    ]);
+  });
+
+  const reclaimed = await campaignRecipientRepository.claimPendingBatch(tenant.id, campaign.id, 2, 15);
+  assert.equal(reclaimed.length, 1, "only the backdated row should be reclaimed");
+  assert.equal(reclaimed[0].id, claimed[0].id);
+});
+
+test("claimPendingBatch is tenant-isolated through the claim UPDATE", { skip }, async () => {
+  const owner = await seedCampaign("OwnerIso", 3);
+  const other = await seedCampaign("OtherIso", 3);
+
+  // Claiming as the other tenant must not reach the owner's campaign: the RLS
+  // policy on campaign_recipients scopes the UPDATE, not just the CTE.
+  const crossTenant = await campaignRecipientRepository.claimPendingBatch(other.tenant.id, owner.campaign.id, 10);
+  assert.deepEqual(crossTenant, [], "a tenant must not claim another tenant's recipients");
+
+  // The owner's rows are therefore still unclaimed and fully available.
+  const ownClaim = await campaignRecipientRepository.claimPendingBatch(owner.tenant.id, owner.campaign.id, 10);
+  assert.equal(ownClaim.length, 3);
+});
+
 test.after(async () => {
   if (!skip) {
     await closePool();
