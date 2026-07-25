@@ -2451,17 +2451,52 @@ export const campaignRecipientRepository = {
       return counts;
     });
   },
-  /** Returns next batch of pending recipients to fan-out (cursor-based pagination). */
+  /**
+   * Claims the next batch of pending recipients for fan-out.
+   *
+   * This is a real claim, not a read: it stamps `claimed_at` on the rows it
+   * returns, so a later call cannot hand the same recipients out again. The
+   * previous implementation was a bare SELECT whose `FOR UPDATE SKIP LOCKED`
+   * locks were released by the enclosing `withTenant` COMMIT before the caller
+   * touched a row — and because the fan-out loop never marks approved
+   * recipients off 'pending' (they leave it only in handleDispatch), every
+   * call returned the same batch and the loop could not converge.
+   *
+   * No SECURITY DEFINER is needed: campaign_recipients is reached through
+   * withTenant, so RLS scopes both the CTE and the UPDATE.
+   *
+   * The `MATERIALIZED` keyword is load-bearing and must not be removed. With
+   * the subquery written inline as `WHERE id IN (SELECT ... LIMIT n)` the
+   * planner is free to turn it into a semi-join and re-execute the locking
+   * subplan once per candidate row; because FOR UPDATE SKIP LOCKED yields
+   * different rows on each execution, every outer row then finds a match and
+   * the batch size is silently ignored. Measured: a `LIMIT 4` claim over 10
+   * pending rows updated all 10 (`Nested Loop Semi Join ... loops=10`).
+   * MATERIALIZED forces the CTE to be evaluated exactly once.
+   *
+   * The RETURNING list is deliberately the pre-existing column set —
+   * `claimed_at` is excluded — so CampaignRecipientRow, mapRecipient, and the
+   * exported CampaignRecipient type are unchanged.
+   */
   async claimPendingBatch(tenantId: string, campaignId: string, batchSize: number): Promise<CampaignRecipient[]> {
     return withTenant(tenantId, async (client) => {
       const result = await client.query<CampaignRecipientRow>(
-        `SELECT id, tenant_id, campaign_id, contact_id, phone_e164, status,
-                external_message_id, error, skip_reason, sent_at, delivered_at, read_at, created_at
-         FROM campaign_recipients
-         WHERE campaign_id = $1 AND status = 'pending'
-         ORDER BY created_at ASC
-         LIMIT $2
-         FOR UPDATE SKIP LOCKED`,
+        `WITH claimed AS MATERIALIZED (
+           SELECT c.id FROM campaign_recipients c
+           WHERE c.campaign_id = $1
+             AND c.status = 'pending'
+             AND c.claimed_at IS NULL
+           ORDER BY c.created_at
+           FOR UPDATE SKIP LOCKED
+           LIMIT $2
+         )
+         UPDATE campaign_recipients r
+         SET claimed_at = now()
+         FROM claimed
+         WHERE r.id = claimed.id
+         RETURNING r.id, r.tenant_id, r.campaign_id, r.contact_id, r.phone_e164, r.status,
+                   r.external_message_id, r.error, r.skip_reason,
+                   r.sent_at, r.delivered_at, r.read_at, r.created_at`,
         [campaignId, batchSize]
       );
       return result.rows.map(mapRecipient);
