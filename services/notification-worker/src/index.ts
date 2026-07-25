@@ -362,8 +362,11 @@ async function handleCampaignRun(event: EventEnvelope): Promise<void> {
 
   logger.info("campaign_run_started", { campaignId: run.campaignId, tenantId: run.tenantId });
 
-  // Process in batches of 50; claimPendingBatch advisory-locks rows so a
-  // restarted worker won't re-dispatch the same contacts.
+  // Process in batches of 50. claimPendingBatch stamps claimed_at on the rows
+  // it returns, so a restarted worker (or a second concurrent loop) never
+  // re-dispatches the same contacts. Claims older than the repository's stale
+  // window are reclaimable, so a crash between claiming and enqueueing does
+  // not strand recipients.
   let processed = 0;
   let batches = 0;
   const MAX_BATCHES = 10_000; // Safety limit (~500K contacts per invocation)
@@ -1080,9 +1083,15 @@ export interface WorkerDeps {
  *
  * Durability: campaign runs and outbound sends are enqueued to the DB outbox by
  * the gateway; the gateway's outbox relay (started by app-server) re-publishes
- * unprocessed rows after a crash, and the synchronous in-memory bus + idempotent
- * claimPendingBatch make re-processing safe — so no separate resume sweep is
- * needed here.
+ * unprocessed rows after a crash. Re-processing is safe because
+ * claimPendingBatch will not hand out an already-claimed recipient and
+ * campaignSendLog.tryClaim is the exactly-once guard at send time — so no
+ * separate resume sweep is needed here.
+ *
+ * Caveat worth knowing before changing this: the in-memory bus awaits handler
+ * completion and the relay publishes sequentially, so a long campaign fan-out
+ * blocks the outbox relay for its whole duration. Pacing happens inside the
+ * fan-out loop, so that duration scales with the recipient count.
  */
 export function registerWorkerConsumers(deps: WorkerDeps = {}): void {
   if (deps.eventBus) {

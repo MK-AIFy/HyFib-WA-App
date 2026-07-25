@@ -242,9 +242,17 @@ In `packages/persistence/src/repositories.ts`, replace the whole `claimPendingBa
    * recipients off 'pending' (they leave it only in handleDispatch), every
    * call returned the same batch and the loop could not converge.
    *
-   * Mirrors the outbox_claim precedent in 015_outbox_durability.sql. No
-   * SECURITY DEFINER is needed: campaign_recipients is reached through
-   * withTenant, so RLS scopes both the subquery and the UPDATE.
+   * No SECURITY DEFINER is needed: campaign_recipients is reached through
+   * withTenant, so RLS scopes both the CTE and the UPDATE.
+   *
+   * The `MATERIALIZED` keyword is load-bearing and must not be removed. With
+   * the subquery written inline as `WHERE id IN (SELECT ... LIMIT n)` the
+   * planner is free to turn it into a semi-join and re-execute the locking
+   * subplan once per candidate row; because FOR UPDATE SKIP LOCKED yields
+   * different rows on each execution, every outer row then finds a match and
+   * the batch size is silently ignored. Measured: a `LIMIT 4` claim over 10
+   * pending rows updated all 10 (`Nested Loop Semi Join ... loops=10`).
+   * MATERIALIZED forces the CTE to be evaluated exactly once.
    *
    * The RETURNING list is deliberately the pre-existing column set —
    * `claimed_at` is excluded — so CampaignRecipientRow, mapRecipient, and the
@@ -253,9 +261,7 @@ In `packages/persistence/src/repositories.ts`, replace the whole `claimPendingBa
   async claimPendingBatch(tenantId: string, campaignId: string, batchSize: number): Promise<CampaignRecipient[]> {
     return withTenant(tenantId, async (client) => {
       const result = await client.query<CampaignRecipientRow>(
-        `UPDATE campaign_recipients r
-         SET claimed_at = now()
-         WHERE r.id IN (
+        `WITH claimed AS MATERIALIZED (
            SELECT c.id FROM campaign_recipients c
            WHERE c.campaign_id = $1
              AND c.status = 'pending'
@@ -264,6 +270,10 @@ In `packages/persistence/src/repositories.ts`, replace the whole `claimPendingBa
            FOR UPDATE SKIP LOCKED
            LIMIT $2
          )
+         UPDATE campaign_recipients r
+         SET claimed_at = now()
+         FROM claimed
+         WHERE r.id = claimed.id
          RETURNING r.id, r.tenant_id, r.campaign_id, r.contact_id, r.phone_e164, r.status,
                    r.external_message_id, r.error, r.skip_reason,
                    r.sent_at, r.delivered_at, r.read_at, r.created_at`,
@@ -273,6 +283,15 @@ In `packages/persistence/src/repositories.ts`, replace the whole `claimPendingBa
     });
   }
 ```
+
+> **Amended after execution.** This step originally specified the
+> `WHERE id IN (SELECT … LIMIT n)` shape copied from `outbox_claim`. The Step 1
+> tests caught it failing: `claimPendingBatch converges to an empty batch`
+> reported `batches` of 1 instead of 3, because a single `LIMIT 4` claim
+> updated all 10 rows. `EXPLAIN (ANALYZE)` showed
+> `Nested Loop Semi Join … loops=10` — the locking subplan re-executed per
+> candidate row. If you are replaying this plan, expect that intermediate
+> failure; `MATERIALIZED` is the fix.
 
 - [ ] **Step 6: Run the test to verify it passes**
 

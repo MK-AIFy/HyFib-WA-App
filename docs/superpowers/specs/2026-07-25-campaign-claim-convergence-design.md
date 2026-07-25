@@ -61,9 +61,12 @@ Both should be corrected as part of this work.
 
 ### 1.4 Verification status
 
-The mechanism is proven by code reading across all seven links. It has **not**
-been reproduced against a live run. The convergence test in §5 is what converts
-this from a code-read conclusion into an executable regression proof.
+The mechanism was proven by code reading across all seven links, then
+**reproduced against a live PostgreSQL** during implementation. Two successive
+`claimPendingBatch` calls over 10 pending recipients returned the identical
+four rows, and the convergence loop tripped its iteration guard — the exact
+non-convergence predicted above. Both are now permanent regression tests (§5
+cases 1 and 2).
 
 ---
 
@@ -119,9 +122,7 @@ It is deliberately kept to two statements for that reason.
 `claimPendingBatch` becomes a real claim:
 
 ```sql
-UPDATE campaign_recipients r
-SET claimed_at = now()
-WHERE r.id IN (
+WITH claimed AS MATERIALIZED (
   SELECT c.id FROM campaign_recipients c
   WHERE c.campaign_id = $1
     AND c.status = 'pending'
@@ -130,18 +131,36 @@ WHERE r.id IN (
   FOR UPDATE SKIP LOCKED
   LIMIT $2
 )
+UPDATE campaign_recipients r
+SET claimed_at = now()
+FROM claimed
+WHERE r.id = claimed.id
 RETURNING r.id, r.tenant_id, r.campaign_id, r.contact_id, r.phone_e164, r.status,
           r.external_message_id, r.error, r.skip_reason,
           r.sent_at, r.delivered_at, r.read_at, r.created_at;
 ```
 
-- Structurally identical to `outbox_claim`
-  (`infra/postgres/init/015_outbox_durability.sql:27-40`), including the
-  `IN (SELECT … FOR UPDATE SKIP LOCKED LIMIT …)` shape and the stale-reclaim
-  disjunction.
+> **Amended during implementation.** This section originally specified the
+> `WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED LIMIT …)` shape, copied from
+> `outbox_claim` (`infra/postgres/init/015_outbox_durability.sql:27-40`). That
+> shape is **not safe here** and the integration test caught it: the planner is
+> free to treat the subquery as a semi-join and re-execute the locking subplan
+> once per candidate row, and because `FOR UPDATE SKIP LOCKED` yields different
+> rows on each execution, every outer row finds a match. Measured against the
+> real schema, a `LIMIT 4` claim over 10 pending rows updated **all 10**
+> (`Nested Loop Semi Join … loops=10`). `MATERIALIZED` forces single evaluation
+> and is load-bearing — do not remove it.
+>
+> **Latent risk recorded, not a live bug:** `outbox_claim` uses the same
+> unmaterialised shape. It was tested directly during this work and does respect
+> its limit today (`outbox_claim(4)` over 12 pending rows returned exactly 4),
+> because `idx_outbox_pending_next` gives it a plan that materialises. But that
+> is a planner choice, not a structural guarantee, and it could flip with
+> different statistics or data volume. See §6 item 9.
+
 - **No `SECURITY DEFINER` needed.** Unlike `outbox_events`,
   `campaign_recipients` is reached through `withTenant`, so the RLS policy
-  (`006_marketing.sql:65-70`) scopes both the subquery and the update. The DB
+  (`006_marketing.sql:65-70`) scopes both the CTE and the update. The DB
   identity `hyfib_app` holds `UPDATE` on all public tables
   (`002_app_role.sh:36`), and FORCE RLS applies identically in gateway and
   worker.
@@ -295,6 +314,15 @@ Each of these is real, verified, and deliberately deferred:
    role check at all.
 8. A quota of `0` is treated as unlimited (`notification-worker/src/index.ts:270`),
    and `monthly_message_quota` has no writer — it is settable only by direct SQL.
+9. **`outbox_claim` relies on a planner choice for its `LIMIT` to hold.**
+   `infra/postgres/init/015_outbox_durability.sql:27-40` uses the same
+   unmaterialised `WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED LIMIT …)` shape
+   that proved unsafe for `claimPendingBatch` (§3.2). Verified correct today —
+   `outbox_claim(4)` over 12 pending rows returned exactly 4 — because
+   `idx_outbox_pending_next` yields a materialising plan. It is not structurally
+   guaranteed, and over-claiming would mean the relay marks more rows
+   `processing` than it publishes in a tick. A `022` migration wrapping the
+   subquery in `AS MATERIALIZED` would close it. Not urgent; not this iteration.
 
 ---
 

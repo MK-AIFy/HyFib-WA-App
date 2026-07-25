@@ -79,10 +79,10 @@ test("claimPendingBatch never claims a non-pending recipient", { skip }, async (
   const { tenant, campaign, contacts } = await seedCampaign("NonPending", 3);
 
   await withTenant(tenant.id, async (client) => {
-    await client.query(
-      `UPDATE campaign_recipients SET status = 'sent' WHERE campaign_id = $1 AND contact_id = $2`,
-      [campaign.id, contacts[0].id]
-    );
+    await client.query(`UPDATE campaign_recipients SET status = 'sent' WHERE campaign_id = $1 AND contact_id = $2`, [
+      campaign.id,
+      contacts[0].id
+    ]);
     await client.query(
       `UPDATE campaign_recipients SET status = 'policy_skipped' WHERE campaign_id = $1 AND contact_id = $2`,
       [campaign.id, contacts[1].id]
