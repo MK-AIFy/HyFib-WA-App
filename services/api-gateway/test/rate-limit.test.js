@@ -56,6 +56,15 @@ test("classifyRoute: campaign run (UUID segment) is expensive", () => {
   assert.equal(classifyRoute("POST", `/api/v1/campaigns/${CAMPAIGN_ID}/run`), "expensive");
 });
 
+test("classifyRoute: campaign pause/resume are ordinary writes, never expensive", () => {
+  // 'expensive' is 10/min. An operator hammering stop during a bad send must not
+  // be throttled out of stopping, so these belong in the 120/min write bucket.
+  // Pins the behaviour so broadening CAMPAIGN_RUN_PATTERN to /campaigns/{id}/*
+  // fails loudly here rather than silently throttling the stop button.
+  assert.equal(classifyRoute("POST", `/api/v1/campaigns/${CAMPAIGN_ID}/pause`), "write");
+  assert.equal(classifyRoute("POST", `/api/v1/campaigns/${CAMPAIGN_ID}/resume`), "write");
+});
+
 test("classifyRoute: campaign run with a non-UUID segment does not match the expensive pattern", () => {
   assert.notEqual(classifyRoute("POST", "/api/v1/campaigns/not-a-uuid/run"), "expensive");
 });

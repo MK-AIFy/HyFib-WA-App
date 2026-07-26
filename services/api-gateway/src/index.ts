@@ -92,7 +92,7 @@ import {
   validateLocationPayload,
   validateContactsPayload
 } from "./validation.js";
-import { filterSendableContacts } from "./campaign.js";
+import { filterSendableContacts, canTransition, transitionConflict, CAMPAIGN_TRANSITIONS } from "./campaign.js";
 import { canCreateContact, canCreateOrder } from "./authorization.js";
 import { buildMediaHeaders } from "./media-headers.js";
 import { mapMediaUploadProxyResult } from "./media-upload.js";
@@ -783,7 +783,14 @@ async function dispatchCampaign(
   }
 
   await withTenant(tenantId, async (client) => {
-    await client.query("UPDATE campaigns SET status = 'running' WHERE id = $1", [campaign.id]);
+    // Guarded so a single-number test send cannot silently resurrect a paused
+    // campaign to 'running'. Without this, pause is not durable: one test send
+    // undoes it with no signal to the operator. The send itself still happens —
+    // only the unintended status side-effect is removed.
+    await client.query(
+      "UPDATE campaigns SET status = 'running' WHERE id = $1 AND status IN ('draft', 'scheduled', 'running')",
+      [campaign.id]
+    );
     await outboxRepository.enqueue(client, tenantId, {
       topic: EventTopics.CampaignDispatchRequested,
       payload: {
@@ -2837,6 +2844,110 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       });
     }
     sendJson(res, result.status, result.body);
+    return;
+  }
+
+  // Campaign pause / resume. Pause stops future starts and de-schedules a
+  // scheduled campaign; it does not abort a fan-out already in flight (the
+  // worker abort check is a separate change). Resume re-enqueues the run
+  // without touching campaign_recipients, so the audience stays exactly as it
+  // was at start — unlike /run, which re-resolves the segment and would
+  // silently add contacts who joined while the campaign was paused.
+  if (
+    path.startsWith("/api/v1/campaigns/") &&
+    (path.endsWith("/pause") || path.endsWith("/resume")) &&
+    method === "POST"
+  ) {
+    const action = path.endsWith("/pause") ? "pause" : "resume";
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager"])) {
+      sendJson(res, 403, { error: `Insufficient role to ${action} campaigns` });
+      return;
+    }
+    const campaignId = extractPathSegment(path, "/api/v1/campaigns/");
+    if (!campaignId || !UUID.test(campaignId)) {
+      sendJson(res, 400, { error: "Invalid campaign id" });
+      return;
+    }
+    const campaign = await campaignRepository.getById(tenantId, campaignId);
+    if (!campaign) {
+      sendJson(res, 404, { error: "Campaign not found" });
+      return;
+    }
+    // Read-side pre-check produces a message naming the actual status; the CAS
+    // below is what actually closes the race. Both 409s are needed, as on /run.
+    if (!canTransition(campaign.status, action)) {
+      sendJson(res, 409, { error: transitionConflict(campaign.status, action) });
+      return;
+    }
+    const { from, to } = CAMPAIGN_TRANSITIONS[action];
+
+    if (action === "pause") {
+      const applied = await campaignRepository.transition(tenantId, campaignId, from, to);
+      if (!applied) {
+        sendJson(res, 409, { error: "Campaign status changed concurrently" });
+        return;
+      }
+      // The pending count lets an operator tell a real stop from a no-op:
+      // pausing a campaign that drained weeks ago returns 0.
+      const counts = await campaignRecipientRepository.funnelCounts(tenantId, campaignId);
+      const pendingRecipients = counts.pending ?? 0;
+      await audit(tenantId, auth, {
+        action: "campaign.paused",
+        resourceType: "Campaign",
+        resourceId: campaignId,
+        payload: { pendingRecipients }
+      });
+      sendJson(res, 200, { status: "paused", campaignId, pendingRecipients });
+      return;
+    }
+
+    // Resume must rebuild the full run event: the worker treats the payload as a
+    // frozen snapshot of the run's parameters and re-reads nothing.
+    const template = await templateRepository.getById(tenantId, campaign.templateId);
+    if (!template) {
+      sendJson(res, 409, { error: "Template not found" });
+      return;
+    }
+    const channel = await channelRepository.firstActive(tenantId);
+    if (!channel) {
+      sendJson(res, 409, { error: "No active WhatsApp channel configured for tenant" });
+      return;
+    }
+    let resumed = false;
+    await withTenant(tenantId, async (client) => {
+      // Status flip and event enqueue commit together, or a crash between them
+      // leaves a 'running' campaign no worker was ever told about.
+      resumed = await campaignRepository.transition(tenantId, campaignId, from, to, client);
+      if (resumed) {
+        await outboxRepository.enqueue(client, tenantId, {
+          topic: EventTopics.CampaignRunRequested,
+          payload: {
+            campaignId,
+            tenantId,
+            channelId: channel.id,
+            templateName: campaign.templateName,
+            templateLanguage: campaign.templateLanguage,
+            templateCategory: campaign.templateCategory,
+            templateStatus: campaign.templateStatus ?? "approved",
+            variableMapping: campaign.variableMapping,
+            quietHours: campaign.quietHours,
+            frequencyCap: campaign.frequencyCap,
+            ratePerMinute: campaign.ratePerMinute
+          }
+        });
+      }
+    });
+    if (!resumed) {
+      sendJson(res, 409, { error: "Campaign status changed concurrently" });
+      return;
+    }
+    await audit(tenantId, auth, {
+      action: "campaign.resumed",
+      resourceType: "Campaign",
+      resourceId: campaignId,
+      payload: {}
+    });
+    sendJson(res, 202, { status: "resumed", campaignId });
     return;
   }
 

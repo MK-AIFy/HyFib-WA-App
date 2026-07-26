@@ -1,11 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {
-  filterSendableContacts,
-  CAMPAIGN_TRANSITIONS,
-  canTransition,
-  transitionConflict
-} from "../dist/campaign.js";
+import { filterSendableContacts, CAMPAIGN_TRANSITIONS, canTransition, transitionConflict } from "../dist/campaign.js";
 
 const contact = (id, optedOut) => ({ id, phoneE164: "+1555000000" + id, optedOut });
 
