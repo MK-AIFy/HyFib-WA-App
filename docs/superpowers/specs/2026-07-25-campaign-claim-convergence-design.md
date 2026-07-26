@@ -328,15 +328,31 @@ Each of these is real, verified, and deliberately deferred:
    role check at all.
 8. A quota of `0` is treated as unlimited (`notification-worker/src/index.ts:270`),
    and `monthly_message_quota` has no writer — it is settable only by direct SQL.
-9. **`outbox_claim` relies on a planner choice for its `LIMIT` to hold.**
-   `infra/postgres/init/015_outbox_durability.sql:27-40` uses the same
-   unmaterialised `WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED LIMIT …)` shape
-   that proved unsafe for `claimPendingBatch` (§3.2). Verified correct today —
-   `outbox_claim(4)` over 12 pending rows returned exactly 4 — because
-   `idx_outbox_pending_next` yields a materialising plan. It is not structurally
-   guaranteed, and over-claiming would mean the relay marks more rows
-   `processing` than it publishes in a tick. A `022` migration wrapping the
-   subquery in `AS MATERIALIZED` would close it. Not urgent; not this iteration.
+9. ~~**`outbox_claim` relies on a planner choice for its `LIMIT` to hold.**~~
+   **HARDENED in migration `022`, but the risk was overstated — correcting the
+   record.** `015_outbox_durability.sql:27-40` used the same unmaterialised
+   `WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED LIMIT …)` shape that proved
+   unsafe for `claimPendingBatch` (§3.2), and this document previously called it
+   "not structurally guaranteed".
+
+   **It could not be reproduced.** The bad plan was forced with
+   `enable_indexscan`, `enable_bitmapscan`, `enable_indexonlyscan`,
+   `enable_hashagg`, `enable_hashjoin`, `enable_material`, `enable_sort`, and
+   `enable_mergejoin` all off; the subquery still materialised
+   (`Limit … loops=1`, subquery on the *outer* side beneath `Unique`) and
+   `outbox_claim(4)` over 12 pending rows returned exactly 4 every time.
+
+   **Why the two cases differ — the mechanism, not luck.** `claimPendingBatch`
+   runs as `hyfib_app` against a FORCE-RLS table, so PostgreSQL injects the
+   `current_setting('app.tenant_id')` predicate; that pushed the subquery to the
+   *inner* side of a `Nested Loop Semi Join`, re-executing it per candidate row.
+   `outbox_claim` is `SECURITY DEFINER` running as the table owner, so **no RLS
+   predicate is ever injected** and that plan shape was never reached.
+
+   `022` was shipped anyway as **defensive hardening, not a bug fix**: it costs
+   one line, changes no behaviour, and removes the dependence on a planner
+   choice that a future index or volume change could alter. The accompanying
+   test is labelled a characterisation test, not a red-green cycle.
 
 ---
 

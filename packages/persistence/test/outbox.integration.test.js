@@ -46,6 +46,29 @@ test("outbox_claim only returns rows whose next_attempt_at has passed", { skip }
   await outboxRepository.markProcessed(pastId);
 });
 
+// Characterisation test, not a red-green cycle: outbox_claim already respected
+// its limit before migration 022 on every plan reachable today, and the bad plan
+// could not be forced. It pins the contract so the MATERIALIZED CTE cannot be
+// dropped, and so an over-claim is caught if a future index or statistics change
+// makes the semi-join plan reachable. Over-claiming would mark rows 'processing'
+// that the tick never publishes, stalling them until the 2-minute stuck-row rule.
+test("outbox_claim never returns more rows than its limit", { skip }, async () => {
+  const t = await tenantRepository.create("Outbox Limit Tenant");
+  await withTenant(t.id, async (client) => {
+    for (let i = 0; i < 12; i++) {
+      await outboxRepository.enqueue(client, t.id, { topic: "durability.limit", payload: { i } });
+    }
+  });
+
+  const claimed = await outboxRepository.claim(4);
+  assert.ok(claimed.length <= 4, `claim(4) must never return more than 4 rows, got ${claimed.length}`);
+
+  // Leave nothing stuck in 'processing' for the other tests in this file.
+  for (const row of claimed) {
+    await outboxRepository.markProcessed(row.id);
+  }
+});
+
 test("markFailed walks a row to 'dead' after max attempts and backs off next_attempt_at", { skip }, async () => {
   const t = await tenantRepository.create("Outbox Durability Tenant B");
   let id;
