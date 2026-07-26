@@ -258,6 +258,36 @@ async function handleDispatch(event: EventEnvelope): Promise<void> {
     logger.warn("dispatch_invalid_command", { eventId: event.id });
     return;
   }
+  // Stop queued fan-out sends for a campaign that is no longer running. The
+  // loop's own abort check stopped it claiming new batches, but everything
+  // already written to the outbox would otherwise still send, so pause looked
+  // ineffective for as long as the backlog took to drain.
+  //
+  // This runs BEFORE tryClaim deliberately. campaign_send_log rows are never
+  // deleted on success, so claiming and then skipping would burn the
+  // exactly-once claim on a message that never sent, and tryClaim would refuse
+  // that recipient forever — resume would silently skip them.
+  //
+  // Only fan-out sends are gated. A dispatch with no recipientId is the
+  // single-number test send: an explicit operator action rather than queued
+  // work, and it must not even pay for the status read.
+  //
+  // Not cached on purpose. Any TTL is added pause latency, and getStatus is a
+  // primary-key lookup — negligible beside the monthly COUNT(*) below.
+  if (command.recipientId) {
+    const campaignStatus = await campaignRepository.getStatus(command.tenantId, command.campaignId);
+    if (campaignStatus !== "running") {
+      // The recipient row is deliberately left 'pending' with its claimed_at
+      // intact: the stale-claim reclaim makes it re-dispatchable once the
+      // campaign resumes. Marking it here would make pause lossy.
+      logger.info("dispatch_skipped_campaign_not_running", {
+        campaignId: command.campaignId,
+        status: campaignStatus ?? "missing"
+      });
+      return;
+    }
+  }
+
   // Dedupe: claim before sending; release on failure so redelivery can retry.
   const claimed = await campaignSendLog.tryClaim(command.tenantId, command.campaignId, command.contactPhoneE164);
   if (!claimed) {

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { registerWorkerConsumers } from "../dist/index.js";
-import { campaignSendLog, campaignRecipientRepository } from "@hyfib/persistence";
+import { campaignSendLog, campaignRecipientRepository, campaignRepository } from "@hyfib/persistence";
 import { EventTopics } from "@hyfib/shared-core";
 
 /**
@@ -51,8 +51,12 @@ test("handleDispatch: a suppressed duplicate marks the recipient off pending", a
   const bus = createFakeBus();
   const originalTryClaim = campaignSendLog.tryClaim;
   const originalUpdateStatus = campaignRecipientRepository.updateStatus;
+  const originalGetStatus = campaignRepository.getStatus;
   const updates = [];
 
+  // A fan-out dispatch is now gated on campaign status before the send-log
+  // claim, so this must report 'running' to reach the duplicate path at all.
+  campaignRepository.getStatus = async () => "running";
   campaignSendLog.tryClaim = async () => false;
   campaignRecipientRepository.updateStatus = async (tenantId, recipientId, update) => {
     updates.push({ tenantId, recipientId, update });
@@ -77,6 +81,7 @@ test("handleDispatch: a suppressed duplicate marks the recipient off pending", a
   } finally {
     campaignSendLog.tryClaim = originalTryClaim;
     campaignRecipientRepository.updateStatus = originalUpdateStatus;
+    campaignRepository.getStatus = originalGetStatus;
   }
 });
 
@@ -109,7 +114,9 @@ test("handleDispatch: a recipient-row write failure never breaks the suppression
   const bus = createFakeBus();
   const originalTryClaim = campaignSendLog.tryClaim;
   const originalUpdateStatus = campaignRecipientRepository.updateStatus;
+  const originalGetStatus = campaignRepository.getStatus;
 
+  campaignRepository.getStatus = async () => "running";
   campaignSendLog.tryClaim = async () => false;
   campaignRecipientRepository.updateStatus = async () => {
     throw new Error("db_unavailable");
@@ -125,5 +132,6 @@ test("handleDispatch: a recipient-row write failure never breaks the suppression
   } finally {
     campaignSendLog.tryClaim = originalTryClaim;
     campaignRecipientRepository.updateStatus = originalUpdateStatus;
+    campaignRepository.getStatus = originalGetStatus;
   }
 });
