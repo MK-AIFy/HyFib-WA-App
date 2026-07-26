@@ -782,6 +782,20 @@ export const campaignRepository = {
     });
   },
   /**
+   * Reads just the status column. getById exists but drives CAMPAIGN_SELECT, a
+   * three-table join, which is far too heavy for the per-batch poll the campaign
+   * fan-out loop needs to notice a pause.
+   *
+   * Returns undefined when the campaign does not exist or belongs to another
+   * tenant — RLS makes those indistinguishable, deliberately.
+   */
+  async getStatus(tenantId: string, id: string): Promise<string | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<{ status: string }>("SELECT status FROM campaigns WHERE id = $1", [id]);
+      return result.rows[0]?.status;
+    });
+  },
+  /**
    * Compare-and-swap a campaign's status: applies only if it is currently one of
    * `from`. Returns whether a row actually changed.
    *

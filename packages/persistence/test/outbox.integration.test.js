@@ -42,8 +42,17 @@ test("outbox_claim only returns rows whose next_attempt_at has passed", { skip }
   assert.ok(claimedIds.includes(pastId), "row with past next_attempt_at should be claimed");
   assert.ok(!claimedIds.includes(futureId), "row with future next_attempt_at should NOT be claimed");
 
-  // Clean up: mark the claimed row processed so it doesn't linger as 'processing'.
-  await outboxRepository.markProcessed(pastId);
+  // Settle EVERY row this claim took, not just the one asserted on. claim() is
+  // SECURITY DEFINER and not tenant-scoped, so it sweeps up whatever is
+  // claimable database-wide; anything left behind sits in 'processing' forever.
+  // Those rows become claimable again after the 2-minute stuck-row rule, so
+  // residue accumulates across runs until it exceeds this claim's own limit of
+  // 100 — at which point the freshly-seeded row below is ordered out of its own
+  // claim window (ORDER BY created_at ASC) and this test fails intermittently,
+  // then permanently. Observed once at 98 stranded rows.
+  for (const row of claimed) {
+    await outboxRepository.markProcessed(row.id);
+  }
 });
 
 // Characterisation test, not a red-green cycle: outbox_claim already respected
@@ -63,10 +72,19 @@ test("outbox_claim never returns more rows than its limit", { skip }, async () =
   const claimed = await outboxRepository.claim(4);
   assert.ok(claimed.length <= 4, `claim(4) must never return more than 4 rows, got ${claimed.length}`);
 
-  // Leave nothing stuck in 'processing' for the other tests in this file.
+  // outbox_claim is SECURITY DEFINER and deliberately NOT tenant-scoped — the
+  // relay runs without a tenant context — so the batch may contain rows this
+  // test never created. Settle only our own, then remove every row we seeded,
+  // so this test leaves no 'processing' or 'pending' residue to perturb the
+  // sibling outbox tests or a later run of this suite.
   for (const row of claimed) {
-    await outboxRepository.markProcessed(row.id);
+    if (row.tenant_id === t.id) {
+      await outboxRepository.markProcessed(row.id);
+    }
   }
+  await withTenant(t.id, async (client) => {
+    await client.query("DELETE FROM outbox_events WHERE tenant_id = $1", [t.id]);
+  });
 });
 
 test("markFailed walks a row to 'dead' after max attempts and backs off next_attempt_at", { skip }, async () => {

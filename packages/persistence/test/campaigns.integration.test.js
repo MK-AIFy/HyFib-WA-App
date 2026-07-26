@@ -251,6 +251,30 @@ test("transition joins a caller's transaction and rolls back with it", { skip },
   );
 });
 
+test("getStatus reads the current status without a join", { skip }, async () => {
+  const { tenant, campaign } = await seedCampaign("GetStatus", 1);
+
+  assert.equal(await campaignRepository.getStatus(tenant.id, campaign.id), "draft");
+
+  await campaignRepository.transition(tenant.id, campaign.id, ["draft"], "running");
+  assert.equal(await campaignRepository.getStatus(tenant.id, campaign.id), "running");
+});
+
+test("getStatus returns undefined for an unknown or other-tenant campaign", { skip }, async () => {
+  const owner = await seedCampaign("GetStatusOwner", 1);
+  const other = await seedCampaign("GetStatusOther", 1);
+
+  assert.equal(
+    await campaignRepository.getStatus(other.tenant.id, owner.campaign.id),
+    undefined,
+    "RLS must hide another tenant's campaign rather than leaking its status"
+  );
+  assert.equal(
+    await campaignRepository.getStatus(owner.tenant.id, "00000000-0000-0000-0000-0000000000ff"),
+    undefined
+  );
+});
+
 test.after(async () => {
   if (!skip) {
     await closePool();
