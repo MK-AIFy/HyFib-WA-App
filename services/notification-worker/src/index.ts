@@ -11,6 +11,7 @@ import {
   automationRuleRepository,
   billingRepository,
   campaignRecipientRepository,
+  campaignRepository,
   campaignSendLog,
   campaignStatsRepository,
   channelRepository,
@@ -397,9 +398,33 @@ async function handleCampaignRun(event: EventEnvelope): Promise<void> {
     ? new Date(Date.now() - run.frequencyCap.periodHours * 60 * 60 * 1000).toISOString()
     : null;
 
+  // Why the loop tracks its exit reason: only a run that genuinely drained may
+  // be marked 'completed'. Stopping because an operator paused, or because the
+  // batch cap tripped, leaves the campaign exactly as it is.
+  let exitReason: "drained" | "stopped" | "cap" = "cap";
+
   while (batches < MAX_BATCHES) {
+    // Re-read the status before claiming more work. The event payload is a
+    // frozen snapshot taken at start, so it can never reflect a pause — this
+    // poll is the only way the loop learns about one. It costs one
+    // single-column read per 50 recipients.
+    //
+    // Checking here, before the claim, is what makes pause mean "no new batches
+    // are started": the batch already in hand runs to completion so its claimed
+    // recipients are not stranded mid-flight. Worst-case pause latency is
+    // therefore one batch, which at the default 60/min is roughly a minute.
+    const status = await campaignRepository.getStatus(run.tenantId, run.campaignId);
+    if (status !== "running") {
+      exitReason = "stopped";
+      logger.info("campaign_run_stopped", { campaignId: run.campaignId, status: status ?? "missing", processed });
+      break;
+    }
+
     const batch = await campaignRecipientRepository.claimPendingBatch(run.tenantId, run.campaignId, 50);
-    if (batch.length === 0) break;
+    if (batch.length === 0) {
+      exitReason = "drained";
+      break;
+    }
     batches++;
 
     // Batch-load all data needed for policy evaluation in 3-4 parallel queries
@@ -520,7 +545,31 @@ async function handleCampaignRun(event: EventEnvelope): Promise<void> {
       maxBatches: MAX_BATCHES
     });
   }
-  logger.info("campaign_run_completed", { campaignId: run.campaignId, processed });
+
+  // The first and only writer of a terminal campaign status. Until the claim
+  // became a real claim this point was unreachable — the loop re-selected the
+  // same recipients forever and never drained — which is why 'running' has so
+  // far been terminal in practice.
+  //
+  // Guarded on 'running' rather than written unconditionally: an operator may
+  // have paused between the last claim and here, and a drained run must not
+  // clobber that. The CAS losing is the correct outcome, not an error.
+  if (exitReason === "drained") {
+    const completed = await campaignRepository
+      .transition(run.tenantId, run.campaignId, ["running"], "completed")
+      .catch((error: unknown) => {
+        logger.warn("campaign_complete_write_failed", {
+          campaignId: run.campaignId,
+          error: error instanceof Error ? error.message : String(error)
+        });
+        return false;
+      });
+    if (!completed) {
+      logger.info("campaign_complete_skipped", { campaignId: run.campaignId, processed });
+    }
+  }
+
+  logger.info("campaign_run_completed", { campaignId: run.campaignId, processed, exitReason });
 }
 
 /**

@@ -269,10 +269,7 @@ test("getStatus returns undefined for an unknown or other-tenant campaign", { sk
     undefined,
     "RLS must hide another tenant's campaign rather than leaking its status"
   );
-  assert.equal(
-    await campaignRepository.getStatus(owner.tenant.id, "00000000-0000-0000-0000-0000000000ff"),
-    undefined
-  );
+  assert.equal(await campaignRepository.getStatus(owner.tenant.id, "00000000-0000-0000-0000-0000000000ff"), undefined);
 });
 
 test.after(async () => {
