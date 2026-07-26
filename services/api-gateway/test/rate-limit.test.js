@@ -63,6 +63,7 @@ test("classifyRoute: campaign pause/resume are ordinary writes, never expensive"
   // fails loudly here rather than silently throttling the stop button.
   assert.equal(classifyRoute("POST", `/api/v1/campaigns/${CAMPAIGN_ID}/pause`), "write");
   assert.equal(classifyRoute("POST", `/api/v1/campaigns/${CAMPAIGN_ID}/resume`), "write");
+  assert.equal(classifyRoute("POST", `/api/v1/campaigns/${CAMPAIGN_ID}/cancel`), "write");
 });
 
 test("classifyRoute: campaign run with a non-UUID segment does not match the expensive pattern", () => {

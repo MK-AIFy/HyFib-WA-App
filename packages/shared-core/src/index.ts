@@ -134,7 +134,7 @@ export interface Campaign {
   name: string;
   templateId: string;
   templateCategory: MessageCategory;
-  status: "draft" | "scheduled" | "running" | "paused" | "completed";
+  status: "draft" | "scheduled" | "running" | "paused" | "completed" | "cancelled";
   createdAt: string;
   segmentId?: string;
   scheduledAt?: string;

@@ -2855,10 +2855,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   // silently add contacts who joined while the campaign was paused.
   if (
     path.startsWith("/api/v1/campaigns/") &&
-    (path.endsWith("/pause") || path.endsWith("/resume")) &&
+    (path.endsWith("/pause") || path.endsWith("/resume") || path.endsWith("/cancel")) &&
     method === "POST"
   ) {
-    const action = path.endsWith("/pause") ? "pause" : "resume";
+    const action = path.endsWith("/pause") ? "pause" : path.endsWith("/resume") ? "resume" : "cancel";
     if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager"])) {
       sendJson(res, 403, { error: `Insufficient role to ${action} campaigns` });
       return;
@@ -2898,6 +2898,28 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         payload: { pendingRecipients }
       });
       sendJson(res, 200, { status: "paused", campaignId, pendingRecipients });
+      return;
+    }
+
+    if (action === "cancel") {
+      const applied = await campaignRepository.transition(tenantId, campaignId, from, to);
+      if (!applied) {
+        sendJson(res, 409, { error: "Campaign status changed concurrently" });
+        return;
+      }
+      // Retire the recipients that will now never be sent, so the funnel drains
+      // to zero pending. Order matters: the status flips first, so a fan-out
+      // still in flight sees 'cancelled' on its next per-batch poll and stops
+      // claiming rather than racing this bulk update. Already sent/delivered/read
+      // recipients keep their outcome — those messages really went out.
+      const retired = await campaignRecipientRepository.cancelPending(tenantId, campaignId);
+      await audit(tenantId, auth, {
+        action: "campaign.cancelled",
+        resourceType: "Campaign",
+        resourceId: campaignId,
+        payload: { retiredRecipients: retired }
+      });
+      sendJson(res, 200, { status: "cancelled", campaignId, retiredRecipients: retired });
       return;
     }
 

@@ -61,3 +61,25 @@ test("transitionConflict names the current status so the operator can act on it"
   assert.match(transitionConflict("completed", "pause"), /completed/);
   assert.match(transitionConflict("running", "resume"), /running/);
 });
+
+test("canTransition: cancel is legal from every non-terminal status", () => {
+  for (const status of ["draft", "scheduled", "running", "paused"]) {
+    assert.equal(canTransition(status, "cancel"), true, `cancel from ${status} must be legal`);
+  }
+});
+
+test("canTransition: cancel is terminal — not legal from completed or cancelled", () => {
+  assert.equal(canTransition("completed", "cancel"), false, "a finished campaign cannot be cancelled");
+  assert.equal(canTransition("cancelled", "cancel"), false, "cancel must be idempotent-safe, not re-appliable");
+});
+
+test("canTransition: a cancelled campaign can never be paused or resumed", () => {
+  // Cancel is terminal: nothing brings a campaign back. runCampaign's own
+  // allowed-from is ('draft','paused'), so /run cannot revive one either.
+  assert.equal(canTransition("cancelled", "pause"), false);
+  assert.equal(canTransition("cancelled", "resume"), false);
+});
+
+test("CAMPAIGN_TRANSITIONS declares cancelled as the cancel target", () => {
+  assert.equal(CAMPAIGN_TRANSITIONS.cancel.to, "cancelled");
+});

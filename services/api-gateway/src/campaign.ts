@@ -20,7 +20,7 @@ export function filterSendableContacts<T extends SendableContact>(contacts: read
   return { eligible, suppressed: contacts.length - eligible.length };
 }
 
-export type CampaignAction = "pause" | "resume";
+export type CampaignAction = "pause" | "resume" | "cancel";
 
 /**
  * The campaign status transitions this service performs, and the only statuses
@@ -39,7 +39,17 @@ export type CampaignAction = "pause" | "resume";
  */
 export const CAMPAIGN_TRANSITIONS: Record<CampaignAction, { from: readonly string[]; to: string }> = {
   pause: { from: ["running", "scheduled"], to: "paused" },
-  resume: { from: ["paused"], to: "running" }
+  resume: { from: ["paused"], to: "running" },
+  // Cancel is terminal and deliberately reaches every non-terminal status,
+  // including 'draft' — abandoning a campaign that was never started is a
+  // legitimate operator action. Nothing transitions out of 'cancelled': it is
+  // absent from every `from` set above, and runCampaign's own allowed-from is
+  // ('draft','paused'), so /run cannot revive one either.
+  //
+  // 'completed' is excluded on purpose. Cancelling a campaign that already
+  // finished would rewrite history to say it was stopped, which is precisely
+  // the kind of thing a compliance audit must be able to trust.
+  cancel: { from: ["draft", "scheduled", "running", "paused"], to: "cancelled" }
 };
 
 /**
@@ -55,6 +65,8 @@ export function canTransition(current: string, action: CampaignAction): boolean 
 
 /** Operator-facing 409 message, phrased like the existing guard in runCampaign. */
 export function transitionConflict(current: string, action: CampaignAction): string {
-  const legal = CAMPAIGN_TRANSITIONS[action].from.join(" or ");
+  const from = CAMPAIGN_TRANSITIONS[action].from;
+  const last = from[from.length - 1] ?? "";
+  const legal = from.length > 1 ? `${from.slice(0, -1).join(", ")} or ${last}` : last;
   return `Cannot ${action} a campaign that is ${current}; it must be ${legal}`;
 }

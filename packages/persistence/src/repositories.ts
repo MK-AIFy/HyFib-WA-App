@@ -2502,6 +2502,32 @@ export const campaignRecipientRepository = {
       };
     });
   },
+  /**
+   * Retires every still-pending recipient of a cancelled campaign. Returns how
+   * many were retired.
+   *
+   * `WHERE status = 'pending'` is the whole point: an already sent, delivered,
+   * or read recipient must keep its outcome, because those messages really went
+   * out and cancelling must not rewrite that record.
+   *
+   * Reuses 'policy_skipped' rather than introducing a 'cancelled' recipient
+   * status. Nothing failed here — the send was deliberately not made — and the
+   * skip bucket is where deliberate non-sends already live. It also keeps the
+   * hardcoded status buckets in tenantAnalytics correct without change, which a
+   * new union member would silently bypass. The reason is carried in
+   * skip_reason, so the two kinds of skip stay distinguishable in reporting.
+   */
+  async cancelPending(tenantId: string, campaignId: string): Promise<number> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query(
+        `UPDATE campaign_recipients
+         SET status = 'policy_skipped', skip_reason = 'campaign_cancelled'
+         WHERE campaign_id = $1 AND status = 'pending'`,
+        [campaignId]
+      );
+      return result.rowCount ?? 0;
+    });
+  },
   async funnelCounts(tenantId: string, campaignId: string): Promise<Record<string, number>> {
     return withTenant(tenantId, async (client) => {
       const result = await client.query<{ status: string; count: string }>(

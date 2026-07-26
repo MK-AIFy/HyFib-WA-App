@@ -272,6 +272,67 @@ test("getStatus returns undefined for an unknown or other-tenant campaign", { sk
   assert.equal(await campaignRepository.getStatus(owner.tenant.id, "00000000-0000-0000-0000-0000000000ff"), undefined);
 });
 
+test("cancelPending retires only the still-pending recipients and reports how many", { skip }, async () => {
+  const { tenant, campaign, contacts } = await seedCampaign("CancelPending", 4);
+
+  // One already sent, one already delivered — both must survive untouched, or
+  // cancelling would rewrite the record of messages that really went out.
+  await withTenant(tenant.id, async (client) => {
+    await client.query(`UPDATE campaign_recipients SET status = 'sent' WHERE campaign_id = $1 AND contact_id = $2`, [
+      campaign.id,
+      contacts[0].id
+    ]);
+    await client.query(
+      `UPDATE campaign_recipients SET status = 'delivered' WHERE campaign_id = $1 AND contact_id = $2`,
+      [campaign.id, contacts[1].id]
+    );
+  });
+
+  const retired = await campaignRecipientRepository.cancelPending(tenant.id, campaign.id);
+  assert.equal(retired, 2, "only the two pending recipients should be retired");
+
+  const counts = await campaignRecipientRepository.funnelCounts(tenant.id, campaign.id);
+  assert.equal(counts.pending ?? 0, 0, "the funnel must drain to zero pending");
+  assert.equal(counts.sent, 1, "an already-sent recipient must be left alone");
+  assert.equal(counts.delivered, 1, "an already-delivered recipient must be left alone");
+  assert.equal(counts.policy_skipped, 2);
+});
+
+test("cancelPending records why the recipients were retired", { skip }, async () => {
+  const { tenant, campaign } = await seedCampaign("CancelReason", 2);
+
+  await campaignRecipientRepository.cancelPending(tenant.id, campaign.id);
+
+  const reasons = await withTenant(tenant.id, async (client) => {
+    const r = await client.query(
+      `SELECT DISTINCT skip_reason FROM campaign_recipients WHERE campaign_id = $1 AND status = 'policy_skipped'`,
+      [campaign.id]
+    );
+    return r.rows.map((row) => row.skip_reason);
+  });
+  assert.deepEqual(reasons, ["campaign_cancelled"]);
+});
+
+test("cancelPending is idempotent and tenant-isolated", { skip }, async () => {
+  const owner = await seedCampaign("CancelOwner", 2);
+  const other = await seedCampaign("CancelOther", 2);
+
+  assert.equal(await campaignRecipientRepository.cancelPending(owner.tenant.id, owner.campaign.id), 2);
+  assert.equal(
+    await campaignRecipientRepository.cancelPending(owner.tenant.id, owner.campaign.id),
+    0,
+    "a second cancel must retire nothing"
+  );
+  assert.equal(
+    await campaignRecipientRepository.cancelPending(other.tenant.id, owner.campaign.id),
+    0,
+    "another tenant must not be able to retire these recipients"
+  );
+
+  const otherCounts = await campaignRecipientRepository.funnelCounts(other.tenant.id, other.campaign.id);
+  assert.equal(otherCounts.pending, 2, "the other tenant's own campaign must be untouched");
+});
+
 test.after(async () => {
   if (!skip) {
     await closePool();
