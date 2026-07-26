@@ -185,6 +185,72 @@ test("updateStatus without onlyIfStatus keeps its existing unguarded behaviour",
   assert.equal(after.status, "failed");
 });
 
+async function readCampaignStatus(tenantId, campaignId) {
+  return withTenant(tenantId, async (client) => {
+    const r = await client.query(`SELECT status FROM campaigns WHERE id = $1`, [campaignId]);
+    return r.rows[0]?.status;
+  });
+}
+
+test("transition applies from a legal status and reports that it applied", { skip }, async () => {
+  const { tenant, campaign } = await seedCampaign("TransitionOk", 1);
+  await withTenant(tenant.id, async (client) => {
+    await client.query(`UPDATE campaigns SET status = 'running' WHERE id = $1`, [campaign.id]);
+  });
+
+  const applied = await campaignRepository.transition(tenant.id, campaign.id, ["running", "scheduled"], "paused");
+
+  assert.equal(applied, true);
+  assert.equal(await readCampaignStatus(tenant.id, campaign.id), "paused");
+});
+
+test("transition is a no-op from an illegal status and returns false", { skip }, async () => {
+  const { tenant, campaign } = await seedCampaign("TransitionIllegal", 1);
+  // seedCampaign leaves the campaign in 'draft', not a legal source for pause.
+
+  const applied = await campaignRepository.transition(tenant.id, campaign.id, ["running", "scheduled"], "paused");
+
+  assert.equal(applied, false, "an illegal transition must report false, not throw");
+  assert.equal(await readCampaignStatus(tenant.id, campaign.id), "draft", "status must be untouched");
+});
+
+test("transition cannot cross tenants", { skip }, async () => {
+  const owner = await seedCampaign("TransitionOwner", 1);
+  const other = await seedCampaign("TransitionOther", 1);
+  await withTenant(owner.tenant.id, async (client) => {
+    await client.query(`UPDATE campaigns SET status = 'running' WHERE id = $1`, [owner.campaign.id]);
+  });
+
+  const applied = await campaignRepository.transition(other.tenant.id, owner.campaign.id, ["running"], "paused");
+
+  assert.equal(applied, false, "another tenant must not be able to transition this campaign");
+  assert.equal(await readCampaignStatus(owner.tenant.id, owner.campaign.id), "running");
+});
+
+test("transition joins a caller's transaction and rolls back with it", { skip }, async () => {
+  const { tenant, campaign } = await seedCampaign("TransitionTxn", 1);
+  await withTenant(tenant.id, async (client) => {
+    await client.query(`UPDATE campaigns SET status = 'running' WHERE id = $1`, [campaign.id]);
+  });
+
+  // Resume must flip status and enqueue its run event atomically. Prove the flip
+  // is genuinely inside the caller's transaction by aborting that transaction.
+  await assert.rejects(
+    withTenant(tenant.id, async (client) => {
+      const applied = await campaignRepository.transition(tenant.id, campaign.id, ["running"], "paused", client);
+      assert.equal(applied, true);
+      throw new Error("abort");
+    }),
+    /abort/
+  );
+
+  assert.equal(
+    await readCampaignStatus(tenant.id, campaign.id),
+    "running",
+    "a rolled-back transaction must leave the status unchanged"
+  );
+});
+
 test.after(async () => {
   if (!skip) {
     await closePool();

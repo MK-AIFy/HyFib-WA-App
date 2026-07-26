@@ -781,6 +781,39 @@ export const campaignRepository = {
       return result.rows[0] ? mapCampaign(result.rows[0]) : undefined;
     });
   },
+  /**
+   * Compare-and-swap a campaign's status: applies only if it is currently one of
+   * `from`. Returns whether a row actually changed.
+   *
+   * CAS rather than read-then-write because two concurrent operators, or a pause
+   * racing the scheduler's 'scheduled' -> 'running' claim, would both pass a
+   * read-side guard. Same reasoning as the comment in runCampaign.
+   *
+   * The caller MUST use the return value. Under FORCE RLS an UPDATE issued
+   * without a tenant context matches zero rows and raises no error, so a silent
+   * no-op is the most likely production failure mode for a status write.
+   *
+   * Pass `client` to run inside a transaction the caller already opened — resume
+   * needs the status flip and its outbox enqueue to commit together, or a crash
+   * between them strands a 'running' campaign no worker was ever told about.
+   * Mirrors outboxRepository.enqueue, the existing client-accepting precedent.
+   */
+  async transition(
+    tenantId: string,
+    id: string,
+    from: readonly string[],
+    to: string,
+    client?: QueryClient
+  ): Promise<boolean> {
+    const run = async (c: QueryClient): Promise<boolean> => {
+      const result = await c.query<{ id: string }>(
+        "UPDATE campaigns SET status = $3 WHERE id = $1 AND status = ANY($2) RETURNING id",
+        [id, [...from], to]
+      );
+      return result.rows.length > 0;
+    };
+    return client ? run(client) : withTenant(tenantId, run);
+  },
   async setStatus(tenantId: string, id: string, status: Campaign["status"]): Promise<void> {
     await withTenant(tenantId, async (client) => {
       await client.query("UPDATE campaigns SET status = $2 WHERE id = $1", [id, status]);
