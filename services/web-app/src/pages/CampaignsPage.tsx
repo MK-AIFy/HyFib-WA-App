@@ -20,7 +20,8 @@ const STATUS_BADGE = {
   scheduled: "blue",
   running: "blue",
   paused: "yellow",
-  completed: "green"
+  completed: "green",
+  cancelled: "destructive"
 } as const;
 
 export function CampaignsPage() {

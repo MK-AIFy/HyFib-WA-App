@@ -781,6 +781,53 @@ export const campaignRepository = {
       return result.rows[0] ? mapCampaign(result.rows[0]) : undefined;
     });
   },
+  /**
+   * Reads just the status column. getById exists but drives CAMPAIGN_SELECT, a
+   * three-table join, which is far too heavy for the per-batch poll the campaign
+   * fan-out loop needs to notice a pause.
+   *
+   * Returns undefined when the campaign does not exist or belongs to another
+   * tenant — RLS makes those indistinguishable, deliberately.
+   */
+  async getStatus(tenantId: string, id: string): Promise<string | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<{ status: string }>("SELECT status FROM campaigns WHERE id = $1", [id]);
+      return result.rows[0]?.status;
+    });
+  },
+  /**
+   * Compare-and-swap a campaign's status: applies only if it is currently one of
+   * `from`. Returns whether a row actually changed.
+   *
+   * CAS rather than read-then-write because two concurrent operators, or a pause
+   * racing the scheduler's 'scheduled' -> 'running' claim, would both pass a
+   * read-side guard. Same reasoning as the comment in runCampaign.
+   *
+   * The caller MUST use the return value. Under FORCE RLS an UPDATE issued
+   * without a tenant context matches zero rows and raises no error, so a silent
+   * no-op is the most likely production failure mode for a status write.
+   *
+   * Pass `client` to run inside a transaction the caller already opened — resume
+   * needs the status flip and its outbox enqueue to commit together, or a crash
+   * between them strands a 'running' campaign no worker was ever told about.
+   * Mirrors outboxRepository.enqueue, the existing client-accepting precedent.
+   */
+  async transition(
+    tenantId: string,
+    id: string,
+    from: readonly string[],
+    to: string,
+    client?: QueryClient
+  ): Promise<boolean> {
+    const run = async (c: QueryClient): Promise<boolean> => {
+      const result = await c.query<{ id: string }>(
+        "UPDATE campaigns SET status = $3 WHERE id = $1 AND status = ANY($2) RETURNING id",
+        [id, [...from], to]
+      );
+      return result.rows.length > 0;
+    };
+    return client ? run(client) : withTenant(tenantId, run);
+  },
   async setStatus(tenantId: string, id: string, status: Campaign["status"]): Promise<void> {
     await withTenant(tenantId, async (client) => {
       await client.query("UPDATE campaigns SET status = $2 WHERE id = $1", [id, status]);
@@ -2341,6 +2388,15 @@ export const campaignRecipientRepository = {
       });
     }
   },
+  /**
+   * Writes a recipient's funnel status.
+   *
+   * `onlyIfStatus` makes the write conditional on the row still being in that
+   * status. Omit it for the unconditional behaviour every existing caller
+   * relies on. It exists for late writes that must never move a row backwards
+   * — e.g. suppressing a duplicate dispatch, where an outbox redelivery could
+   * otherwise downgrade an already 'sent'/'delivered'/'read' recipient.
+   */
   async updateStatus(
     tenantId: string,
     recipientId: string,
@@ -2349,6 +2405,7 @@ export const campaignRecipientRepository = {
       externalMessageId?: string;
       error?: string;
       skipReason?: string;
+      onlyIfStatus?: CampaignRecipient["status"];
     }
   ): Promise<void> {
     await withTenant(tenantId, async (client) => {
@@ -2359,8 +2416,16 @@ export const campaignRecipientRepository = {
              error = $4,
              skip_reason = $5,
              sent_at = CASE WHEN $2 = 'sent' THEN now() ELSE sent_at END
-         WHERE id = $1`,
-        [recipientId, update.status, update.externalMessageId ?? null, update.error ?? null, update.skipReason ?? null]
+         WHERE id = $1
+           AND ($6::text IS NULL OR status = $6)`,
+        [
+          recipientId,
+          update.status,
+          update.externalMessageId ?? null,
+          update.error ?? null,
+          update.skipReason ?? null,
+          update.onlyIfStatus ?? null
+        ]
       );
     });
   },
@@ -2437,6 +2502,32 @@ export const campaignRecipientRepository = {
       };
     });
   },
+  /**
+   * Retires every still-pending recipient of a cancelled campaign. Returns how
+   * many were retired.
+   *
+   * `WHERE status = 'pending'` is the whole point: an already sent, delivered,
+   * or read recipient must keep its outcome, because those messages really went
+   * out and cancelling must not rewrite that record.
+   *
+   * Reuses 'policy_skipped' rather than introducing a 'cancelled' recipient
+   * status. Nothing failed here — the send was deliberately not made — and the
+   * skip bucket is where deliberate non-sends already live. It also keeps the
+   * hardcoded status buckets in tenantAnalytics correct without change, which a
+   * new union member would silently bypass. The reason is carried in
+   * skip_reason, so the two kinds of skip stay distinguishable in reporting.
+   */
+  async cancelPending(tenantId: string, campaignId: string): Promise<number> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query(
+        `UPDATE campaign_recipients
+         SET status = 'policy_skipped', skip_reason = 'campaign_cancelled'
+         WHERE campaign_id = $1 AND status = 'pending'`,
+        [campaignId]
+      );
+      return result.rowCount ?? 0;
+    });
+  },
   async funnelCounts(tenantId: string, campaignId: string): Promise<Record<string, number>> {
     return withTenant(tenantId, async (client) => {
       const result = await client.query<{ status: string; count: string }>(
@@ -2451,18 +2542,66 @@ export const campaignRecipientRepository = {
       return counts;
     });
   },
-  /** Returns next batch of pending recipients to fan-out (cursor-based pagination). */
-  async claimPendingBatch(tenantId: string, campaignId: string, batchSize: number): Promise<CampaignRecipient[]> {
+  /**
+   * Claims the next batch of pending recipients for fan-out.
+   *
+   * This is a real claim, not a read: it stamps `claimed_at` on the rows it
+   * returns, so a later call cannot hand the same recipients out again. The
+   * previous implementation was a bare SELECT whose `FOR UPDATE SKIP LOCKED`
+   * locks were released by the enclosing `withTenant` COMMIT before the caller
+   * touched a row — and because the fan-out loop never marks approved
+   * recipients off 'pending' (they leave it only in handleDispatch), every
+   * call returned the same batch and the loop could not converge.
+   *
+   * No SECURITY DEFINER is needed: campaign_recipients is reached through
+   * withTenant, so RLS scopes both the CTE and the UPDATE.
+   *
+   * The `MATERIALIZED` keyword is load-bearing and must not be removed. With
+   * the subquery written inline as `WHERE id IN (SELECT ... LIMIT n)` the
+   * planner is free to turn it into a semi-join and re-execute the locking
+   * subplan once per candidate row; because FOR UPDATE SKIP LOCKED yields
+   * different rows on each execution, every outer row then finds a match and
+   * the batch size is silently ignored. Measured: a `LIMIT 4` claim over 10
+   * pending rows updated all 10 (`Nested Loop Semi Join ... loops=10`).
+   * MATERIALIZED forces the CTE to be evaluated exactly once.
+   *
+   * A claimed row becomes reclaimable after `staleClaimMinutes` so a process
+   * that dies between claiming and enqueueing does not strand recipients. The
+   * window must exceed one batch's wall time — batchSize / ratePerMinute,
+   * because pacing happens inside the fan-out loop — so the 2-minute constant
+   * outbox_claim uses would be wrong here. Reclaiming too early costs a
+   * duplicate outbox row, never a duplicate send: campaignSendLog.tryClaim is
+   * the exactly-once guard at send time.
+   *
+   * The RETURNING list is deliberately the pre-existing column set —
+   * `claimed_at` is excluded — so CampaignRecipientRow, mapRecipient, and the
+   * exported CampaignRecipient type are unchanged.
+   */
+  async claimPendingBatch(
+    tenantId: string,
+    campaignId: string,
+    batchSize: number,
+    staleClaimMinutes = 15
+  ): Promise<CampaignRecipient[]> {
     return withTenant(tenantId, async (client) => {
       const result = await client.query<CampaignRecipientRow>(
-        `SELECT id, tenant_id, campaign_id, contact_id, phone_e164, status,
-                external_message_id, error, skip_reason, sent_at, delivered_at, read_at, created_at
-         FROM campaign_recipients
-         WHERE campaign_id = $1 AND status = 'pending'
-         ORDER BY created_at ASC
-         LIMIT $2
-         FOR UPDATE SKIP LOCKED`,
-        [campaignId, batchSize]
+        `WITH claimed AS MATERIALIZED (
+           SELECT c.id FROM campaign_recipients c
+           WHERE c.campaign_id = $1
+             AND c.status = 'pending'
+             AND (c.claimed_at IS NULL OR c.claimed_at < now() - make_interval(mins => $3::int))
+           ORDER BY c.created_at
+           FOR UPDATE SKIP LOCKED
+           LIMIT $2
+         )
+         UPDATE campaign_recipients r
+         SET claimed_at = now()
+         FROM claimed
+         WHERE r.id = claimed.id
+         RETURNING r.id, r.tenant_id, r.campaign_id, r.contact_id, r.phone_e164, r.status,
+                   r.external_message_id, r.error, r.skip_reason,
+                   r.sent_at, r.delivered_at, r.read_at, r.created_at`,
+        [campaignId, batchSize, staleClaimMinutes]
       );
       return result.rows.map(mapRecipient);
     });

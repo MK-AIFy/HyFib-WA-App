@@ -11,6 +11,7 @@ import {
   automationRuleRepository,
   billingRepository,
   campaignRecipientRepository,
+  campaignRepository,
   campaignSendLog,
   campaignStatsRepository,
   channelRepository,
@@ -261,6 +262,28 @@ async function handleDispatch(event: EventEnvelope): Promise<void> {
   const claimed = await campaignSendLog.tryClaim(command.tenantId, command.campaignId, command.contactPhoneE164);
   if (!claimed) {
     logger.info("dispatch_duplicate_skipped", { campaignId: command.campaignId });
+    // Record the suppression on the funnel row, otherwise it stays 'pending'
+    // forever: claimPendingBatch reclaims stale claims, so a permanently-pending
+    // recipient is re-claimed and re-enqueued every stale window and the
+    // campaign never drains. Guarded on 'pending' so an outbox redelivery for a
+    // recipient that already sent cannot downgrade it. Best-effort, like the
+    // quota gate below — a bookkeeping failure must not rethrow, since broker
+    // retry would only re-suppress.
+    if (command.recipientId) {
+      await campaignRecipientRepository
+        .updateStatus(command.tenantId, command.recipientId, {
+          status: "policy_skipped",
+          skipReason: "duplicate_send_suppressed",
+          onlyIfStatus: "pending"
+        })
+        .catch((error) =>
+          logger.warn("dispatch_duplicate_recipient_update_failed", {
+            campaignId: command.campaignId,
+            recipientId: command.recipientId,
+            error: error instanceof Error ? error.message : String(error)
+          })
+        );
+    }
     return;
   }
   try {
@@ -362,8 +385,11 @@ async function handleCampaignRun(event: EventEnvelope): Promise<void> {
 
   logger.info("campaign_run_started", { campaignId: run.campaignId, tenantId: run.tenantId });
 
-  // Process in batches of 50; claimPendingBatch advisory-locks rows so a
-  // restarted worker won't re-dispatch the same contacts.
+  // Process in batches of 50. claimPendingBatch stamps claimed_at on the rows
+  // it returns, so a restarted worker (or a second concurrent loop) never
+  // re-dispatches the same contacts. Claims older than the repository's stale
+  // window are reclaimable, so a crash between claiming and enqueueing does
+  // not strand recipients.
   let processed = 0;
   let batches = 0;
   const MAX_BATCHES = 10_000; // Safety limit (~500K contacts per invocation)
@@ -372,9 +398,33 @@ async function handleCampaignRun(event: EventEnvelope): Promise<void> {
     ? new Date(Date.now() - run.frequencyCap.periodHours * 60 * 60 * 1000).toISOString()
     : null;
 
+  // Why the loop tracks its exit reason: only a run that genuinely drained may
+  // be marked 'completed'. Stopping because an operator paused, or because the
+  // batch cap tripped, leaves the campaign exactly as it is.
+  let exitReason: "drained" | "stopped" | "cap" = "cap";
+
   while (batches < MAX_BATCHES) {
+    // Re-read the status before claiming more work. The event payload is a
+    // frozen snapshot taken at start, so it can never reflect a pause — this
+    // poll is the only way the loop learns about one. It costs one
+    // single-column read per 50 recipients.
+    //
+    // Checking here, before the claim, is what makes pause mean "no new batches
+    // are started": the batch already in hand runs to completion so its claimed
+    // recipients are not stranded mid-flight. Worst-case pause latency is
+    // therefore one batch, which at the default 60/min is roughly a minute.
+    const status = await campaignRepository.getStatus(run.tenantId, run.campaignId);
+    if (status !== "running") {
+      exitReason = "stopped";
+      logger.info("campaign_run_stopped", { campaignId: run.campaignId, status: status ?? "missing", processed });
+      break;
+    }
+
     const batch = await campaignRecipientRepository.claimPendingBatch(run.tenantId, run.campaignId, 50);
-    if (batch.length === 0) break;
+    if (batch.length === 0) {
+      exitReason = "drained";
+      break;
+    }
     batches++;
 
     // Batch-load all data needed for policy evaluation in 3-4 parallel queries
@@ -495,7 +545,31 @@ async function handleCampaignRun(event: EventEnvelope): Promise<void> {
       maxBatches: MAX_BATCHES
     });
   }
-  logger.info("campaign_run_completed", { campaignId: run.campaignId, processed });
+
+  // The first and only writer of a terminal campaign status. Until the claim
+  // became a real claim this point was unreachable — the loop re-selected the
+  // same recipients forever and never drained — which is why 'running' has so
+  // far been terminal in practice.
+  //
+  // Guarded on 'running' rather than written unconditionally: an operator may
+  // have paused between the last claim and here, and a drained run must not
+  // clobber that. The CAS losing is the correct outcome, not an error.
+  if (exitReason === "drained") {
+    const completed = await campaignRepository
+      .transition(run.tenantId, run.campaignId, ["running"], "completed")
+      .catch((error: unknown) => {
+        logger.warn("campaign_complete_write_failed", {
+          campaignId: run.campaignId,
+          error: error instanceof Error ? error.message : String(error)
+        });
+        return false;
+      });
+    if (!completed) {
+      logger.info("campaign_complete_skipped", { campaignId: run.campaignId, processed });
+    }
+  }
+
+  logger.info("campaign_run_completed", { campaignId: run.campaignId, processed, exitReason });
 }
 
 /**
@@ -1080,9 +1154,15 @@ export interface WorkerDeps {
  *
  * Durability: campaign runs and outbound sends are enqueued to the DB outbox by
  * the gateway; the gateway's outbox relay (started by app-server) re-publishes
- * unprocessed rows after a crash, and the synchronous in-memory bus + idempotent
- * claimPendingBatch make re-processing safe — so no separate resume sweep is
- * needed here.
+ * unprocessed rows after a crash. Re-processing is safe because
+ * claimPendingBatch will not hand out an already-claimed recipient and
+ * campaignSendLog.tryClaim is the exactly-once guard at send time — so no
+ * separate resume sweep is needed here.
+ *
+ * Caveat worth knowing before changing this: the in-memory bus awaits handler
+ * completion and the relay publishes sequentially, so a long campaign fan-out
+ * blocks the outbox relay for its whole duration. Pacing happens inside the
+ * fan-out loop, so that duration scales with the recipient count.
  */
 export function registerWorkerConsumers(deps: WorkerDeps = {}): void {
   if (deps.eventBus) {
