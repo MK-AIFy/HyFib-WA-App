@@ -782,6 +782,26 @@ export const campaignRepository = {
     });
   },
   /**
+   * Completes every running campaign whose recipients have all resolved.
+   * Returns the campaigns it completed.
+   *
+   * Cross-tenant and therefore routed through a SECURITY DEFINER function
+   * (023_campaign_completion.sql), like outboxRepository.claim — the sweeper
+   * runs in a scheduler context with no app.tenant_id, where an RLS-scoped
+   * query would silently match nothing.
+   *
+   * The fan-out loop deliberately does NOT write 'completed' itself: an empty
+   * claim batch means "nothing unclaimed right now", not "finished", because
+   * recipients it claimed a moment ago are still pending with their dispatch
+   * rows queued. This sweep is the single writer of that status.
+   */
+  async completeDrained(limit: number): Promise<Array<{ id: string; tenantId: string }>> {
+    const result = await query<{ id: string; tenant_id: string }>("SELECT * FROM complete_drained_campaigns($1)", [
+      limit
+    ]);
+    return result.rows.map((row) => ({ id: row.id, tenantId: row.tenant_id }));
+  },
+  /**
    * Reads just the status column. getById exists but drives CAMPAIGN_SELECT, a
    * three-table join, which is far too heavy for the per-batch poll the campaign
    * fan-out loop needs to notice a pause.

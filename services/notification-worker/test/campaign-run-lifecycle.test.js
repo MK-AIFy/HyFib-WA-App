@@ -91,21 +91,16 @@ async function driveRun({ statuses, batches }) {
   return { claims: claims.length, transitions };
 }
 
-test("handleCampaignRun: a drained run writes the terminal 'completed' status", async () => {
+test("handleCampaignRun: a drained run does NOT complete the campaign itself", async () => {
   const { claims, transitions } = await driveRun({ statuses: ["running"], batches: [[]] });
 
   assert.equal(claims, 1, "a running campaign should claim once and find nothing");
-  assert.deepEqual(transitions, [{ tenantId: "t-1", id: "camp-1", from: ["running"], to: "completed" }]);
-});
-
-test("handleCampaignRun: the completed write is guarded on 'running' so a concurrent pause wins", async () => {
-  const { transitions } = await driveRun({ statuses: ["running"], batches: [[]] });
-
-  assert.deepEqual(
-    transitions[0].from,
-    ["running"],
-    "guarding on 'running' is what stops a drained run clobbering a pause that landed first"
-  );
+  // An empty claim batch means "nothing unclaimed right now", not "finished":
+  // recipients claimed a moment ago are still pending with their dispatch rows
+  // queued. Completing here marked campaigns finished while their own sends were
+  // in flight, and the dispatch-time guard then refused to send them.
+  // complete_drained_campaigns owns this transition now.
+  assert.deepEqual(transitions, [], "the fan-out loop must never write a terminal status");
 });
 
 test("handleCampaignRun: a paused campaign stops before claiming and is not marked completed", async () => {

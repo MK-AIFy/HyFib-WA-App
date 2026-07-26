@@ -1296,6 +1296,41 @@ function startNoReplyScheduler(): NodeJS.Timeout {
   }, 60_000);
 }
 
+/**
+ * Completes running campaigns whose recipients have all resolved.
+ *
+ * The fan-out loop cannot do this itself: an empty claim batch means "nothing
+ * unclaimed right now", not "finished", because recipients claimed a moment ago
+ * are still pending with their dispatch rows queued. Under the in-memory bus the
+ * relay publishes those rows only after the loop returns, so at loop exit there
+ * are always pending recipients. Completion has to be observed after the sends
+ * resolve, which is what this does.
+ *
+ * 60s because completion is a reporting state that nothing blocks on — the
+ * pendingRecipients count returned by pause is the live signal operators use.
+ */
+function startCampaignCompletionScheduler(): NodeJS.Timeout {
+  let running = false;
+  return setInterval(() => {
+    if (running) return;
+    running = true;
+    void (async () => {
+      try {
+        const completed = await campaignRepository.completeDrained(50);
+        for (const campaign of completed) {
+          logger.info("campaign_completed", { campaignId: campaign.id, tenantId: campaign.tenantId });
+        }
+      } catch (error) {
+        logger.error("campaign_completion_scheduler_error", {
+          error: error instanceof Error ? error.message : String(error)
+        });
+      } finally {
+        running = false;
+      }
+    })();
+  }, 60_000);
+}
+
 /** Dispatches due task reminders (status open, remind_at passed) once via SSE. */
 function startReminderScheduler(): NodeJS.Timeout {
   let running = false;
@@ -3840,6 +3875,7 @@ export function createGatewayHandler(deps: GatewayDeps = {}): GatewayModule {
     startSchedulers: () => [
       startOutboxRelay(),
       startCampaignScheduler(),
+      startCampaignCompletionScheduler(),
       startNoReplyScheduler(),
       startReminderScheduler(),
       startSessionPurgeScheduler()

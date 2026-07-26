@@ -576,29 +576,18 @@ async function handleCampaignRun(event: EventEnvelope): Promise<void> {
     });
   }
 
-  // The first and only writer of a terminal campaign status. Until the claim
-  // became a real claim this point was unreachable — the loop re-selected the
-  // same recipients forever and never drained — which is why 'running' has so
-  // far been terminal in practice.
+  // This loop deliberately does NOT write 'completed'. An empty claim batch
+  // means "nothing unclaimed right now", not "finished": claimPendingBatch
+  // excludes rows it just stamped with claimed_at, so the recipients claimed on
+  // the previous iteration are still pending with their dispatch rows queued in
+  // the outbox. Completing here marked a campaign finished while its own sends
+  // were still in flight, and the dispatch-time status guard then correctly
+  // refused to send them — the campaign delivered nothing.
   //
-  // Guarded on 'running' rather than written unconditionally: an operator may
-  // have paused between the last claim and here, and a drained run must not
-  // clobber that. The CAS losing is the correct outcome, not an error.
-  if (exitReason === "drained") {
-    const completed = await campaignRepository
-      .transition(run.tenantId, run.campaignId, ["running"], "completed")
-      .catch((error: unknown) => {
-        logger.warn("campaign_complete_write_failed", {
-          campaignId: run.campaignId,
-          error: error instanceof Error ? error.message : String(error)
-        });
-        return false;
-      });
-    if (!completed) {
-      logger.info("campaign_complete_skipped", { campaignId: run.campaignId, processed });
-    }
-  }
-
+  // Completion is owned solely by complete_drained_campaigns
+  // (023_campaign_completion.sql), swept by the gateway once the sends actually
+  // resolve. exitReason is kept for logging: distinguishing a drained exit from
+  // a pause or the batch cap is still worth having in the log.
   logger.info("campaign_run_completed", { campaignId: run.campaignId, processed, exitReason });
 }
 
