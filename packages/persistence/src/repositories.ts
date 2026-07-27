@@ -2018,6 +2018,20 @@ export const outboxRepository = {
       [tenantId, input.topic, JSON.stringify(input.payload), toTimestamp(input.nextAttemptAt)]
     );
   },
+  /**
+   * Enqueue an event in its own transaction, for callers that are not already
+   * inside one.
+   *
+   * Used to defer a dispatch that would exceed its campaign's rate: the send is
+   * re-queued at a later time instead of being slept on, which is what keeps the
+   * relay free. Kept as a repository method rather than an inline withTenant so
+   * the worker's deferral path can be stubbed in tests without a database.
+   */
+  async enqueueOwn(tenantId: string, input: OutboxEnqueueInput): Promise<void> {
+    await withTenant(tenantId, async (client) => {
+      await outboxRepository.enqueue(client, tenantId, input);
+    });
+  },
   /** Batch-enqueue multiple events in one statement (still within the caller's transaction). */
   async enqueueBatch(client: QueryClient, tenantId: string, inputs: OutboxEnqueueInput[]): Promise<void> {
     if (inputs.length === 0) return;

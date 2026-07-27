@@ -32,8 +32,8 @@ import {
   type ChannelCredentials,
   type OutboxEnqueueInput
 } from "@hyfib/persistence";
-import { getRedisClient } from "@hyfib/ratelimit";
-import { dispatchScheduleAt, continuationScheduleAt, isFinalBatch } from "./pacing.js";
+import { getRedisClient, checkRateLimit } from "@hyfib/ratelimit";
+import { dispatchScheduleAt, continuationScheduleAt, isFinalBatch, BATCH_SIZE } from "./pacing.js";
 import {
   EventTopics,
   Logger,
@@ -289,6 +289,34 @@ async function handleDispatch(event: EventEnvelope): Promise<void> {
     }
   }
 
+  // Hard rate cap, enforced without sleeping.
+  //
+  // Pacing is a schedule now, which is what freed the relay — but a schedule is
+  // only advisory: if the relay falls behind, every backlogged row becomes
+  // eligible at once and would burst past the campaign's configured rate. This
+  // restores the cap by re-queueing an over-budget send for later instead of
+  // blocking on it, so the relay stays free and the campaign still paces.
+  //
+  // checkRateLimit is the non-blocking half of the limiter — acquireRateLimit,
+  // which sleeps, is exactly what must never run on this path. Deferring before
+  // tryClaim keeps the exactly-once claim unburned, same reasoning as the
+  // campaign-status guard above.
+  if (command.recipientId && command.ratePerMinute) {
+    const budget = await checkRateLimit(redis, `campaign:${command.campaignId}`, command.ratePerMinute);
+    if (!budget.allowed) {
+      await outboxRepository.enqueueOwn(command.tenantId, {
+        topic: EventTopics.CampaignDispatchRequested,
+        payload: { ...command } as unknown as Record<string, unknown>,
+        nextAttemptAt: new Date(Date.now() + budget.waitMs)
+      });
+      logger.info("dispatch_deferred_rate_cap", {
+        campaignId: command.campaignId,
+        waitMs: budget.waitMs
+      });
+      return;
+    }
+  }
+
   // Dedupe: claim before sending; release on failure so redelivery can retry.
   const claimed = await campaignSendLog.tryClaim(command.tenantId, command.campaignId, command.contactPhoneE164);
   if (!claimed) {
@@ -422,53 +450,43 @@ async function handleCampaignRun(event: EventEnvelope): Promise<void> {
 
   logger.info("campaign_run_started", { campaignId: run.campaignId, tenantId: run.tenantId });
 
-  // Process in batches of 50. claimPendingBatch stamps claimed_at on the rows
-  // it returns, so a restarted worker (or a second concurrent loop) never
-  // re-dispatches the same contacts. Claims older than the repository's stale
-  // window are reclaimable, so a crash between claiming and enqueueing does
-  // not strand recipients.
-  let processed = 0;
-  let batches = 0;
-  // One batch per invocation. The loop is kept as a single-iteration `while` so
-  // the pause check, claim, and per-recipient body stay exactly as they were;
-  // it breaks unconditionally at the end and re-enters via a scheduled
-  // continuation event instead. Looping here is what made a run hold the relay
+  // Exactly one batch per invocation, then return. Re-entry happens through a
+  // scheduled continuation event, not a loop: looping here is what made a run
+  // hold the outbox relay — and therefore every outbound message in the system —
   // for its entire duration.
-  const MAX_BATCHES = 1;
-  // Pre-compute the frequency-cap since-date once per run (shared across all recipients).
+  //
+  // claimPendingBatch stamps claimed_at on the rows it returns, so a restarted
+  // worker or a second concurrent invocation never re-dispatches the same
+  // contacts. Claims older than the repository's stale window are reclaimable,
+  // so a crash between claiming and enqueueing does not strand recipients.
+  let processed = 0;
+  // Pre-compute the frequency-cap since-date once (shared across all recipients).
   const frequencyCapSince = run.frequencyCap
     ? new Date(Date.now() - run.frequencyCap.periodHours * 60 * 60 * 1000).toISOString()
     : null;
 
-  // Why the loop tracks its exit reason: only a run that genuinely drained may
-  // be marked 'completed'. Stopping because an operator paused, or because the
-  // batch cap tripped, leaves the campaign exactly as it is.
-  let exitReason: "drained" | "stopped" | "cap" = "cap";
+  // Re-read the status before claiming work. The event payload is a frozen
+  // snapshot taken when the run was first requested, so it can never reflect a
+  // pause — this poll is the only way an in-flight campaign learns about one.
+  // It costs one single-column read per batch.
+  //
+  // Checking before the claim is what makes pause mean "no new batches are
+  // started": the batch already in hand runs to completion, so its claimed
+  // recipients are not stranded mid-flight. Worst-case pause latency is one
+  // batch window, roughly a minute at the default 60/min.
+  const status = await campaignRepository.getStatus(run.tenantId, run.campaignId);
+  if (status !== "running") {
+    logger.info("campaign_run_stopped", { campaignId: run.campaignId, status: status ?? "missing", processed });
+    return;
+  }
 
-  while (batches < MAX_BATCHES) {
-    // Re-read the status before claiming more work. The event payload is a
-    // frozen snapshot taken at start, so it can never reflect a pause — this
-    // poll is the only way the loop learns about one. It costs one
-    // single-column read per 50 recipients.
-    //
-    // Checking here, before the claim, is what makes pause mean "no new batches
-    // are started": the batch already in hand runs to completion so its claimed
-    // recipients are not stranded mid-flight. Worst-case pause latency is
-    // therefore one batch, which at the default 60/min is roughly a minute.
-    const status = await campaignRepository.getStatus(run.tenantId, run.campaignId);
-    if (status !== "running") {
-      exitReason = "stopped";
-      logger.info("campaign_run_stopped", { campaignId: run.campaignId, status: status ?? "missing", processed });
-      break;
-    }
+  const batch = await campaignRecipientRepository.claimPendingBatch(run.tenantId, run.campaignId, BATCH_SIZE);
+  if (batch.length === 0) {
+    logger.info("campaign_run_completed", { campaignId: run.campaignId, processed, exitReason: "drained" });
+    return;
+  }
 
-    const batch = await campaignRecipientRepository.claimPendingBatch(run.tenantId, run.campaignId, 50);
-    if (batch.length === 0) {
-      exitReason = "drained";
-      break;
-    }
-    batches++;
-
+  {
     // Batch-load all data needed for policy evaluation in 3-4 parallel queries
     // instead of 4 sequential per-contact queries (N+1 → O(1) per batch).
     const contactIds = batch.map((r) => r.contactId);
@@ -571,7 +589,10 @@ async function handleCampaignRun(event: EventEnvelope): Promise<void> {
           templateCategory: run.templateCategory,
           contactPhoneE164: recipient.phoneE164,
           parameters,
-          recipientId: recipient.id
+          recipientId: recipient.id,
+          // Carried so the dispatch can enforce the cap if the relay ever runs
+          // the backlog faster than this schedule intended.
+          ratePerMinute
         } satisfies CampaignDispatchRequest
       });
       processed++;
@@ -601,18 +622,9 @@ async function handleCampaignRun(event: EventEnvelope): Promise<void> {
         await outboxRepository.enqueueBatch(client, run.tenantId, toEnqueue);
       });
     }
-    break;
   }
 
-  if (batches >= MAX_BATCHES) {
-    logger.warn("campaign_run_max_batches_hit", {
-      campaignId: run.campaignId,
-      processed,
-      maxBatches: MAX_BATCHES
-    });
-  }
-
-  // This loop deliberately does NOT write 'completed'. An empty claim batch
+  // This handler deliberately does NOT write 'completed'. An empty claim batch
   // means "nothing unclaimed right now", not "finished": claimPendingBatch
   // excludes rows it just stamped with claimed_at, so the recipients claimed on
   // the previous iteration are still pending with their dispatch rows queued in
@@ -622,9 +634,8 @@ async function handleCampaignRun(event: EventEnvelope): Promise<void> {
   //
   // Completion is owned solely by complete_drained_campaigns
   // (023_campaign_completion.sql), swept by the gateway once the sends actually
-  // resolve. exitReason is kept for logging: distinguishing a drained exit from
-  // a pause or the batch cap is still worth having in the log.
-  logger.info("campaign_run_completed", { campaignId: run.campaignId, processed, exitReason });
+  // resolve.
+  logger.info("campaign_run_completed", { campaignId: run.campaignId, processed, exitReason: "batch_scheduled" });
 }
 
 /**
