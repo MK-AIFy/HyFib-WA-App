@@ -87,6 +87,49 @@ test("outbox_claim never returns more rows than its limit", { skip }, async () =
   });
 });
 
+test("enqueue honours an explicit nextAttemptAt so work can be scheduled, not slept on", { skip }, async () => {
+  const t = await tenantRepository.create("Outbox Schedule Tenant");
+  const future = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+  await withTenant(t.id, async (client) => {
+    await outboxRepository.enqueue(client, t.id, {
+      topic: "schedule.single",
+      payload: { case: "single" },
+      nextAttemptAt: future
+    });
+    await outboxRepository.enqueueBatch(client, t.id, [
+      { topic: "schedule.batch.now", payload: { i: 0 } },
+      { topic: "schedule.batch.later", payload: { i: 1 }, nextAttemptAt: future }
+    ]);
+  });
+
+  const rows = await withTenant(t.id, async (client) => {
+    const r = await client.query(
+      `SELECT topic, next_attempt_at FROM outbox_events WHERE tenant_id = $1 ORDER BY topic`,
+      [t.id]
+    );
+    return r.rows;
+  });
+  const byTopic = Object.fromEntries(rows.map((r) => [r.topic, new Date(r.next_attempt_at).getTime()]));
+  const futureMs = new Date(future).getTime();
+
+  assert.equal(byTopic["schedule.single"], futureMs, "an explicit nextAttemptAt must be stored verbatim");
+  assert.equal(byTopic["schedule.batch.later"], futureMs, "enqueueBatch must honour per-row scheduling");
+  assert.ok(byTopic["schedule.batch.now"] < futureMs, "a row without nextAttemptAt must keep the immediate default");
+
+  // A future next_attempt_at is exactly what outbox_claim filters on, so a
+  // scheduled row is not yet claimable — that filter is what replaces sleeping
+  // inside the fan-out loop. Asserted on the column rather than by calling
+  // claim(): claim() is SECURITY DEFINER and not tenant-scoped, and node --test
+  // runs test files in parallel, so calling it here would race the outbox tests
+  // in other files and steal their rows. The filter itself is already covered
+  // by "outbox_claim only returns rows whose next_attempt_at has passed" above.
+  assert.ok(futureMs > Date.now(), "the scheduled rows are genuinely in the future");
+
+  await withTenant(t.id, async (client) => {
+    await client.query("DELETE FROM outbox_events WHERE tenant_id = $1", [t.id]);
+  });
+});
+
 test("markFailed walks a row to 'dead' after max attempts and backs off next_attempt_at", { skip }, async () => {
   const t = await tenantRepository.create("Outbox Durability Tenant B");
   let id;

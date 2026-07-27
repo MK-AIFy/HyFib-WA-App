@@ -32,7 +32,8 @@ import {
   type ChannelCredentials,
   type OutboxEnqueueInput
 } from "@hyfib/persistence";
-import { getRedisClient, acquireRateLimit } from "@hyfib/ratelimit";
+import { getRedisClient } from "@hyfib/ratelimit";
+import { dispatchScheduleAt, continuationScheduleAt, isFinalBatch } from "./pacing.js";
 import {
   EventTopics,
   Logger,
@@ -409,9 +410,15 @@ async function handleCampaignRun(event: EventEnvelope): Promise<void> {
     return;
   }
 
-  const channel = await resolveSendChannel(run.tenantId, run.channelId);
-  const rateScopeKey = `campaign:${run.campaignId}:${channel.phoneNumberId}`;
+  // The channel is no longer resolved here. It was only needed to build the
+  // token-bucket scope key for the pacing sleep; handleDispatch resolves its own
+  // channel at send time, so reading credentials per batch was pure dead work.
   const ratePerMinute = run.ratePerMinute ?? 60;
+  // Every send scheduled by this invocation is offset from a single instant, so
+  // the batch is spread evenly rather than clustered at whatever moment each
+  // recipient happened to be processed.
+  const runStartedAt = Date.now();
+  let scheduled = 0;
 
   logger.info("campaign_run_started", { campaignId: run.campaignId, tenantId: run.tenantId });
 
@@ -422,7 +429,12 @@ async function handleCampaignRun(event: EventEnvelope): Promise<void> {
   // not strand recipients.
   let processed = 0;
   let batches = 0;
-  const MAX_BATCHES = 10_000; // Safety limit (~500K contacts per invocation)
+  // One batch per invocation. The loop is kept as a single-iteration `while` so
+  // the pause check, claim, and per-recipient body stay exactly as they were;
+  // it breaks unconditionally at the end and re-enters via a scheduled
+  // continuation event instead. Looping here is what made a run hold the relay
+  // for its entire duration.
+  const MAX_BATCHES = 1;
   // Pre-compute the frequency-cap since-date once per run (shared across all recipients).
   const frequencyCapSince = run.frequencyCap
     ? new Date(Date.now() - run.frequencyCap.periodHours * 60 * 60 * 1000).toISOString()
@@ -540,10 +552,15 @@ async function handleCampaignRun(event: EventEnvelope): Promise<void> {
         });
       }
 
-      // Rate pacing: acquire a slot from the token bucket; waits if needed.
-      await acquireRateLimit(redis, rateScopeKey, ratePerMinute).catch(() => undefined);
-
+      // Rate pacing is a schedule, not a sleep. This used to call
+      // acquireRateLimit, which blocks until a token-bucket slot frees up —
+      // and because the in-memory bus awaits its handler while the outbox relay
+      // holds a re-entrancy guard, that blocked every outbound message
+      // platform-wide for the whole run (~2.8h for 10k at the default 60/min).
+      // Stamping the row instead lets the relay's next_attempt_at filter pace
+      // delivery while this handler returns immediately.
       toEnqueue.push({
+        nextAttemptAt: dispatchScheduleAt(runStartedAt, scheduled++, ratePerMinute),
         topic: EventTopics.CampaignDispatchRequested,
         payload: {
           campaignId: run.campaignId,
@@ -560,12 +577,31 @@ async function handleCampaignRun(event: EventEnvelope): Promise<void> {
       processed++;
     }
 
-    // Batch-insert all approved dispatch events in a single transaction.
+    // A full batch means more recipients may remain, so this run must re-enter.
+    // The continuation is scheduled a whole batch-window ahead: re-entering
+    // sooner would claim and schedule faster than the previous batch is being
+    // delivered, piling up outbox rows and defeating the pacing.
+    //
+    // It rides the same durable outbox as the dispatches — retried, and
+    // dead-lettered after the usual attempt cap — rather than being held in
+    // memory, so a crash between batches does not abandon the campaign.
+    if (!isFinalBatch(batch.length)) {
+      toEnqueue.push({
+        nextAttemptAt: continuationScheduleAt(runStartedAt, ratePerMinute),
+        topic: EventTopics.CampaignRunRequested,
+        payload: { ...run } as unknown as Record<string, unknown>
+      });
+    }
+
+    // Batch-insert the approved dispatch events and any continuation in a
+    // single transaction, so a campaign can never lose its continuation while
+    // keeping the sends it belongs to.
     if (toEnqueue.length > 0) {
       await withTenant(run.tenantId, async (client) => {
         await outboxRepository.enqueueBatch(client, run.tenantId, toEnqueue);
       });
     }
+    break;
   }
 
   if (batches >= MAX_BATCHES) {
