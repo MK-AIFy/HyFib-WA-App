@@ -2838,12 +2838,34 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return;
     }
     const result = await dispatchCampaign(tenantId, campaign, template, payload);
-    await audit(tenantId, auth, {
-      action: "campaign.dispatch.requested",
-      resourceType: "Campaign",
-      resourceId: campaignId,
-      payload: { parametersCount: payload.parameters?.length ?? 0 }
-    });
+    // Audit the outcome, not the attempt. This previously logged
+    // 'campaign.dispatch.requested' unconditionally, so a send the policy engine
+    // refused was recorded exactly like one that went out — a compliance review
+    // reading this trail would conclude messages were queued that never were.
+    // /run already gates its audit on success; this matches it.
+    //
+    // A refused send is still recorded, under its own action and with the
+    // reason, because "someone tried to message a contact without consent" is
+    // precisely what a consent-first audit trail exists to capture.
+    if (result.status === 202) {
+      await audit(tenantId, auth, {
+        action: "campaign.dispatch.requested",
+        resourceType: "Campaign",
+        resourceId: campaignId,
+        payload: { parametersCount: payload.parameters?.length ?? 0 }
+      });
+    } else {
+      await audit(tenantId, auth, {
+        action: "campaign.dispatch.blocked",
+        resourceType: "Campaign",
+        resourceId: campaignId,
+        payload: {
+          status: result.status,
+          error: (result.body as Record<string, unknown>).error ?? null,
+          reason: (result.body as Record<string, unknown>).reason ?? null
+        }
+      });
+    }
     sendJson(res, result.status, result.body);
     return;
   }
