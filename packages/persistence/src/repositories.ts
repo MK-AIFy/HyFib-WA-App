@@ -782,6 +782,26 @@ export const campaignRepository = {
     });
   },
   /**
+   * Completes every running campaign whose recipients have all resolved.
+   * Returns the campaigns it completed.
+   *
+   * Cross-tenant and therefore routed through a SECURITY DEFINER function
+   * (023_campaign_completion.sql), like outboxRepository.claim — the sweeper
+   * runs in a scheduler context with no app.tenant_id, where an RLS-scoped
+   * query would silently match nothing.
+   *
+   * The fan-out loop deliberately does NOT write 'completed' itself: an empty
+   * claim batch means "nothing unclaimed right now", not "finished", because
+   * recipients it claimed a moment ago are still pending with their dispatch
+   * rows queued. This sweep is the single writer of that status.
+   */
+  async completeDrained(limit: number): Promise<Array<{ id: string; tenantId: string }>> {
+    const result = await query<{ id: string; tenant_id: string }>("SELECT * FROM complete_drained_campaigns($1)", [
+      limit
+    ]);
+    return result.rows.map((row) => ({ id: row.id, tenantId: row.tenant_id }));
+  },
+  /**
    * Reads just the status column. getById exists but drives CAMPAIGN_SELECT, a
    * three-table join, which is far too heavy for the per-batch poll the campaign
    * fan-out loop needs to notice a pause.
@@ -1951,6 +1971,16 @@ export const messageRepository = {
 export interface OutboxEnqueueInput {
   topic: string;
   payload: Record<string, unknown>;
+  /**
+   * When this row becomes eligible for the relay. Omit for immediate delivery.
+   *
+   * This is how campaign pacing works: rather than sleeping inside the fan-out
+   * loop — which blocked the relay, and with it every outbound message
+   * platform-wide, for the whole run — dispatch rows are stamped with the time
+   * they should go out and the relay's existing `next_attempt_at <= now()`
+   * filter does the pacing for free.
+   */
+  nextAttemptAt?: Date | string;
 }
 
 export interface OutboxRow {
@@ -1973,24 +2003,46 @@ export interface OutboxDeadRow {
   created_at: Date;
 }
 
+/** Normalises an optional schedule to a string Postgres can cast, or null for "now". */
+function toTimestamp(value: Date | string | undefined): string | null {
+  if (value === undefined) return null;
+  return value instanceof Date ? value.toISOString() : value;
+}
+
 export const outboxRepository = {
   /** Enqueue an event in the SAME transaction as the domain change (atomic). */
   async enqueue(client: QueryClient, tenantId: string, input: OutboxEnqueueInput): Promise<void> {
     await client.query(
-      "INSERT INTO outbox_events (tenant_id, topic, payload, status) VALUES ($1, $2, $3::jsonb, 'pending')",
-      [tenantId, input.topic, JSON.stringify(input.payload)]
+      `INSERT INTO outbox_events (tenant_id, topic, payload, status, next_attempt_at)
+       VALUES ($1, $2, $3::jsonb, 'pending', COALESCE($4::timestamptz, now()))`,
+      [tenantId, input.topic, JSON.stringify(input.payload), toTimestamp(input.nextAttemptAt)]
     );
+  },
+  /**
+   * Enqueue an event in its own transaction, for callers that are not already
+   * inside one.
+   *
+   * Used to defer a dispatch that would exceed its campaign's rate: the send is
+   * re-queued at a later time instead of being slept on, which is what keeps the
+   * relay free. Kept as a repository method rather than an inline withTenant so
+   * the worker's deferral path can be stubbed in tests without a database.
+   */
+  async enqueueOwn(tenantId: string, input: OutboxEnqueueInput): Promise<void> {
+    await withTenant(tenantId, async (client) => {
+      await outboxRepository.enqueue(client, tenantId, input);
+    });
   },
   /** Batch-enqueue multiple events in one statement (still within the caller's transaction). */
   async enqueueBatch(client: QueryClient, tenantId: string, inputs: OutboxEnqueueInput[]): Promise<void> {
     if (inputs.length === 0) return;
     const topics = inputs.map((i) => i.topic);
     const payloads = inputs.map((i) => JSON.stringify(i.payload));
+    const schedules = inputs.map((i) => toTimestamp(i.nextAttemptAt));
     await client.query(
-      `INSERT INTO outbox_events (tenant_id, topic, payload, status)
-       SELECT $1, t, p::jsonb, 'pending'
-       FROM unnest($2::text[], $3::text[]) AS u(t, p)`,
-      [tenantId, topics, payloads]
+      `INSERT INTO outbox_events (tenant_id, topic, payload, status, next_attempt_at)
+       SELECT $1, t, p::jsonb, 'pending', COALESCE(s::timestamptz, now())
+       FROM unnest($2::text[], $3::text[], $4::text[]) AS u(t, p, s)`,
+      [tenantId, topics, payloads, schedules]
     );
   },
   /** Claim a batch of pending/stuck rows for publishing (bypasses RLS via SECURITY DEFINER fn). */

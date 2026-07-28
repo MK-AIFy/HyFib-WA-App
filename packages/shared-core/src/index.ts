@@ -334,6 +334,12 @@ export interface CampaignDispatchRequest {
   parameters: string[];
   /** Set when dispatched as part of a fan-out run; tracks funnel row. */
   recipientId?: string;
+  /**
+   * The campaign's send budget, carried so the dispatch can enforce a hard cap
+   * without sleeping. Absent on single-number test sends, which are one-off
+   * operator actions rather than paced fan-out work.
+   */
+  ratePerMinute?: number;
 }
 
 /** Triggers a full audience fan-out from the notification worker. */

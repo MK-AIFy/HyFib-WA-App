@@ -333,6 +333,78 @@ test("cancelPending is idempotent and tenant-isolated", { skip }, async () => {
   assert.equal(otherCounts.pending, 2, "the other tenant's own campaign must be untouched");
 });
 
+/** Puts a seeded campaign into 'running' and returns it. */
+async function runningCampaign(label, recipientCount) {
+  const seeded = await seedCampaign(label, recipientCount);
+  await campaignRepository.transition(seeded.tenant.id, seeded.campaign.id, ["draft"], "running");
+  return seeded;
+}
+
+test("completeDrained completes a running campaign whose recipients have all resolved", { skip }, async () => {
+  const { tenant, campaign } = await runningCampaign("Drained", 2);
+  await withTenant(tenant.id, async (client) => {
+    await client.query(`UPDATE campaign_recipients SET status = 'sent' WHERE campaign_id = $1`, [campaign.id]);
+  });
+
+  const completed = await campaignRepository.completeDrained(50);
+
+  assert.ok(
+    completed.some((c) => c.id === campaign.id && c.tenantId === tenant.id),
+    "a drained campaign should be completed and reported with its tenant"
+  );
+  assert.equal(await campaignRepository.getStatus(tenant.id, campaign.id), "completed");
+});
+
+test("completeDrained leaves a campaign with a pending recipient alone", { skip }, async () => {
+  // This is the whole point: a claimed-but-undispatched recipient is still
+  // 'pending', so an in-flight run must never be completed out from under itself.
+  const { tenant, campaign } = await runningCampaign("StillPending", 2);
+  await withTenant(tenant.id, async (client) => {
+    await client.query(
+      `UPDATE campaign_recipients SET status = 'sent' WHERE campaign_id = $1
+       AND id = (SELECT id FROM campaign_recipients WHERE campaign_id = $1 LIMIT 1)`,
+      [campaign.id]
+    );
+  });
+  // Claim the remaining one, exactly as a live fan-out would.
+  const claimed = await campaignRecipientRepository.claimPendingBatch(tenant.id, campaign.id, 10);
+  assert.equal(claimed.length, 1, "one recipient should still be claimable");
+
+  await campaignRepository.completeDrained(50);
+
+  assert.equal(
+    await campaignRepository.getStatus(tenant.id, campaign.id),
+    "running",
+    "a claimed-but-undispatched recipient must keep the campaign running"
+  );
+});
+
+test("completeDrained ignores a running campaign that has no recipients at all", { skip }, async () => {
+  // A single-number test send promotes a draft campaign to 'running' without
+  // creating recipients; completing it immediately would be wrong.
+  const { tenant, campaign } = await runningCampaign("NoRecipients", 0);
+
+  await campaignRepository.completeDrained(50);
+
+  assert.equal(await campaignRepository.getStatus(tenant.id, campaign.id), "running");
+});
+
+test("completeDrained never completes a paused campaign", { skip }, async () => {
+  const { tenant, campaign } = await runningCampaign("PausedDrained", 1);
+  await withTenant(tenant.id, async (client) => {
+    await client.query(`UPDATE campaign_recipients SET status = 'sent' WHERE campaign_id = $1`, [campaign.id]);
+  });
+  await campaignRepository.transition(tenant.id, campaign.id, ["running"], "paused");
+
+  await campaignRepository.completeDrained(50);
+
+  assert.equal(
+    await campaignRepository.getStatus(tenant.id, campaign.id),
+    "paused",
+    "an operator pause must win over the completion sweep"
+  );
+});
+
 test.after(async () => {
   if (!skip) {
     await closePool();
