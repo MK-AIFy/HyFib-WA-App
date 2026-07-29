@@ -91,6 +91,8 @@ export interface Template {
   status: "approved" | "rejected" | "pending" | "paused";
   language: string;
   body: string;
+  /** Graph template id once submitted to Meta; null for local-only drafts. */
+  metaTemplateId?: string | null;
 }
 
 export interface Contact {

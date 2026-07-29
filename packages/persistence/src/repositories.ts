@@ -579,7 +579,10 @@ interface TemplateRow {
   language: string;
   status: string;
   body: string;
+  meta_template_id: string | null;
 }
+
+const TEMPLATE_COLUMNS = "id, tenant_id, name, category, language, status, body, meta_template_id";
 
 function mapTemplate(row: TemplateRow): Template {
   return {
@@ -589,7 +592,8 @@ function mapTemplate(row: TemplateRow): Template {
     category: row.category as MessageCategory,
     language: row.language,
     status: row.status as Template["status"],
-    body: row.body
+    body: row.body,
+    metaTemplateId: row.meta_template_id
   };
 }
 
@@ -608,7 +612,7 @@ export const templateRepository = {
       const result = await client.query<TemplateRow>(
         `INSERT INTO templates (tenant_id, name, category, language, status, body)
          VALUES ($1, $2, $3, $4, $5, $6)
-         RETURNING id, tenant_id, name, category, language, status, body`,
+         RETURNING ${TEMPLATE_COLUMNS}`,
         [tenantId, input.name, input.category, input.language, input.status ?? "pending", input.body]
       );
       return mapTemplate(result.rows[0]!);
@@ -626,7 +630,7 @@ export const templateRepository = {
       const limitClause = opts?.limit != null ? ` LIMIT $${params.push(opts.limit)}` : "";
       const offsetClause = opts?.offset != null ? ` OFFSET $${params.push(opts.offset)}` : "";
       const result = await client.query<TemplateRow>(
-        `SELECT id, tenant_id, name, category, language, status, body FROM templates ${where} ORDER BY created_at DESC${limitClause}${offsetClause}`,
+        `SELECT ${TEMPLATE_COLUMNS} FROM templates ${where} ORDER BY created_at DESC${limitClause}${offsetClause}`,
         params
       );
       return result.rows.map(mapTemplate);
@@ -635,10 +639,70 @@ export const templateRepository = {
   async getById(tenantId: string, id: string): Promise<Template | undefined> {
     return withTenant(tenantId, async (client) => {
       const result = await client.query<TemplateRow>(
-        "SELECT id, tenant_id, name, category, language, status, body FROM templates WHERE id = $1",
+        `SELECT ${TEMPLATE_COLUMNS} FROM templates WHERE id = $1`,
         [id]
       );
       return result.rows[0] ? mapTemplate(result.rows[0]) : undefined;
+    });
+  },
+  /**
+   * Partial local edit. Callers own the business rules (e.g. Meta must be
+   * updated first for submitted templates); this only mutates the row.
+   */
+  async update(
+    tenantId: string,
+    id: string,
+    patch: { category?: MessageCategory; body?: string; status?: Template["status"] }
+  ): Promise<Template | undefined> {
+    if (patch.category === undefined && patch.body === undefined && patch.status === undefined) {
+      return templateRepository.getById(tenantId, id);
+    }
+    const sets: string[] = [];
+    const params: unknown[] = [];
+    if (patch.category !== undefined) {
+      params.push(patch.category);
+      sets.push(`category = $${params.length}`);
+    }
+    if (patch.body !== undefined) {
+      params.push(patch.body);
+      sets.push(`body = $${params.length}`);
+    }
+    if (patch.status !== undefined) {
+      params.push(patch.status);
+      sets.push(`status = $${params.length}`);
+    }
+    params.push(id);
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<TemplateRow>(
+        `UPDATE templates SET ${sets.join(", ")} WHERE id = $${params.length}
+         RETURNING ${TEMPLATE_COLUMNS}`,
+        params
+      );
+      return result.rows[0] ? mapTemplate(result.rows[0]) : undefined;
+    });
+  },
+  /**
+   * Records a successful submit-to-Meta: links the Graph template id and
+   * resets status to pending (Meta reviews every submission).
+   */
+  async markSubmitted(tenantId: string, id: string, metaTemplateId: string): Promise<Template | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<TemplateRow>(
+        `UPDATE templates SET meta_template_id = $2, status = 'pending' WHERE id = $1
+         RETURNING ${TEMPLATE_COLUMNS}`,
+        [id, metaTemplateId]
+      );
+      return result.rows[0] ? mapTemplate(result.rows[0]) : undefined;
+    });
+  },
+  /**
+   * Hard delete. Foreign-key violations (campaigns.template_id) propagate to
+   * the caller, which maps them to a conflict response.
+   */
+  async delete(tenantId: string, id: string): Promise<boolean> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query("DELETE FROM templates WHERE id = $1", [id]);
+      return (result.rowCount ?? 0) > 0;
     });
   },
   /**
@@ -647,16 +711,24 @@ export const templateRepository = {
    */
   async upsertFromMeta(
     tenantId: string,
-    input: { name: string; language: string; status: Template["status"]; category: MessageCategory; body: string }
+    input: {
+      name: string;
+      language: string;
+      status: Template["status"];
+      category: MessageCategory;
+      body: string;
+      metaTemplateId?: string;
+    }
   ): Promise<Template> {
     return withTenant(tenantId, async (client) => {
       const result = await client.query<TemplateRow>(
-        `INSERT INTO templates (tenant_id, name, category, language, status, body)
-         VALUES ($1, $2, $3, $4, $5, $6)
+        `INSERT INTO templates (tenant_id, name, category, language, status, body, meta_template_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT (tenant_id, name, language) DO UPDATE
-           SET status = EXCLUDED.status, category = EXCLUDED.category, body = EXCLUDED.body
-         RETURNING id, tenant_id, name, category, language, status, body`,
-        [tenantId, input.name, input.category, input.language, input.status, input.body]
+           SET status = EXCLUDED.status, category = EXCLUDED.category, body = EXCLUDED.body,
+               meta_template_id = COALESCE(EXCLUDED.meta_template_id, templates.meta_template_id)
+         RETURNING ${TEMPLATE_COLUMNS}`,
+        [tenantId, input.name, input.category, input.language, input.status, input.body, input.metaTemplateId ?? null]
       );
       return mapTemplate(result.rows[0]!);
     });
