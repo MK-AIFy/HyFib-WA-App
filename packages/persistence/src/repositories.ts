@@ -515,9 +515,7 @@ export const apiKeyRepository = {
   },
   async list(tenantId: string): Promise<ApiKey[]> {
     return withTenant(tenantId, async (client) => {
-      const result = await client.query<ApiKeyRow>(
-        `SELECT ${API_KEY_COLUMNS} FROM api_keys ORDER BY created_at DESC`
-      );
+      const result = await client.query<ApiKeyRow>(`SELECT ${API_KEY_COLUMNS} FROM api_keys ORDER BY created_at DESC`);
       return result.rows.map(mapApiKey);
     });
   },
