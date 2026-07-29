@@ -11,6 +11,7 @@ import {
   automationRuleRepository,
   billingRepository,
   campaignRecipientRepository,
+  automationSettingsRepository,
   campaignRepository,
   campaignSendLog,
   campaignStatsRepository,
@@ -63,6 +64,7 @@ import { resolveVariables } from "./personalize.js";
 import { mintTrackedParameters } from "./click-tracking.js";
 import { matchAutoReply } from "./autoreply.js";
 import { evaluateAutomationRules } from "./automation.js";
+import { decideDefaultAutomation } from "./default-automations.js";
 import { processMediaFetch } from "./media.js";
 
 const config = loadConfig();
@@ -883,6 +885,13 @@ async function handleInbound(event: EventEnvelope): Promise<void> {
     logger.info("inbound_opt_in", { tenantId: channel.tenantId, contactId: contact.id });
   }
 
+  // Default automations (G8): welcome on first contact, out-of-office outside
+  // working hours. Any real message type counts — a voice note deserves a
+  // welcome as much as text — but reactions are not a contact reaching out.
+  if (inbound.type !== "reaction") {
+    await runDefaultAutomations(channel, conversation.id, contact, createdMessage.id);
+  }
+
   // Auto-reply evaluation (only text/button messages; skip reactions, read receipts).
   if (inbound.type === "text" || inbound.type === "button" || inbound.type === "interactive") {
     const rules = await autoReplyRuleRepository.listEnabled(channel.tenantId);
@@ -917,6 +926,71 @@ async function handleInbound(event: EventEnvelope): Promise<void> {
 
     // Automation rules: new_message trigger.
     await runNewMessageAutomation(channel.tenantId, conversation.id, contact, channel.channelId, text);
+  }
+}
+
+/**
+ * Welcome / out-of-office default automations (G8). Failures never break
+ * inbound processing; the OOO reply is suppressed per conversation for the
+ * configured window via a Redis claim — when the claim cannot be evaluated
+ * (Redis down) we skip rather than risk an OOO reply on every message.
+ */
+async function runDefaultAutomations(
+  channel: { tenantId: string; channelId: string },
+  conversationId: string,
+  contact: { id: string; phoneE164: string },
+  messageId: string
+): Promise<void> {
+  try {
+    const settings = await automationSettingsRepository.get(channel.tenantId);
+    if (!settings || (!settings.welcomeEnabled && !settings.oooEnabled)) {
+      return;
+    }
+    const firstInbound = settings.welcomeEnabled
+      ? !(await messageRepository.hasPriorInbound(channel.tenantId, conversationId, messageId))
+      : false;
+    const decision = decideDefaultAutomation({ settings, firstInbound, now: new Date() });
+    if (!decision) {
+      return;
+    }
+    if (decision.kind === "ooo") {
+      const claimed = await claimRedisKey(
+        redis,
+        `ooo:${channel.tenantId}:${conversationId}`,
+        settings.oooSuppressHours * 3600
+      ).catch(() => false);
+      if (!claimed) {
+        return;
+      }
+    }
+    await withTenant(channel.tenantId, async (client) => {
+      await outboxRepository.enqueue(client, channel.tenantId, {
+        topic: EventTopics.WhatsAppOutboundRequested,
+        payload: {
+          tenantId: channel.tenantId,
+          channelId: channel.channelId,
+          conversationId,
+          contactPhoneE164: contact.phoneE164,
+          kind: "text",
+          text: decision.text,
+          dispatchId: randomUUID()
+        } satisfies WhatsAppOutboundRequest
+      });
+    });
+    incCounter("default_automations_sent_total", "Welcome/OOO default automations enqueued.", {
+      kind: decision.kind
+    });
+    logger.info("default_automation_enqueued", {
+      tenantId: channel.tenantId,
+      conversationId,
+      kind: decision.kind
+    });
+  } catch (error) {
+    logger.error("default_automation_failed", {
+      tenantId: channel.tenantId,
+      conversationId,
+      error: error instanceof Error ? error.message : String(error)
+    });
   }
 }
 
