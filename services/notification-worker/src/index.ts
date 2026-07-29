@@ -11,6 +11,7 @@ import {
   automationRuleRepository,
   billingRepository,
   campaignRecipientRepository,
+  automationSettingsRepository,
   campaignRepository,
   campaignSendLog,
   campaignStatsRepository,
@@ -19,13 +20,16 @@ import {
   consentRepository,
   contactRepository,
   conversationRepository,
+  flowRepository,
   healthCheck,
   linkClickRepository,
   mediaRepository,
   messageRepository,
   outboxRepository,
   resolveChannelByPhoneNumberId,
+  sequenceRepository,
   taskRepository,
+  teamRepository,
   userRepository,
   whatsappSettingsRepository,
   withTenant,
@@ -37,6 +41,7 @@ import { dispatchScheduleAt, continuationScheduleAt, isFinalBatch, BATCH_SIZE } 
 import {
   EventTopics,
   Logger,
+  advanceFlow,
   parseUrlPath,
   sendJson,
   sendMetrics,
@@ -63,6 +68,7 @@ import { resolveVariables } from "./personalize.js";
 import { mintTrackedParameters } from "./click-tracking.js";
 import { matchAutoReply } from "./autoreply.js";
 import { evaluateAutomationRules } from "./automation.js";
+import { decideDefaultAutomation } from "./default-automations.js";
 import { processMediaFetch } from "./media.js";
 import { deliverCustomerWebhook } from "./customer-webhook.js";
 
@@ -896,14 +902,51 @@ async function handleInbound(event: EventEnvelope): Promise<void> {
     logger.info("inbound_opt_in", { tenantId: channel.tenantId, contactId: contact.id });
   }
 
+  // Default automations (G8): welcome on first contact, out-of-office outside
+  // working hours. Any real message type counts — a voice note deserves a
+  // welcome as much as text — but reactions are not a contact reaching out.
+  if (inbound.type !== "reaction") {
+    // Stop-on-reply (G7): a human reply supersedes any drip in flight. Never
+    // allowed to break inbound processing.
+    try {
+      const stopped = await sequenceRepository.stopActiveForContact(channel.tenantId, contact.id, "replied");
+      if (stopped > 0) {
+        incCounter("sequence_enrollments_stopped_total", "Drip enrollments stopped by an inbound reply.", {});
+        logger.info("sequence_stopped_on_reply", { tenantId: channel.tenantId, contactId: contact.id, stopped });
+      }
+    } catch (error) {
+      logger.error("sequence_stop_on_reply_failed", {
+        tenantId: channel.tenantId,
+        contactId: contact.id,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+    await runDefaultAutomations(channel, conversation.id, contact, createdMessage.id);
+    // Round-robin auto-assignment (G9): only unassigned conversations — a
+    // manual assignment or an earlier rotation is never overridden.
+    if (!conversation.assignedUserId) {
+      await runRoundRobinAssignment(channel.tenantId, conversation.id);
+    }
+  }
+
   // Auto-reply evaluation (only text/button messages; skip reactions, read receipts).
   if (inbound.type === "text" || inbound.type === "button" || inbound.type === "interactive") {
-    const rules = await autoReplyRuleRepository.listEnabled(channel.tenantId);
     const interactivePayload = inbound.interactive as
       | { button_reply?: { title?: string }; list_reply?: { title?: string } }
       | undefined;
     const interactiveTitle = interactivePayload?.button_reply?.title ?? interactivePayload?.list_reply?.title;
     const text = typeof inbound.text === "string" && inbound.text ? inbound.text : interactiveTitle;
+
+    // Chatbot flows (G14): an active session (or a matching trigger) consumes
+    // the message — keyword auto-replies are then skipped so the bot never
+    // double-replies. Rule-based automations (tagging etc.) still run below.
+    const flowConsumed = await runFlowRuntime(channel, conversation.id, contact, text);
+    if (flowConsumed) {
+      await runNewMessageAutomation(channel.tenantId, conversation.id, contact, channel.channelId, text);
+      return;
+    }
+
+    const rules = await autoReplyRuleRepository.listEnabled(channel.tenantId);
     const matched = matchAutoReply(text, rules);
     if (matched && matched.replyText) {
       await withTenant(channel.tenantId, async (client) => {
@@ -930,6 +973,189 @@ async function handleInbound(event: EventEnvelope): Promise<void> {
 
     // Automation rules: new_message trigger.
     await runNewMessageAutomation(channel.tenantId, conversation.id, contact, channel.channelId, text);
+  }
+}
+
+/**
+ * Welcome / out-of-office default automations (G8). Failures never break
+ * inbound processing; the OOO reply is suppressed per conversation for the
+ * configured window via a Redis claim — when the claim cannot be evaluated
+ * (Redis down) we skip rather than risk an OOO reply on every message.
+ */
+async function runDefaultAutomations(
+  channel: { tenantId: string; channelId: string },
+  conversationId: string,
+  contact: { id: string; phoneE164: string },
+  messageId: string
+): Promise<void> {
+  try {
+    const settings = await automationSettingsRepository.get(channel.tenantId);
+    if (!settings || (!settings.welcomeEnabled && !settings.oooEnabled)) {
+      return;
+    }
+    const firstInbound = settings.welcomeEnabled
+      ? !(await messageRepository.hasPriorInbound(channel.tenantId, conversationId, messageId))
+      : false;
+    const decision = decideDefaultAutomation({ settings, firstInbound, now: new Date() });
+    if (!decision) {
+      return;
+    }
+    if (decision.kind === "ooo") {
+      const claimed = await claimRedisKey(
+        redis,
+        `ooo:${channel.tenantId}:${conversationId}`,
+        settings.oooSuppressHours * 3600
+      ).catch(() => false);
+      if (!claimed) {
+        return;
+      }
+    }
+    await withTenant(channel.tenantId, async (client) => {
+      await outboxRepository.enqueue(client, channel.tenantId, {
+        topic: EventTopics.WhatsAppOutboundRequested,
+        payload: {
+          tenantId: channel.tenantId,
+          channelId: channel.channelId,
+          conversationId,
+          contactPhoneE164: contact.phoneE164,
+          kind: "text",
+          text: decision.text,
+          dispatchId: randomUUID()
+        } satisfies WhatsAppOutboundRequest
+      });
+    });
+    incCounter("default_automations_sent_total", "Welcome/OOO default automations enqueued.", {
+      kind: decision.kind
+    });
+    logger.info("default_automation_enqueued", {
+      tenantId: channel.tenantId,
+      conversationId,
+      kind: decision.kind
+    });
+  } catch (error) {
+    logger.error("default_automation_failed", {
+      tenantId: channel.tenantId,
+      conversationId,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+}
+
+/**
+ * Round-robin auto-assignment (G9): rotate unassigned new conversations among
+ * the configured team's active members. Failures never break inbound
+ * processing; enabled-without-team is a deliberate no-op (G8's
+ * OOO-without-hours precedent).
+ */
+async function runRoundRobinAssignment(tenantId: string, conversationId: string): Promise<void> {
+  try {
+    const settings = await automationSettingsRepository.get(tenantId);
+    if (!settings?.roundRobinEnabled || !settings.roundRobinTeamId) {
+      return;
+    }
+    const assignee = await teamRepository.nextRoundRobinAssignee(tenantId, settings.roundRobinTeamId);
+    if (!assignee) {
+      logger.warn("round_robin_no_active_members", { tenantId, teamId: settings.roundRobinTeamId });
+      return;
+    }
+    await conversationRepository.assign(tenantId, conversationId, assignee.id);
+    incCounter("round_robin_assignments_total", "Conversations auto-assigned by round-robin.", {});
+    logger.info("round_robin_assigned", { tenantId, conversationId, userId: assignee.id });
+  } catch (error) {
+    logger.error("round_robin_assignment_failed", {
+      tenantId,
+      conversationId,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+}
+
+/**
+ * Chatbot flow runtime (G14): continues the conversation's active session with
+ * the reply, or starts a new session when the text matches an active flow's
+ * trigger keyword. Actions map onto existing primitives (outbox text sends,
+ * tagging, team assignment). Returns true when a flow consumed the message.
+ * Failures never break inbound processing.
+ */
+async function runFlowRuntime(
+  channel: { tenantId: string; channelId: string },
+  conversationId: string,
+  contact: { id: string; phoneE164: string },
+  text: string | undefined
+): Promise<boolean> {
+  try {
+    let session = await flowRepository.activeSessionForConversation(channel.tenantId, conversationId);
+    let flow;
+    let reply: string | null = text ?? null;
+    if (session) {
+      flow = await flowRepository.getById(channel.tenantId, session.flowId);
+      if (!flow || flow.status !== "active") {
+        return false; // paused/deleted flow: normal automations take over
+      }
+    } else {
+      if (!text?.trim()) {
+        return false;
+      }
+      flow = await flowRepository.findByTrigger(channel.tenantId, text);
+      if (!flow) {
+        return false;
+      }
+      session = await flowRepository.startSession(channel.tenantId, {
+        flowId: flow.id,
+        conversationId,
+        contactId: contact.id,
+        currentNode: flow.definition.start
+      });
+      if (!session) {
+        return false; // lost the one-active-session race
+      }
+      reply = null; // the trigger message starts the flow; it is not a question reply
+    }
+
+    const result = advanceFlow(flow.definition, session.currentNode, reply);
+    for (const action of result.actions) {
+      if (action.type === "send") {
+        await withTenant(channel.tenantId, async (client) => {
+          await outboxRepository.enqueue(client, channel.tenantId, {
+            topic: EventTopics.WhatsAppOutboundRequested,
+            payload: {
+              tenantId: channel.tenantId,
+              channelId: channel.channelId,
+              conversationId,
+              contactPhoneE164: contact.phoneE164,
+              kind: "text",
+              text: action.text,
+              dispatchId: randomUUID()
+            } satisfies WhatsAppOutboundRequest
+          });
+        });
+      } else if (action.type === "add_tag") {
+        await contactRepository.addTag(channel.tenantId, contact.id, action.tag);
+      } else if (action.type === "assign_team") {
+        await conversationRepository.assignTeam(channel.tenantId, conversationId, action.teamId);
+      }
+    }
+    if (result.outcome.status === "waiting") {
+      await flowRepository.updateSession(channel.tenantId, session.id, { currentNode: result.outcome.node });
+    } else {
+      await flowRepository.updateSession(channel.tenantId, session.id, { status: "completed" });
+    }
+    incCounter("flow_steps_total", "Chatbot flow advances.", { outcome: result.outcome.status });
+    logger.info("flow_advanced", {
+      tenantId: channel.tenantId,
+      conversationId,
+      flowId: flow.id,
+      actions: result.actions.length,
+      outcome: result.outcome.status
+    });
+    return true;
+  } catch (error) {
+    logger.error("flow_runtime_failed", {
+      tenantId: channel.tenantId,
+      conversationId,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return false;
   }
 }
 

@@ -1,14 +1,17 @@
 import { createHash, randomBytes } from "node:crypto";
 import { query, withTenant, type QueryClient } from "./db.js";
 import { loadConfig } from "@hyfib/config";
-import { decryptSecret, encryptSecret } from "@hyfib/shared-core";
+import { EventTopics, decryptSecret, encryptSecret } from "@hyfib/shared-core";
 import type {
   ApiKey,
+  FlowDefinition,
   AuditEvent,
   AutoReplyRule,
   AutomationActionConfig,
   AutomationConditions,
   AutomationRule,
+  AutomationSettings,
+  WorkingHours,
   Campaign,
   CampaignRecipient,
   ContactNote,
@@ -23,6 +26,8 @@ import type {
   QuietHoursConfig,
   Role,
   Segment,
+  Sequence,
+  SequenceStep,
   Tag,
   Task,
   Team,
@@ -386,6 +391,43 @@ export const teamRepository = {
       return (result.rowCount ?? 0) > 0;
     });
   },
+  /**
+   * Strict round-robin pick among a team's ACTIVE members (roadmap G9). The
+   * cursor lives on automation_settings.round_robin_last_user_id; the settings
+   * row is locked FOR UPDATE so concurrent inbounds serialize on the pick and
+   * the rotation stays fair. Returns undefined when the team has no active
+   * members. Callers only invoke this when round-robin is enabled, so a
+   * settings row exists and the cursor persists.
+   */
+  async nextRoundRobinAssignee(tenantId: string, teamId: string): Promise<{ id: string } | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const members = await client.query<{ user_id: string }>(
+        `SELECT tm.user_id
+         FROM team_members tm
+         JOIN users u ON u.id = tm.user_id
+         WHERE tm.team_id = $1 AND u.status = 'active'
+         ORDER BY u.created_at ASC, u.id ASC`,
+        [teamId]
+      );
+      const ids = members.rows.map((row) => row.user_id);
+      if (ids.length === 0) {
+        return undefined;
+      }
+      const cursor = await client.query<{ round_robin_last_user_id: string | null }>(
+        "SELECT round_robin_last_user_id FROM automation_settings WHERE tenant_id = $1 FOR UPDATE",
+        [tenantId]
+      );
+      const last = cursor.rows[0]?.round_robin_last_user_id ?? null;
+      const lastIndex = last ? ids.indexOf(last) : -1;
+      // A departed/suspended cursor user is simply not found: restart at 0.
+      const next = ids[(lastIndex + 1) % ids.length]!;
+      await client.query("UPDATE automation_settings SET round_robin_last_user_id = $2 WHERE tenant_id = $1", [
+        tenantId,
+        next
+      ]);
+      return { id: next };
+    });
+  },
   async listMembers(tenantId: string, teamId: string): Promise<User[]> {
     return withTenant(tenantId, async (client) => {
       const result = await client.query<UserRow>(
@@ -426,6 +468,118 @@ function mapWhatsAppSettings(row: WhatsAppSettingsRow): WhatsAppSettings & { mon
     updatedAt: row.updated_at.toISOString()
   };
 }
+
+interface AutomationSettingsRow {
+  tenant_id: string;
+  timezone: string;
+  working_hours: WorkingHours;
+  welcome_enabled: boolean;
+  welcome_text: string | null;
+  ooo_enabled: boolean;
+  ooo_text: string | null;
+  ooo_suppress_hours: number;
+  round_robin_enabled: boolean;
+  round_robin_team_id: string | null;
+  updated_at: Date;
+}
+
+function mapAutomationSettings(row: AutomationSettingsRow): AutomationSettings {
+  return {
+    tenantId: row.tenant_id,
+    timezone: row.timezone,
+    workingHours: row.working_hours ?? {},
+    welcomeEnabled: row.welcome_enabled,
+    welcomeText: row.welcome_text ?? undefined,
+    oooEnabled: row.ooo_enabled,
+    oooText: row.ooo_text ?? undefined,
+    oooSuppressHours: row.ooo_suppress_hours,
+    roundRobinEnabled: row.round_robin_enabled,
+    roundRobinTeamId: row.round_robin_team_id ?? undefined,
+    updatedAt: row.updated_at.toISOString()
+  };
+}
+
+const AUTOMATION_SETTINGS_SELECT =
+  "SELECT tenant_id, timezone, working_hours, welcome_enabled, welcome_text, ooo_enabled, ooo_text, ooo_suppress_hours, round_robin_enabled, round_robin_team_id, updated_at FROM automation_settings";
+
+export const automationSettingsRepository = {
+  async get(tenantId: string): Promise<AutomationSettings | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<AutomationSettingsRow>(`${AUTOMATION_SETTINGS_SELECT} WHERE tenant_id = $1`, [
+        tenantId
+      ]);
+      return result.rows[0] ? mapAutomationSettings(result.rows[0]) : undefined;
+    });
+  },
+  /**
+   * Partial upsert: absent fields keep their stored (or default) values.
+   * Read-modify-write inside one tenant-scoped transaction — settings writes
+   * are rare and low-contention.
+   */
+  async upsert(
+    tenantId: string,
+    patch: {
+      timezone?: string;
+      workingHours?: WorkingHours;
+      welcomeEnabled?: boolean;
+      welcomeText?: string | null;
+      oooEnabled?: boolean;
+      oooText?: string | null;
+      oooSuppressHours?: number;
+      roundRobinEnabled?: boolean;
+      roundRobinTeamId?: string | null;
+    }
+  ): Promise<AutomationSettings> {
+    return withTenant(tenantId, async (client) => {
+      const existing = await client.query<AutomationSettingsRow>(`${AUTOMATION_SETTINGS_SELECT} WHERE tenant_id = $1`, [
+        tenantId
+      ]);
+      const current = existing.rows[0];
+      const merged = {
+        timezone: patch.timezone ?? current?.timezone ?? "UTC",
+        workingHours: patch.workingHours ?? current?.working_hours ?? {},
+        welcomeEnabled: patch.welcomeEnabled ?? current?.welcome_enabled ?? false,
+        welcomeText: patch.welcomeText !== undefined ? patch.welcomeText : (current?.welcome_text ?? null),
+        oooEnabled: patch.oooEnabled ?? current?.ooo_enabled ?? false,
+        oooText: patch.oooText !== undefined ? patch.oooText : (current?.ooo_text ?? null),
+        oooSuppressHours: patch.oooSuppressHours ?? current?.ooo_suppress_hours ?? 12,
+        roundRobinEnabled: patch.roundRobinEnabled ?? current?.round_robin_enabled ?? false,
+        roundRobinTeamId:
+          patch.roundRobinTeamId !== undefined ? patch.roundRobinTeamId : (current?.round_robin_team_id ?? null)
+      };
+      const result = await client.query<AutomationSettingsRow>(
+        `INSERT INTO automation_settings
+           (tenant_id, timezone, working_hours, welcome_enabled, welcome_text, ooo_enabled, ooo_text, ooo_suppress_hours, round_robin_enabled, round_robin_team_id, updated_at)
+         VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, $8, $9, $10, now())
+         ON CONFLICT (tenant_id) DO UPDATE SET
+           timezone = EXCLUDED.timezone,
+           working_hours = EXCLUDED.working_hours,
+           welcome_enabled = EXCLUDED.welcome_enabled,
+           welcome_text = EXCLUDED.welcome_text,
+           ooo_enabled = EXCLUDED.ooo_enabled,
+           ooo_text = EXCLUDED.ooo_text,
+           ooo_suppress_hours = EXCLUDED.ooo_suppress_hours,
+           round_robin_enabled = EXCLUDED.round_robin_enabled,
+           round_robin_team_id = EXCLUDED.round_robin_team_id,
+           updated_at = now()
+         RETURNING tenant_id, timezone, working_hours, welcome_enabled, welcome_text, ooo_enabled, ooo_text, ooo_suppress_hours, round_robin_enabled, round_robin_team_id, updated_at`,
+        [
+          tenantId,
+          merged.timezone,
+          JSON.stringify(merged.workingHours),
+          merged.welcomeEnabled,
+          merged.welcomeText,
+          merged.oooEnabled,
+          merged.oooText,
+          merged.oooSuppressHours,
+          merged.roundRobinEnabled,
+          merged.roundRobinTeamId
+        ]
+      );
+      return mapAutomationSettings(result.rows[0]!);
+    });
+  }
+};
 
 const WHATSAPP_SETTINGS_SELECT =
   "SELECT id, tenant_id, status_callback_url, status_callback_secret, graph_version, retry_max_attempts, retry_base_delay_ms, outbound_rate_limit_per_minute, monthly_message_quota, created_at, updated_at";
@@ -2238,6 +2392,23 @@ export const messageRepository = {
    * id). Used to resolve the message id a typing indicator must reference —
    * rides idx_messages_conversation_created (see 005_channel_credentials.sql).
    */
+  /**
+   * True when the conversation already had an inbound message BEFORE the one
+   * just persisted — i.e. false exactly for a contact's first message, which
+   * is what the welcome default-automation keys on.
+   */
+  async hasPriorInbound(tenantId: string, conversationId: string, excludeMessageId: string): Promise<boolean> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<{ exists: boolean }>(
+        `SELECT EXISTS (
+           SELECT 1 FROM messages
+           WHERE conversation_id = $1 AND direction = 'inbound' AND id <> $2
+         ) AS exists`,
+        [conversationId, excludeMessageId]
+      );
+      return result.rows[0]?.exists ?? false;
+    });
+  },
   async lastInboundExternalId(tenantId: string, conversationId: string): Promise<string | undefined> {
     return withTenant(tenantId, async (client) => {
       const result = await client.query<{ external_message_id: string | null }>(
@@ -3260,6 +3431,476 @@ export const savedReplyRepository = {
   async delete(tenantId: string, id: string): Promise<void> {
     await withTenant(tenantId, async (client) => {
       await client.query("DELETE FROM saved_replies WHERE id = $1", [id]);
+    });
+  }
+};
+
+// ─── Chatbot flows (G14) ────────────────────────────────────────────────────────
+
+interface FlowRow {
+  id: string;
+  tenant_id: string;
+  name: string;
+  status: string;
+  trigger_keyword: string | null;
+  definition: FlowDefinition;
+  created_at: Date;
+}
+
+export interface Flow {
+  id: string;
+  tenantId: string;
+  name: string;
+  status: "draft" | "active" | "paused";
+  triggerKeyword?: string;
+  definition: FlowDefinition;
+  createdAt: string;
+}
+
+function mapFlow(row: FlowRow): Flow {
+  return {
+    id: row.id,
+    tenantId: row.tenant_id,
+    name: row.name,
+    status: row.status as Flow["status"],
+    triggerKeyword: row.trigger_keyword ?? undefined,
+    definition: row.definition,
+    createdAt: row.created_at.toISOString()
+  };
+}
+
+const FLOW_COLUMNS = "id, tenant_id, name, status, trigger_keyword, definition, created_at";
+
+export interface FlowSession {
+  id: string;
+  flowId: string;
+  conversationId: string;
+  contactId: string;
+  currentNode: string;
+  status: "active" | "completed" | "cancelled";
+}
+
+export const flowRepository = {
+  async create(
+    tenantId: string,
+    input: { name: string; triggerKeyword?: string; definition: FlowDefinition }
+  ): Promise<Flow> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<FlowRow>(
+        `INSERT INTO flows (tenant_id, name, trigger_keyword, definition)
+         VALUES ($1, $2, $3, $4::jsonb)
+         RETURNING ${FLOW_COLUMNS}`,
+        [tenantId, input.name, input.triggerKeyword ?? null, JSON.stringify(input.definition)]
+      );
+      return mapFlow(result.rows[0]!);
+    });
+  },
+  async list(tenantId: string): Promise<Array<Flow & { activeSessions: number }>> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<FlowRow & { active_sessions: string }>(
+        `SELECT f.id, f.tenant_id, f.name, f.status, f.trigger_keyword, f.definition, f.created_at,
+                COUNT(s.id) FILTER (WHERE s.status = 'active')::text AS active_sessions
+         FROM flows f
+         LEFT JOIN flow_sessions s ON s.flow_id = f.id
+         GROUP BY f.id
+         ORDER BY f.created_at DESC`
+      );
+      return result.rows.map((row) => ({ ...mapFlow(row), activeSessions: Number(row.active_sessions) }));
+    });
+  },
+  async getById(tenantId: string, id: string): Promise<Flow | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<FlowRow>(`SELECT ${FLOW_COLUMNS} FROM flows WHERE id = $1`, [id]);
+      return result.rows[0] ? mapFlow(result.rows[0]) : undefined;
+    });
+  },
+  async setStatus(tenantId: string, id: string, status: Flow["status"]): Promise<Flow | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<FlowRow>(
+        `UPDATE flows SET status = $2, updated_at = now() WHERE id = $1 RETURNING ${FLOW_COLUMNS}`,
+        [id, status]
+      );
+      return result.rows[0] ? mapFlow(result.rows[0]) : undefined;
+    });
+  },
+  /** Active flow whose trigger keyword matches the inbound text (case-insensitive exact). */
+  async findByTrigger(tenantId: string, text: string): Promise<Flow | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<FlowRow>(
+        `SELECT ${FLOW_COLUMNS} FROM flows
+         WHERE status = 'active' AND trigger_keyword IS NOT NULL AND lower(trigger_keyword) = lower($1)
+         ORDER BY created_at ASC LIMIT 1`,
+        [text.trim()]
+      );
+      return result.rows[0] ? mapFlow(result.rows[0]) : undefined;
+    });
+  },
+  /**
+   * Starts a session unless the conversation already has an active one (the
+   * partial unique index closes the race; conflict = no-op returning undefined).
+   */
+  async startSession(
+    tenantId: string,
+    input: { flowId: string; conversationId: string; contactId: string; currentNode: string }
+  ): Promise<FlowSession | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<{
+        id: string;
+        flow_id: string;
+        conversation_id: string;
+        contact_id: string;
+        current_node: string;
+        status: string;
+      }>(
+        `INSERT INTO flow_sessions (tenant_id, flow_id, conversation_id, contact_id, current_node)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (tenant_id, conversation_id) WHERE status = 'active' DO NOTHING
+         RETURNING id, flow_id, conversation_id, contact_id, current_node, status`,
+        [tenantId, input.flowId, input.conversationId, input.contactId, input.currentNode]
+      );
+      const row = result.rows[0];
+      return row
+        ? {
+            id: row.id,
+            flowId: row.flow_id,
+            conversationId: row.conversation_id,
+            contactId: row.contact_id,
+            currentNode: row.current_node,
+            status: row.status as FlowSession["status"]
+          }
+        : undefined;
+    });
+  },
+  async activeSessionForConversation(tenantId: string, conversationId: string): Promise<FlowSession | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<{
+        id: string;
+        flow_id: string;
+        conversation_id: string;
+        contact_id: string;
+        current_node: string;
+        status: string;
+      }>(
+        `SELECT id, flow_id, conversation_id, contact_id, current_node, status
+         FROM flow_sessions WHERE conversation_id = $1 AND status = 'active' LIMIT 1`,
+        [conversationId]
+      );
+      const row = result.rows[0];
+      return row
+        ? {
+            id: row.id,
+            flowId: row.flow_id,
+            conversationId: row.conversation_id,
+            contactId: row.contact_id,
+            currentNode: row.current_node,
+            status: row.status as FlowSession["status"]
+          }
+        : undefined;
+    });
+  },
+  async updateSession(
+    tenantId: string,
+    sessionId: string,
+    update: { currentNode?: string; status?: FlowSession["status"] }
+  ): Promise<void> {
+    await withTenant(tenantId, async (client) => {
+      await client.query(
+        `UPDATE flow_sessions
+         SET current_node = COALESCE($2, current_node),
+             status = COALESCE($3, status),
+             updated_at = now()
+         WHERE id = $1`,
+        [sessionId, update.currentNode ?? null, update.status ?? null]
+      );
+    });
+  }
+};
+
+// ─── Drip sequences (G7) ────────────────────────────────────────────────────────
+
+interface SequenceRow {
+  id: string;
+  tenant_id: string;
+  name: string;
+  channel_id: string;
+  status: string;
+  stop_on_reply: boolean;
+  created_at: Date;
+}
+
+function mapSequence(row: SequenceRow): Sequence {
+  return {
+    id: row.id,
+    tenantId: row.tenant_id,
+    name: row.name,
+    channelId: row.channel_id,
+    status: row.status as Sequence["status"],
+    stopOnReply: row.stop_on_reply,
+    createdAt: row.created_at.toISOString()
+  };
+}
+
+interface SequenceStepRow {
+  id: string;
+  sequence_id: string;
+  step_order: number;
+  delay_minutes: number;
+  template_id: string;
+  template_name: string | null;
+  template_language: string | null;
+}
+
+function mapSequenceStep(row: SequenceStepRow): SequenceStep {
+  return {
+    id: row.id,
+    sequenceId: row.sequence_id,
+    stepOrder: row.step_order,
+    delayMinutes: row.delay_minutes,
+    templateId: row.template_id,
+    templateName: row.template_name ?? undefined,
+    templateLanguage: row.template_language ?? undefined
+  };
+}
+
+const SEQUENCE_STEP_SELECT = `
+  SELECT st.id, st.sequence_id, st.step_order, st.delay_minutes, st.template_id,
+         t.name AS template_name, t.language AS template_language
+  FROM sequence_steps st
+  LEFT JOIN templates t ON t.id = st.template_id`;
+
+/** Payload the scheduler needs to enqueue one due step, or the terminal outcome. */
+export type SequenceAdvanceResult =
+  | {
+      action: "send";
+      stepOrder: number;
+      templateName: string;
+      templateLanguage: string;
+      channelId: string;
+      contactId: string;
+      contactPhoneE164: string;
+      completedAfterSend: boolean;
+    }
+  | { action: "completed" }
+  | { action: "stopped"; reason: string }
+  | { action: "skipped" };
+
+export const sequenceRepository = {
+  async create(
+    tenantId: string,
+    input: {
+      name: string;
+      channelId: string;
+      stopOnReply?: boolean;
+      steps: Array<{ delayMinutes: number; templateId: string }>;
+    }
+  ): Promise<Sequence> {
+    return withTenant(tenantId, async (client) => {
+      const inserted = await client.query<SequenceRow>(
+        `INSERT INTO sequences (tenant_id, name, channel_id, stop_on_reply)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, tenant_id, name, channel_id, status, stop_on_reply, created_at`,
+        [tenantId, input.name, input.channelId, input.stopOnReply ?? true]
+      );
+      const sequence = mapSequence(inserted.rows[0]!);
+      for (let i = 0; i < input.steps.length; i += 1) {
+        const step = input.steps[i]!;
+        await client.query(
+          `INSERT INTO sequence_steps (tenant_id, sequence_id, step_order, delay_minutes, template_id)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [tenantId, sequence.id, i + 1, step.delayMinutes, step.templateId]
+        );
+      }
+      return sequence;
+    });
+  },
+  async list(tenantId: string): Promise<Sequence[]> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<SequenceRow & { active: string; completed: string; stopped: string }>(
+        `SELECT s.id, s.tenant_id, s.name, s.channel_id, s.status, s.stop_on_reply, s.created_at,
+                COUNT(e.id) FILTER (WHERE e.status = 'active')::text AS active,
+                COUNT(e.id) FILTER (WHERE e.status = 'completed')::text AS completed,
+                COUNT(e.id) FILTER (WHERE e.status = 'stopped')::text AS stopped
+         FROM sequences s
+         LEFT JOIN sequence_enrollments e ON e.sequence_id = s.id
+         GROUP BY s.id
+         ORDER BY s.created_at DESC`
+      );
+      return result.rows.map((row) => ({
+        ...mapSequence(row),
+        enrollmentCounts: { active: Number(row.active), completed: Number(row.completed), stopped: Number(row.stopped) }
+      }));
+    });
+  },
+  async getById(tenantId: string, id: string): Promise<Sequence | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<SequenceRow>(
+        "SELECT id, tenant_id, name, channel_id, status, stop_on_reply, created_at FROM sequences WHERE id = $1",
+        [id]
+      );
+      if (!result.rows[0]) {
+        return undefined;
+      }
+      const steps = await client.query<SequenceStepRow>(
+        `${SEQUENCE_STEP_SELECT} WHERE st.sequence_id = $1 ORDER BY st.step_order ASC`,
+        [id]
+      );
+      return { ...mapSequence(result.rows[0]), steps: steps.rows.map(mapSequenceStep) };
+    });
+  },
+  async setStatus(tenantId: string, id: string, status: Sequence["status"]): Promise<Sequence | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<SequenceRow>(
+        `UPDATE sequences SET status = $2 WHERE id = $1
+         RETURNING id, tenant_id, name, channel_id, status, stop_on_reply, created_at`,
+        [id, status]
+      );
+      return result.rows[0] ? mapSequence(result.rows[0]) : undefined;
+    });
+  },
+  /**
+   * Enrolls contacts; duplicates are ignored (a contact runs a sequence once).
+   * next_step_at = now + step 1's delay. Opted-out contacts are excluded at
+   * enrollment AND re-checked at every advance — consent can be revoked
+   * mid-sequence.
+   */
+  async enroll(tenantId: string, sequenceId: string, contactIds: string[]): Promise<number> {
+    if (contactIds.length === 0) {
+      return 0;
+    }
+    return withTenant(tenantId, async (client) => {
+      const firstStep = await client.query<{ delay_minutes: number }>(
+        "SELECT delay_minutes FROM sequence_steps WHERE sequence_id = $1 AND step_order = 1",
+        [sequenceId]
+      );
+      if (!firstStep.rows[0]) {
+        return 0;
+      }
+      const result = await client.query(
+        `INSERT INTO sequence_enrollments (tenant_id, sequence_id, contact_id, next_step_at)
+         SELECT $1, $2, c.id, now() + ($3 || ' minutes')::interval
+         FROM contacts c
+         WHERE c.id = ANY($4)
+           AND (c.metadata->>'optedOut')::boolean IS NOT TRUE
+         ON CONFLICT (tenant_id, sequence_id, contact_id) DO NOTHING`,
+        [tenantId, sequenceId, String(firstStep.rows[0].delay_minutes), contactIds]
+      );
+      return result.rowCount ?? 0;
+    });
+  },
+  /**
+   * Advances one due enrollment atomically: re-checks due-ness and sequence
+   * status FOR UPDATE, re-checks the contact's opt-out, enqueues the step's
+   * template send on the durable outbox and moves the cursor — all in ONE
+   * transaction, so a scheduler crash never double-sends a step.
+   */
+  async advanceDueEnrollment(tenantId: string, enrollmentId: string): Promise<SequenceAdvanceResult> {
+    return withTenant(tenantId, async (client) => {
+      const row = await client.query<{
+        id: string;
+        sequence_id: string;
+        contact_id: string;
+        current_step: number;
+        status: string;
+        next_step_at: Date | null;
+        seq_status: string;
+        channel_id: string;
+      }>(
+        `SELECT e.id, e.sequence_id, e.contact_id, e.current_step, e.status, e.next_step_at,
+                s.status AS seq_status, s.channel_id
+         FROM sequence_enrollments e
+         JOIN sequences s ON s.id = e.sequence_id
+         WHERE e.id = $1
+         FOR UPDATE OF e`,
+        [enrollmentId]
+      );
+      const enrollment = row.rows[0];
+      if (
+        !enrollment ||
+        enrollment.status !== "active" ||
+        enrollment.seq_status !== "active" ||
+        !enrollment.next_step_at ||
+        enrollment.next_step_at.getTime() > Date.now()
+      ) {
+        return { action: "skipped" };
+      }
+      const contact = await client.query<{ phone_e164: string; opted_out: string | null }>(
+        "SELECT phone_e164, metadata->>'optedOut' AS opted_out FROM contacts WHERE id = $1",
+        [enrollment.contact_id]
+      );
+      if (!contact.rows[0] || contact.rows[0].opted_out === "true") {
+        await client.query(
+          `UPDATE sequence_enrollments SET status = 'stopped', stopped_reason = 'opted_out', updated_at = now()
+           WHERE id = $1`,
+          [enrollmentId]
+        );
+        return { action: "stopped", reason: "opted_out" };
+      }
+      const steps = await client.query<SequenceStepRow>(
+        `${SEQUENCE_STEP_SELECT} WHERE st.sequence_id = $1 AND st.step_order IN ($2, $3) ORDER BY st.step_order ASC`,
+        [enrollment.sequence_id, enrollment.current_step + 1, enrollment.current_step + 2]
+      );
+      const current = steps.rows.find((s) => s.step_order === enrollment.current_step + 1);
+      if (!current || !current.template_name || !current.template_language) {
+        await client.query(
+          "UPDATE sequence_enrollments SET status = 'completed', next_step_at = NULL, updated_at = now() WHERE id = $1",
+          [enrollmentId]
+        );
+        return { action: "completed" };
+      }
+      const next = steps.rows.find((s) => s.step_order === enrollment.current_step + 2);
+      await outboxRepository.enqueue(client, tenantId, {
+        topic: EventTopics.AutomationTemplateRequested,
+        payload: {
+          tenantId,
+          channelId: enrollment.channel_id,
+          contactPhoneE164: contact.rows[0].phone_e164,
+          templateName: current.template_name,
+          templateLanguage: current.template_language,
+          dispatchId: `seq-${enrollmentId}-step-${current.step_order}`
+        }
+      });
+      if (next) {
+        await client.query(
+          `UPDATE sequence_enrollments
+           SET current_step = $2, next_step_at = now() + ($3 || ' minutes')::interval, updated_at = now()
+           WHERE id = $1`,
+          [enrollmentId, current.step_order, String(next.delay_minutes)]
+        );
+      } else {
+        await client.query(
+          `UPDATE sequence_enrollments
+           SET current_step = $2, status = 'completed', next_step_at = NULL, updated_at = now()
+           WHERE id = $1`,
+          [enrollmentId, current.step_order]
+        );
+      }
+      return {
+        action: "send",
+        stepOrder: current.step_order,
+        templateName: current.template_name,
+        templateLanguage: current.template_language,
+        channelId: enrollment.channel_id,
+        contactId: enrollment.contact_id,
+        contactPhoneE164: contact.rows[0].phone_e164,
+        completedAfterSend: !next
+      };
+    });
+  },
+  /** Inbound reply: stop this contact's active enrollments in stop-on-reply sequences. */
+  async stopActiveForContact(tenantId: string, contactId: string, reason: string): Promise<number> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query(
+        `UPDATE sequence_enrollments e
+         SET status = 'stopped', stopped_reason = $3, next_step_at = NULL, updated_at = now()
+         FROM sequences s
+         WHERE s.id = e.sequence_id
+           AND e.contact_id = $2
+           AND e.status = 'active'
+           AND s.stop_on_reply = true
+           AND e.tenant_id = $1`,
+        [tenantId, contactId, reason]
+      );
+      return result.rowCount ?? 0;
     });
   }
 };

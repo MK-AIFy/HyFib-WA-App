@@ -16,6 +16,9 @@ import {
   attributionRepository,
   auditRepository,
   autoReplyRuleRepository,
+  automationSettingsRepository,
+  flowRepository,
+  sequenceRepository,
   automationRuleRepository,
   campaignRecipientRepository,
   campaignRepository,
@@ -124,6 +127,9 @@ import { openApiSpec } from "./openapi.js";
 import { SseHub } from "./sse-hub.js";
 import { parseCsv, serializeContactsCsv, serializeCampaignRecipientsCsv, extractMultipartFile } from "./csv.js";
 import { validateSegmentDefinition } from "./segment-definition.js";
+import { validateAutomationSettingsPatch } from "./automation-settings.js";
+import { validateSequenceCreate } from "./sequence-validation.js";
+import { validateFlowDefinition } from "@hyfib/shared-core";
 import { resolveOrgTenant } from "./single-org.js";
 import { runOutboxRelayOnce } from "./outbox-relay.js";
 import { classifyRoute, API_RATE_LIMITS } from "./rate-limit.js";
@@ -1387,6 +1393,49 @@ function startCampaignScheduler(): NodeJS.Timeout {
  * was an inbound message older than the rule's delay, with no agent reply since.
  * `no_reply_fired_at` de-dupes until a new inbound arrives.
  */
+/**
+ * Advances due drip-sequence enrollments (G7). The repository's
+ * advanceDueEnrollment is transactional (re-check + outbox enqueue + cursor
+ * move), so this loop is safe to crash or overlap-guard like its siblings.
+ */
+function startSequenceScheduler(): NodeJS.Timeout {
+  let running = false;
+  return setInterval(() => {
+    if (running) return;
+    running = true;
+    void (async () => {
+      try {
+        const due = await dbQuery<{ id: string; tenant_id: string }>(
+          "SELECT * FROM due_sequence_enrollments($1)",
+          [100]
+        );
+        for (const row of due.rows) {
+          const result = await sequenceRepository.advanceDueEnrollment(row.tenant_id, row.id);
+          if (result.action === "send") {
+            incCounter("sequence_steps_sent_total", "Drip-sequence steps enqueued.", {});
+            logger.info("sequence_step_enqueued", {
+              tenantId: row.tenant_id,
+              enrollmentId: row.id,
+              stepOrder: result.stepOrder,
+              completed: result.completedAfterSend
+            });
+          } else if (result.action === "stopped") {
+            logger.info("sequence_enrollment_stopped", {
+              tenantId: row.tenant_id,
+              enrollmentId: row.id,
+              reason: result.reason
+            });
+          }
+        }
+      } catch (error) {
+        logger.error("sequence_scheduler_error", { error: error instanceof Error ? error.message : String(error) });
+      } finally {
+        running = false;
+      }
+    })();
+  }, 30_000);
+}
+
 function startNoReplyScheduler(): NodeJS.Timeout {
   let running = false;
   return setInterval(() => {
@@ -4271,6 +4320,286 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   }
 
   // ─── Auto-reply rules ─────────────────────────────────────────────────────
+  // ─── Chatbot flows (G14) ──────────────────────────────────────────────────
+  if (path === "/api/v1/flows") {
+    if (method === "GET") {
+      sendJson(res, 200, { items: await flowRepository.list(tenantId) });
+      return;
+    }
+    if (method === "POST") {
+      if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager"])) {
+        sendJson(res, 403, { error: "Insufficient role to create flows" });
+        return;
+      }
+      const body = await readJsonBody<{ name?: unknown; triggerKeyword?: unknown; definition?: unknown }>(req);
+      const nameCheck = boundedText(body.name as string | undefined, 200);
+      if (!nameCheck.ok) {
+        sendJson(res, 400, { error: `name ${nameCheck.error}` });
+        return;
+      }
+      if (body.triggerKeyword !== undefined) {
+        if (
+          typeof body.triggerKeyword !== "string" ||
+          body.triggerKeyword.trim().length === 0 ||
+          body.triggerKeyword.length > 100
+        ) {
+          sendJson(res, 400, { error: "triggerKeyword must be a non-empty string of at most 100 characters" });
+          return;
+        }
+      }
+      const definition = validateFlowDefinition(body.definition);
+      if (!definition.ok) {
+        sendJson(res, 400, { error: definition.error });
+        return;
+      }
+      // Handoff targets must be real teams in this workspace.
+      for (const [nodeId, node] of Object.entries(definition.value.nodes)) {
+        if (node.type === "assign_team" && !(await teamRepository.getById(tenantId, node.teamId))) {
+          sendJson(res, 422, { error: `node "${nodeId}": teamId does not name a team in this workspace` });
+          return;
+        }
+      }
+      const flow = await flowRepository.create(tenantId, {
+        name: nameCheck.value,
+        triggerKeyword: (body.triggerKeyword as string | undefined)?.trim(),
+        definition: definition.value
+      });
+      await audit(tenantId, auth, {
+        action: "flow.created",
+        resourceType: "Flow",
+        resourceId: flow.id,
+        payload: { name: flow.name, nodes: Object.keys(definition.value.nodes).length }
+      });
+      sendJson(res, 201, { ...flow });
+      return;
+    }
+    sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+
+  if (path.startsWith("/api/v1/flows/")) {
+    const flowId = extractPathSegment(path, "/api/v1/flows/");
+    if (!flowId || !UUID.test(flowId)) {
+      sendJson(res, 400, { error: "Invalid flow id" });
+      return;
+    }
+    if (path === `/api/v1/flows/${flowId}` && method === "GET") {
+      const flow = await flowRepository.getById(tenantId, flowId);
+      if (!flow) {
+        sendJson(res, 404, { error: "Flow not found" });
+        return;
+      }
+      sendJson(res, 200, { ...flow });
+      return;
+    }
+    if ((path.endsWith("/activate") || path.endsWith("/pause")) && method === "POST") {
+      if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager"])) {
+        sendJson(res, 403, { error: "Insufficient role to manage flows" });
+        return;
+      }
+      const target = path.endsWith("/activate") ? "active" : "paused";
+      const existing = await flowRepository.getById(tenantId, flowId);
+      if (!existing) {
+        sendJson(res, 404, { error: "Flow not found" });
+        return;
+      }
+      if (target === "active" && existing.status === "active") {
+        sendJson(res, 409, { error: "Flow is already active" });
+        return;
+      }
+      if (target === "paused" && existing.status !== "active") {
+        sendJson(res, 409, { error: `Cannot pause a flow that is ${existing.status}` });
+        return;
+      }
+      const flow = await flowRepository.setStatus(tenantId, flowId, target);
+      await audit(tenantId, auth, {
+        action: target === "active" ? "flow.activated" : "flow.paused",
+        resourceType: "Flow",
+        resourceId: flowId,
+        payload: {}
+      });
+      sendJson(res, 200, { ...flow });
+      return;
+    }
+    sendJson(res, 404, { error: "Not found" });
+    return;
+  }
+
+  // ─── Drip sequences (G7) ──────────────────────────────────────────────────
+  if (path === "/api/v1/sequences") {
+    if (method === "GET") {
+      sendJson(res, 200, { items: await sequenceRepository.list(tenantId) });
+      return;
+    }
+    if (method === "POST") {
+      if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager"])) {
+        sendJson(res, 403, { error: "Insufficient role to create sequences" });
+        return;
+      }
+      const check = validateSequenceCreate(await readJsonBody<Record<string, unknown>>(req));
+      if (!check.ok) {
+        sendJson(res, 400, { error: check.error });
+        return;
+      }
+      if (!(await channelRepository.getCredentials(tenantId, check.value.channelId))) {
+        sendJson(res, 422, { error: "channelId does not name a channel in this workspace" });
+        return;
+      }
+      for (const [index, step] of check.value.steps.entries()) {
+        const template = await templateRepository.getById(tenantId, step.templateId);
+        if (!template) {
+          sendJson(res, 422, { error: `steps[${index}].templateId does not name a template in this workspace` });
+          return;
+        }
+        if (template.status !== "approved") {
+          sendJson(res, 422, {
+            error: `steps[${index}] template "${template.name}" is ${template.status}; sequences require approved templates`
+          });
+          return;
+        }
+      }
+      const sequence = await sequenceRepository.create(tenantId, check.value);
+      await audit(tenantId, auth, {
+        action: "sequence.created",
+        resourceType: "Sequence",
+        resourceId: sequence.id,
+        payload: { name: sequence.name, steps: check.value.steps.length }
+      });
+      sendJson(res, 201, { ...sequence });
+      return;
+    }
+    sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+
+  if (path.startsWith("/api/v1/sequences/")) {
+    const sequenceId = extractPathSegment(path, "/api/v1/sequences/");
+    if (!sequenceId || !UUID.test(sequenceId)) {
+      sendJson(res, 400, { error: "Invalid sequence id" });
+      return;
+    }
+    if (path === `/api/v1/sequences/${sequenceId}` && method === "GET") {
+      const sequence = await sequenceRepository.getById(tenantId, sequenceId);
+      if (!sequence) {
+        sendJson(res, 404, { error: "Sequence not found" });
+        return;
+      }
+      sendJson(res, 200, { ...sequence });
+      return;
+    }
+    if ((path.endsWith("/activate") || path.endsWith("/pause")) && method === "POST") {
+      if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager"])) {
+        sendJson(res, 403, { error: "Insufficient role to manage sequences" });
+        return;
+      }
+      const target = path.endsWith("/activate") ? "active" : "paused";
+      const sequence = await sequenceRepository.getById(tenantId, sequenceId);
+      if (!sequence) {
+        sendJson(res, 404, { error: "Sequence not found" });
+        return;
+      }
+      if (target === "active" && sequence.status === "active") {
+        sendJson(res, 409, { error: "Sequence is already active" });
+        return;
+      }
+      if (target === "paused" && sequence.status !== "active") {
+        sendJson(res, 409, { error: `Cannot pause a sequence that is ${sequence.status}` });
+        return;
+      }
+      const updated = await sequenceRepository.setStatus(tenantId, sequenceId, target);
+      await audit(tenantId, auth, {
+        action: target === "active" ? "sequence.activated" : "sequence.paused",
+        resourceType: "Sequence",
+        resourceId: sequenceId,
+        payload: {}
+      });
+      sendJson(res, 200, { ...updated });
+      return;
+    }
+    if (path.endsWith("/enroll") && method === "POST") {
+      if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager"])) {
+        sendJson(res, 403, { error: "Insufficient role to enroll contacts" });
+        return;
+      }
+      const body = await readJsonBody<{ segmentId?: string }>(req);
+      if (!body.segmentId || !UUID.test(body.segmentId)) {
+        sendJson(res, 400, { error: "segmentId is required" });
+        return;
+      }
+      const sequence = await sequenceRepository.getById(tenantId, sequenceId);
+      if (!sequence) {
+        sendJson(res, 404, { error: "Sequence not found" });
+        return;
+      }
+      const segment = await segmentRepository.getById(tenantId, body.segmentId);
+      if (!segment) {
+        sendJson(res, 404, { error: "Segment not found" });
+        return;
+      }
+      const contacts = await segmentRepository.resolveContacts(tenantId, segment.definition);
+      const enrolled = await sequenceRepository.enroll(
+        tenantId,
+        sequenceId,
+        contacts.map((c) => c.id)
+      );
+      await audit(tenantId, auth, {
+        action: "sequence.enrolled",
+        resourceType: "Sequence",
+        resourceId: sequenceId,
+        payload: { segmentId: body.segmentId, resolved: contacts.length, enrolled }
+      });
+      sendJson(res, 200, { status: "enrolled", resolved: contacts.length, enrolled });
+      return;
+    }
+    sendJson(res, 404, { error: "Not found" });
+    return;
+  }
+
+  // ─── Default automations settings: working hours / welcome / OOO (G8) ─────
+  if (path === "/api/v1/automation-settings") {
+    if (method === "GET") {
+      const settings = await automationSettingsRepository.get(tenantId);
+      sendJson(res, 200, {
+        settings: settings ?? {
+          tenantId,
+          timezone: "UTC",
+          workingHours: {},
+          welcomeEnabled: false,
+          oooEnabled: false,
+          oooSuppressHours: 12,
+          roundRobinEnabled: false
+        }
+      });
+      return;
+    }
+    if (method === "PUT") {
+      if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager"])) {
+        sendJson(res, 403, { error: "Insufficient role to update automation settings" });
+        return;
+      }
+      const patch = validateAutomationSettingsPatch(await readJsonBody<Record<string, unknown>>(req));
+      if (!patch.ok) {
+        sendJson(res, 400, { error: patch.error });
+        return;
+      }
+      if (patch.value.roundRobinTeamId && !(await teamRepository.getById(tenantId, patch.value.roundRobinTeamId))) {
+        sendJson(res, 422, { error: "roundRobinTeamId does not name a team in this workspace" });
+        return;
+      }
+      const settings = await automationSettingsRepository.upsert(tenantId, patch.value);
+      await audit(tenantId, auth, {
+        action: "automation.settings.updated",
+        resourceType: "AutomationSettings",
+        resourceId: tenantId,
+        payload: { fields: Object.keys(patch.value) }
+      });
+      sendJson(res, 200, { settings });
+      return;
+    }
+    sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+
   if (path === "/api/v1/auto-reply-rules") {
     if (method === "GET") {
       sendJson(res, 200, { items: await autoReplyRuleRepository.list(tenantId) });
@@ -4980,6 +5309,7 @@ export function createGatewayHandler(deps: GatewayDeps = {}): GatewayModule {
       startCampaignScheduler(),
       startCampaignCompletionScheduler(),
       startNoReplyScheduler(),
+      startSequenceScheduler(),
       startReminderScheduler(),
       startSessionPurgeScheduler()
     ],

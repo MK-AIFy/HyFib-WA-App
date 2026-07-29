@@ -5,6 +5,8 @@ export * from "./logger.js";
 export * from "./metrics.js";
 export * from "./security.js";
 export * from "./automation.js";
+export * from "./working-hours.js";
+export * from "./flows.js";
 
 export type Role =
   | "platform_owner"
@@ -270,6 +272,58 @@ export interface ConversationNote {
   authorUserId?: string;
   note: string;
   createdAt: string;
+}
+
+/** Drip sequence (G7): ordered template steps with per-step delays. */
+export interface Sequence {
+  id: string;
+  tenantId: string;
+  name: string;
+  channelId: string;
+  status: "draft" | "active" | "paused";
+  stopOnReply: boolean;
+  createdAt: string;
+  steps?: SequenceStep[];
+  enrollmentCounts?: { active: number; completed: number; stopped: number };
+}
+
+export interface SequenceStep {
+  id: string;
+  sequenceId: string;
+  stepOrder: number;
+  /** Delay from enrollment (step 1) or from the previous step's send. */
+  delayMinutes: number;
+  templateId: string;
+  templateName?: string;
+  templateLanguage?: string;
+}
+
+export interface SequenceEnrollment {
+  id: string;
+  tenantId: string;
+  sequenceId: string;
+  contactId: string;
+  status: "active" | "completed" | "stopped";
+  currentStep: number;
+  nextStepAt?: string;
+  stoppedReason?: string;
+  createdAt: string;
+}
+
+/** Default automations (G8): working hours, welcome message, out-of-office. */
+export interface AutomationSettings {
+  tenantId: string;
+  timezone: string;
+  workingHours: import("./working-hours.js").WorkingHours;
+  welcomeEnabled: boolean;
+  welcomeText?: string;
+  oooEnabled: boolean;
+  oooText?: string;
+  oooSuppressHours: number;
+  /** Round-robin auto-assignment (G9): rotate new conversations among this team. */
+  roundRobinEnabled: boolean;
+  roundRobinTeamId?: string;
+  updatedAt: string;
 }
 
 export interface WhatsAppSettings {
