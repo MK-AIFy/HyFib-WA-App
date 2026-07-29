@@ -5,6 +5,7 @@ export * from "./logger.js";
 export * from "./metrics.js";
 export * from "./security.js";
 export * from "./automation.js";
+export * from "./working-hours.js";
 
 export type Role =
   | "platform_owner"
