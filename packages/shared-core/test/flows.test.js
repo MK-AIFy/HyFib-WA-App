@@ -42,14 +42,8 @@ test("start and every next/branch target must exist", () => {
 test("shape errors are rejected: node caps, texts, unknown types, empty branches", () => {
   assert.equal(validateFlowDefinition(null).ok, false);
   assert.equal(validateFlowDefinition({ start: "a", nodes: {} }).ok, false);
-  assert.equal(
-    validateFlowDefinition({ start: "a", nodes: { a: { type: "teleport" } } }).ok,
-    false
-  );
-  assert.equal(
-    validateFlowDefinition({ start: "a", nodes: { a: { type: "message", text: "" } } }).ok,
-    false
-  );
+  assert.equal(validateFlowDefinition({ start: "a", nodes: { a: { type: "teleport" } } }).ok, false);
+  assert.equal(validateFlowDefinition({ start: "a", nodes: { a: { type: "message", text: "" } } }).ok, false);
   assert.equal(
     validateFlowDefinition({ start: "a", nodes: { a: { type: "question", text: "?", branches: [] } } }).ok,
     false
@@ -85,7 +79,10 @@ test("a matching reply follows its branch and executes side-effect nodes to the 
 
 test("branch matching is case-insensitive and trims; fallback re-asks on no match", () => {
   const upper = advanceFlow(
-    { start: "q", nodes: { q: { type: "question", text: "yes?", branches: [{ match: "YES", next: "e" }] }, e: { type: "end" } } },
+    {
+      start: "q",
+      nodes: { q: { type: "question", text: "yes?", branches: [{ match: "YES", next: "e" }] }, e: { type: "end" } }
+    },
     "q",
     "  yes  "
   );
@@ -108,7 +105,10 @@ test("a question with no fallback stays waiting silently on an unmatched reply",
 
 test("assign_team emits its action and the step cap breaks message loops", () => {
   const handoff = advanceFlow(SUPPORT_FLOW, "ask", "2");
-  assert.deepEqual(handoff.actions.map((a) => a.type), ["assign_team"]);
+  assert.deepEqual(
+    handoff.actions.map((a) => a.type),
+    ["assign_team"]
+  );
   assert.deepEqual(handoff.outcome, { status: "done" });
 
   const loop = {

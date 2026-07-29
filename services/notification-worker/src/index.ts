@@ -20,6 +20,7 @@ import {
   consentRepository,
   contactRepository,
   conversationRepository,
+  flowRepository,
   healthCheck,
   linkClickRepository,
   mediaRepository,
@@ -40,6 +41,7 @@ import { dispatchScheduleAt, continuationScheduleAt, isFinalBatch, BATCH_SIZE } 
 import {
   EventTopics,
   Logger,
+  advanceFlow,
   parseUrlPath,
   sendJson,
   sendMetrics,
@@ -916,12 +918,22 @@ async function handleInbound(event: EventEnvelope): Promise<void> {
 
   // Auto-reply evaluation (only text/button messages; skip reactions, read receipts).
   if (inbound.type === "text" || inbound.type === "button" || inbound.type === "interactive") {
-    const rules = await autoReplyRuleRepository.listEnabled(channel.tenantId);
     const interactivePayload = inbound.interactive as
       | { button_reply?: { title?: string }; list_reply?: { title?: string } }
       | undefined;
     const interactiveTitle = interactivePayload?.button_reply?.title ?? interactivePayload?.list_reply?.title;
     const text = typeof inbound.text === "string" && inbound.text ? inbound.text : interactiveTitle;
+
+    // Chatbot flows (G14): an active session (or a matching trigger) consumes
+    // the message — keyword auto-replies are then skipped so the bot never
+    // double-replies. Rule-based automations (tagging etc.) still run below.
+    const flowConsumed = await runFlowRuntime(channel, conversation.id, contact, text);
+    if (flowConsumed) {
+      await runNewMessageAutomation(channel.tenantId, conversation.id, contact, channel.channelId, text);
+      return;
+    }
+
+    const rules = await autoReplyRuleRepository.listEnabled(channel.tenantId);
     const matched = matchAutoReply(text, rules);
     if (matched && matched.replyText) {
       await withTenant(channel.tenantId, async (client) => {
@@ -1042,6 +1054,95 @@ async function runRoundRobinAssignment(tenantId: string, conversationId: string)
       conversationId,
       error: error instanceof Error ? error.message : String(error)
     });
+  }
+}
+
+/**
+ * Chatbot flow runtime (G14): continues the conversation's active session with
+ * the reply, or starts a new session when the text matches an active flow's
+ * trigger keyword. Actions map onto existing primitives (outbox text sends,
+ * tagging, team assignment). Returns true when a flow consumed the message.
+ * Failures never break inbound processing.
+ */
+async function runFlowRuntime(
+  channel: { tenantId: string; channelId: string },
+  conversationId: string,
+  contact: { id: string; phoneE164: string },
+  text: string | undefined
+): Promise<boolean> {
+  try {
+    let session = await flowRepository.activeSessionForConversation(channel.tenantId, conversationId);
+    let flow;
+    let reply: string | null = text ?? null;
+    if (session) {
+      flow = await flowRepository.getById(channel.tenantId, session.flowId);
+      if (!flow || flow.status !== "active") {
+        return false; // paused/deleted flow: normal automations take over
+      }
+    } else {
+      if (!text?.trim()) {
+        return false;
+      }
+      flow = await flowRepository.findByTrigger(channel.tenantId, text);
+      if (!flow) {
+        return false;
+      }
+      session = await flowRepository.startSession(channel.tenantId, {
+        flowId: flow.id,
+        conversationId,
+        contactId: contact.id,
+        currentNode: flow.definition.start
+      });
+      if (!session) {
+        return false; // lost the one-active-session race
+      }
+      reply = null; // the trigger message starts the flow; it is not a question reply
+    }
+
+    const result = advanceFlow(flow.definition, session.currentNode, reply);
+    for (const action of result.actions) {
+      if (action.type === "send") {
+        await withTenant(channel.tenantId, async (client) => {
+          await outboxRepository.enqueue(client, channel.tenantId, {
+            topic: EventTopics.WhatsAppOutboundRequested,
+            payload: {
+              tenantId: channel.tenantId,
+              channelId: channel.channelId,
+              conversationId,
+              contactPhoneE164: contact.phoneE164,
+              kind: "text",
+              text: action.text,
+              dispatchId: randomUUID()
+            } satisfies WhatsAppOutboundRequest
+          });
+        });
+      } else if (action.type === "add_tag") {
+        await contactRepository.addTag(channel.tenantId, contact.id, action.tag);
+      } else if (action.type === "assign_team") {
+        await conversationRepository.assignTeam(channel.tenantId, conversationId, action.teamId);
+      }
+    }
+    if (result.outcome.status === "waiting") {
+      await flowRepository.updateSession(channel.tenantId, session.id, { currentNode: result.outcome.node });
+    } else {
+      await flowRepository.updateSession(channel.tenantId, session.id, { status: "completed" });
+    }
+    incCounter("flow_steps_total", "Chatbot flow advances.", { outcome: result.outcome.status });
+    logger.info("flow_advanced", {
+      tenantId: channel.tenantId,
+      conversationId,
+      flowId: flow.id,
+      actions: result.actions.length,
+      outcome: result.outcome.status
+    });
+    return true;
+  } catch (error) {
+    logger.error("flow_runtime_failed", {
+      tenantId: channel.tenantId,
+      conversationId,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return false;
   }
 }
 

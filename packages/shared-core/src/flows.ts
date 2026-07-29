@@ -135,13 +135,17 @@ export interface FlowAdvanceResult {
  * non-waiting nodes until it must wait or the flow ends; STEP_CAP bounds
  * mis-authored cycles.
  */
-export function advanceFlow(definition: FlowDefinition, currentNode: string, inboundText: string | null): FlowAdvanceResult {
+export function advanceFlow(
+  definition: FlowDefinition,
+  currentNode: string,
+  inboundText: string | null
+): FlowAdvanceResult {
   const actions: FlowAction[] = [];
   let cursor: string | undefined = currentNode;
   let reply = inboundText;
 
   for (let step = 0; step < STEP_CAP && cursor; step += 1) {
-    const node = definition.nodes[cursor];
+    const node: FlowNode | undefined = definition.nodes[cursor];
     if (!node) {
       return { actions, outcome: { status: "done" } };
     }
@@ -168,7 +172,9 @@ export function advanceFlow(definition: FlowDefinition, currentNode: string, inb
         }
         const normalized = reply.trim().toLowerCase();
         reply = null; // a reply is consumed by exactly one question
-        const branch = node.branches.find((b) => b.match.trim().toLowerCase() === normalized);
+        const branch = node.branches.find(
+          (candidate: { match: string; next: string }) => candidate.match.trim().toLowerCase() === normalized
+        );
         if (branch) {
           cursor = branch.next;
         } else if (node.fallbackNext) {

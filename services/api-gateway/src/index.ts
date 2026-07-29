@@ -14,6 +14,7 @@ import {
   auditRepository,
   autoReplyRuleRepository,
   automationSettingsRepository,
+  flowRepository,
   sequenceRepository,
   automationRuleRepository,
   campaignRecipientRepository,
@@ -102,6 +103,7 @@ import { SseHub } from "./sse-hub.js";
 import { parseCsv, serializeContactsCsv, extractMultipartFile } from "./csv.js";
 import { validateAutomationSettingsPatch } from "./automation-settings.js";
 import { validateSequenceCreate } from "./sequence-validation.js";
+import { validateFlowDefinition } from "@hyfib/shared-core";
 import { resolveOrgTenant } from "./single-org.js";
 import { runOutboxRelayOnce } from "./outbox-relay.js";
 import { classifyRoute, API_RATE_LIMITS } from "./rate-limit.js";
@@ -3427,6 +3429,111 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   }
 
   // ─── Auto-reply rules ─────────────────────────────────────────────────────
+  // ─── Chatbot flows (G14) ──────────────────────────────────────────────────
+  if (path === "/api/v1/flows") {
+    if (method === "GET") {
+      sendJson(res, 200, { items: await flowRepository.list(tenantId) });
+      return;
+    }
+    if (method === "POST") {
+      if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager"])) {
+        sendJson(res, 403, { error: "Insufficient role to create flows" });
+        return;
+      }
+      const body = await readJsonBody<{ name?: unknown; triggerKeyword?: unknown; definition?: unknown }>(req);
+      const nameCheck = boundedText(body.name as string | undefined, 200);
+      if (!nameCheck.ok) {
+        sendJson(res, 400, { error: `name ${nameCheck.error}` });
+        return;
+      }
+      if (body.triggerKeyword !== undefined) {
+        if (
+          typeof body.triggerKeyword !== "string" ||
+          body.triggerKeyword.trim().length === 0 ||
+          body.triggerKeyword.length > 100
+        ) {
+          sendJson(res, 400, { error: "triggerKeyword must be a non-empty string of at most 100 characters" });
+          return;
+        }
+      }
+      const definition = validateFlowDefinition(body.definition);
+      if (!definition.ok) {
+        sendJson(res, 400, { error: definition.error });
+        return;
+      }
+      // Handoff targets must be real teams in this workspace.
+      for (const [nodeId, node] of Object.entries(definition.value.nodes)) {
+        if (node.type === "assign_team" && !(await teamRepository.getById(tenantId, node.teamId))) {
+          sendJson(res, 422, { error: `node "${nodeId}": teamId does not name a team in this workspace` });
+          return;
+        }
+      }
+      const flow = await flowRepository.create(tenantId, {
+        name: nameCheck.value,
+        triggerKeyword: (body.triggerKeyword as string | undefined)?.trim(),
+        definition: definition.value
+      });
+      await audit(tenantId, auth, {
+        action: "flow.created",
+        resourceType: "Flow",
+        resourceId: flow.id,
+        payload: { name: flow.name, nodes: Object.keys(definition.value.nodes).length }
+      });
+      sendJson(res, 201, { ...flow });
+      return;
+    }
+    sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+
+  if (path.startsWith("/api/v1/flows/")) {
+    const flowId = extractPathSegment(path, "/api/v1/flows/");
+    if (!flowId || !UUID.test(flowId)) {
+      sendJson(res, 400, { error: "Invalid flow id" });
+      return;
+    }
+    if (path === `/api/v1/flows/${flowId}` && method === "GET") {
+      const flow = await flowRepository.getById(tenantId, flowId);
+      if (!flow) {
+        sendJson(res, 404, { error: "Flow not found" });
+        return;
+      }
+      sendJson(res, 200, { ...flow });
+      return;
+    }
+    if ((path.endsWith("/activate") || path.endsWith("/pause")) && method === "POST") {
+      if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager"])) {
+        sendJson(res, 403, { error: "Insufficient role to manage flows" });
+        return;
+      }
+      const target = path.endsWith("/activate") ? "active" : "paused";
+      const existing = await flowRepository.getById(tenantId, flowId);
+      if (!existing) {
+        sendJson(res, 404, { error: "Flow not found" });
+        return;
+      }
+      if (target === "active" && existing.status === "active") {
+        sendJson(res, 409, { error: "Flow is already active" });
+        return;
+      }
+      if (target === "paused" && existing.status !== "active") {
+        sendJson(res, 409, { error: `Cannot pause a flow that is ${existing.status}` });
+        return;
+      }
+      const flow = await flowRepository.setStatus(tenantId, flowId, target);
+      await audit(tenantId, auth, {
+        action: target === "active" ? "flow.activated" : "flow.paused",
+        resourceType: "Flow",
+        resourceId: flowId,
+        payload: {}
+      });
+      sendJson(res, 200, { ...flow });
+      return;
+    }
+    sendJson(res, 404, { error: "Not found" });
+    return;
+  }
+
   // ─── Drip sequences (G7) ──────────────────────────────────────────────────
   if (path === "/api/v1/sequences") {
     if (method === "GET") {
