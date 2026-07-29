@@ -117,6 +117,9 @@ import {
   validateChannelPatch,
   validateUserPatch
 } from "./entity-crud.js";
+import QRCodeSvg from "qrcode-svg";
+import { buildWaLink, renderWidgetScript } from "./click-to-chat.js";
+import { openApiSpec } from "./openapi.js";
 import { SseHub } from "./sse-hub.js";
 import { parseCsv, serializeContactsCsv, serializeCampaignRecipientsCsv, extractMultipartFile } from "./csv.js";
 import { validateSegmentDefinition } from "./segment-definition.js";
@@ -1603,6 +1606,35 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
 
+  // ─── OpenAPI description (public, like any API's docs) ───────────────────
+  if (path === "/api/v1/openapi.json" && method === "GET") {
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    res.end(JSON.stringify(openApiSpec));
+    return;
+  }
+
+  // ─── Website chat widget (public, embedded on customer sites) ────────────
+  if (path === "/widget.js" && method === "GET") {
+    const q = parseQuery(req.url);
+    const link = buildWaLink({ phone: q.get("phone") ?? "", text: q.get("text") ?? undefined });
+    if (!link.ok) {
+      sendJson(res, 400, { error: link.error });
+      return;
+    }
+    const script = renderWidgetScript({
+      waLink: link.value,
+      position: q.get("position") === "left" ? "left" : "right",
+      label: q.get("label")?.trim() || "Chat with us"
+    });
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "application/javascript; charset=utf-8");
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    res.end(script);
+    return;
+  }
+
   // ─── Link click redirect (public, no auth) ───────────────────────────────
   if (path.startsWith("/r/") && method === "GET") {
     const token = path.slice(3);
@@ -2031,6 +2063,54 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     }
     await audit(tenantId, auth, { action: "api_key.revoked", resourceType: "ApiKey", resourceId: keyId, payload: {} });
     sendJson(res, 200, { status: "revoked", keyId });
+  // ─── Click-to-chat tools: link / QR / widget snippet (Phase D) ────────────
+  if ((path === "/api/v1/tools/click-to-chat" || path === "/api/v1/tools/click-to-chat/qr") && method === "GET") {
+    const q = parseQuery(req.url);
+    let phone = q.get("phone") ?? "";
+    const channelId = q.get("channelId");
+    if (channelId) {
+      if (!UUID.test(channelId)) {
+        sendJson(res, 400, { error: "channelId must be a UUID" });
+        return;
+      }
+      const channel = (await channelRepository.list(tenantId)).find((c) => c.id === channelId);
+      if (!channel) {
+        sendJson(res, 404, { error: "Channel not found" });
+        return;
+      }
+      phone = channel.displayPhoneNumber;
+    }
+    const link = buildWaLink({ phone, text: q.get("text") ?? undefined });
+    if (!link.ok) {
+      sendJson(res, 400, { error: link.error });
+      return;
+    }
+    if (path.endsWith("/qr")) {
+      const svg = new QRCodeSvg({
+        content: link.value,
+        padding: 2,
+        width: 256,
+        height: 256,
+        ecl: "M",
+        join: true
+      }).svg();
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "image/svg+xml; charset=utf-8");
+      res.setHeader("Cache-Control", "no-store");
+      res.end(svg);
+      return;
+    }
+    const widgetSrc = new URL("/widget.js", config.platformBaseUrl);
+    widgetSrc.searchParams.set("phone", phone);
+    const text = q.get("text")?.trim();
+    if (text) {
+      widgetSrc.searchParams.set("text", text);
+    }
+    sendJson(res, 200, {
+      waLink: link.value,
+      qrUrl: `${config.platformBaseUrl}/api/v1/tools/click-to-chat/qr?${new URLSearchParams({ phone, ...(text ? { text } : {}) })}`,
+      widgetSnippet: `<script src="${widgetSrc.toString()}" async></script>`
+    });
     return;
   }
 
