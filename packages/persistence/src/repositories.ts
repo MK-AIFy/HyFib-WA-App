@@ -2216,6 +2216,59 @@ function mapSegment(row: SegmentRow): Segment {
   };
 }
 
+/**
+ * Shared WHERE/JOIN builder for the three segment-resolution queries — they
+ * previously mirrored each other by hand, which is exactly how the retargeting
+ * clause (G6) would have drifted. Opted-out contacts are always excluded;
+ * hasConsent defaults to required.
+ */
+function buildSegmentFilter(definition: Segment["definition"]): {
+  joins: string;
+  where: string;
+  params: unknown[];
+} {
+  const conditions: string[] = ["(c.metadata->>'optedOut')::boolean IS NOT TRUE"];
+  const params: unknown[] = [];
+  const joins: string[] = [];
+
+  if (definition.country) {
+    params.push(definition.country);
+    conditions.push(`c.metadata->>'country' = $${params.length}`);
+  }
+  if (definition.tags && definition.tags.length > 0) {
+    params.push(JSON.stringify(definition.tags));
+    conditions.push(`c.metadata->'tags' @> $${params.length}::jsonb`);
+  }
+  if (definition.hasConsent !== false) {
+    joins.push("JOIN consent_records cr ON cr.contact_id = c.id AND cr.revoked_at IS NULL");
+  }
+  // Retargeting (G6): contacts from a prior campaign's funnel, optionally
+  // narrowed by recipient status and/or a recorded shortlink click.
+  const campaign = definition.campaign;
+  if (campaign?.id) {
+    params.push(campaign.id);
+    const campaignIdIdx = params.length;
+    if (campaign.statuses && campaign.statuses.length > 0) {
+      params.push(campaign.statuses);
+      joins.push(
+        `JOIN campaign_recipients crc ON crc.contact_id = c.id AND crc.campaign_id = $${campaignIdIdx} AND crc.status = ANY($${params.length})`
+      );
+    } else {
+      joins.push(`JOIN campaign_recipients crc ON crc.contact_id = c.id AND crc.campaign_id = $${campaignIdIdx}`);
+    }
+    if (campaign.clicked !== undefined) {
+      params.push(campaign.id);
+      const clickIdx = params.length;
+      const quantifier = campaign.clicked ? "EXISTS" : "NOT EXISTS";
+      conditions.push(
+        `${quantifier} (SELECT 1 FROM link_clicks lc WHERE lc.contact_id = c.id AND lc.campaign_id = $${clickIdx} AND lc.clicked_count > 0)`
+      );
+    }
+  }
+
+  return { joins: joins.join("\n        "), where: conditions.join(" AND "), params };
+}
+
 export const segmentRepository = {
   async create(tenantId: string, input: { name: string; definition: Segment["definition"] }): Promise<Segment> {
     return withTenant(tenantId, async (client) => {
@@ -2254,31 +2307,12 @@ export const segmentRepository = {
     definition: Segment["definition"]
   ): Promise<Array<{ id: string; phoneE164: string; firstName?: string; lastName?: string; timezone?: string }>> {
     return withTenant(tenantId, async (client) => {
-      const conditions: string[] = ["(c.metadata->>'optedOut')::boolean IS NOT TRUE"];
-      const params: unknown[] = [];
-
-      if (definition.country) {
-        params.push(definition.country);
-        conditions.push(`c.metadata->>'country' = $${params.length}`);
-      }
-      if (definition.tags && definition.tags.length > 0) {
-        params.push(JSON.stringify(definition.tags));
-        conditions.push(`c.metadata->'tags' @> $${params.length}::jsonb`);
-      }
-
-      let join = "";
-      if (definition.hasConsent !== false) {
-        join = "JOIN consent_records cr ON cr.contact_id = c.id AND cr.revoked_at IS NULL";
-        // Deduplicate contacts with multiple consent records.
-        conditions.push("TRUE");
-      }
-
-      const where = conditions.join(" AND ");
+      const filter = buildSegmentFilter(definition);
       const sql = `
         SELECT DISTINCT ON (c.id) c.id, c.phone_e164, c.first_name, c.last_name, c.timezone
         FROM contacts c
-        ${join}
-        WHERE ${where}
+        ${filter.joins}
+        WHERE ${filter.where}
         ORDER BY c.id`;
 
       const result = await client.query<{
@@ -2287,7 +2321,7 @@ export const segmentRepository = {
         first_name: string | null;
         last_name: string | null;
         timezone: string | null;
-      }>(sql, params);
+      }>(sql, filter.params);
 
       return result.rows.map((r) => ({
         id: r.id,
@@ -2300,31 +2334,14 @@ export const segmentRepository = {
   },
   async previewCount(tenantId: string, definition: Segment["definition"]): Promise<number> {
     return withTenant(tenantId, async (client) => {
-      const conditions: string[] = ["(c.metadata->>'optedOut')::boolean IS NOT TRUE"];
-      const params: unknown[] = [];
-
-      if (definition.country) {
-        params.push(definition.country);
-        conditions.push(`c.metadata->>'country' = $${params.length}`);
-      }
-      if (definition.tags && definition.tags.length > 0) {
-        params.push(JSON.stringify(definition.tags));
-        conditions.push(`c.metadata->'tags' @> $${params.length}::jsonb`);
-      }
-
-      let join = "";
-      if (definition.hasConsent !== false) {
-        join = "JOIN consent_records cr ON cr.contact_id = c.id AND cr.revoked_at IS NULL";
-      }
-
-      const where = conditions.join(" AND ");
+      const filter = buildSegmentFilter(definition);
       const sql = `
         SELECT COUNT(DISTINCT c.id) AS cnt
         FROM contacts c
-        ${join}
-        WHERE ${where}`;
+        ${filter.joins}
+        WHERE ${filter.where}`;
 
-      const result = await client.query<{ cnt: string }>(sql, params);
+      const result = await client.query<{ cnt: string }>(sql, filter.params);
       return Number(result.rows[0]?.cnt ?? 0);
     });
   },
@@ -2335,30 +2352,13 @@ export const segmentRepository = {
     limit: number
   ): Promise<Array<{ id: string; phoneE164: string; firstName?: string; lastName?: string; timezone?: string }>> {
     return withTenant(tenantId, async (client) => {
-      const conditions: string[] = ["(c.metadata->>'optedOut')::boolean IS NOT TRUE"];
-      const params: unknown[] = [];
-
-      if (definition.country) {
-        params.push(definition.country);
-        conditions.push(`c.metadata->>'country' = $${params.length}`);
-      }
-      if (definition.tags && definition.tags.length > 0) {
-        params.push(JSON.stringify(definition.tags));
-        conditions.push(`c.metadata->'tags' @> $${params.length}::jsonb`);
-      }
-
-      let join = "";
-      if (definition.hasConsent !== false) {
-        join = "JOIN consent_records cr ON cr.contact_id = c.id AND cr.revoked_at IS NULL";
-      }
-
-      params.push(limit);
-      const where = conditions.join(" AND ");
+      const filter = buildSegmentFilter(definition);
+      const params = [...filter.params, limit];
       const sql = `
         SELECT DISTINCT ON (c.id) c.id, c.phone_e164, c.first_name, c.last_name, c.timezone
         FROM contacts c
-        ${join}
-        WHERE ${where}
+        ${filter.joins}
+        WHERE ${filter.where}
         ORDER BY c.id
         LIMIT $${params.length}`;
 

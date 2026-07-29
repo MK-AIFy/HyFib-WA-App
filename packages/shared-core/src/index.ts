@@ -153,6 +153,18 @@ export interface Segment {
     country?: string;
     hasConsent?: boolean;
     optedInOnly?: boolean;
+    /**
+     * Retargeting source (G6): contacts from a prior campaign's funnel.
+     * statuses filters campaign_recipients.status (e.g. ["delivered"] =
+     * delivered-but-not-read once "read" recipients advance); clicked
+     * true/false requires/excludes a recorded shortlink click for that
+     * campaign. Omitted statuses = every recipient of the campaign.
+     */
+    campaign?: {
+      id: string;
+      statuses?: string[];
+      clicked?: boolean;
+    };
   };
   createdAt: string;
 }
