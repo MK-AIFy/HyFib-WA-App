@@ -137,6 +137,68 @@ function safeParse<T>(raw: string | undefined): T {
   }
 }
 
+// ─── Inbox copilot (roadmap G15): summary + suggested replies ──────────────────
+
+interface CopilotMessage {
+  direction: "inbound" | "outbound";
+  text: string;
+}
+
+const COPILOT_MAX_MESSAGES = 50;
+const COPILOT_MAX_MESSAGE_CHARS = 1000;
+const COPILOT_MAX_TOTAL_CHARS = 15_000;
+
+/** Validates and bounds a copilot transcript; undefined = reject with 400. */
+export function normalizeCopilotMessages(raw: unknown): CopilotMessage[] | undefined {
+  if (!Array.isArray(raw) || raw.length === 0 || raw.length > COPILOT_MAX_MESSAGES) {
+    return undefined;
+  }
+  const messages: CopilotMessage[] = [];
+  let total = 0;
+  for (const entry of raw) {
+    const item = entry as { direction?: unknown; text?: unknown };
+    if (item.direction !== "inbound" && item.direction !== "outbound") {
+      return undefined;
+    }
+    if (typeof item.text !== "string" || item.text.trim().length === 0) {
+      continue; // media/interactive rows without text are simply omitted
+    }
+    const text = item.text.trim().slice(0, COPILOT_MAX_MESSAGE_CHARS);
+    total += text.length;
+    if (total > COPILOT_MAX_TOTAL_CHARS) {
+      break;
+    }
+    messages.push({ direction: item.direction, text });
+  }
+  return messages.length > 0 ? messages : undefined;
+}
+
+function copilotTranscript(messages: CopilotMessage[]): string {
+  return messages.map((m) => `${m.direction === "inbound" ? "Customer" : "Agent"}: ${m.text}`).join("\n");
+}
+
+function fallbackConversationSummary(messages: CopilotMessage[]): string {
+  const inbound = messages.filter((m) => m.direction === "inbound");
+  const lastCustomer = inbound[inbound.length - 1]?.text ?? "(no customer message)";
+  return `Conversation with ${messages.length} recent messages (${inbound.length} from the customer). Latest customer message: "${lastCustomer.slice(0, 200)}"`;
+}
+
+const FALLBACK_SUGGESTIONS = [
+  "Thanks for reaching out! Let me look into that for you right away.",
+  "Could you share a few more details so I can help you faster?",
+  "I've noted your request and will get back to you shortly with an update."
+];
+
+/** Parses "1. …\n2. …" style output into up to three suggestions. */
+export function parseSuggestions(text: string): string[] {
+  const lines = text
+    .split("\n")
+    .map((line) => line.replace(/^\s*(?:\d+[.)]|[-*])\s*/, "").trim())
+    .filter((line) => line.length > 0);
+  const suggestions = lines.slice(0, 3).map((line) => line.slice(0, 300));
+  return suggestions.length > 0 ? suggestions : [text.trim().slice(0, 300)];
+}
+
 /**
  * Route an `/internal/v1/ai/*` request to the matching handler, returning the
  * status + body the HTTP endpoint produces. Exported so app-server calls it
@@ -150,6 +212,43 @@ export async function dispatchAi(
 ): Promise<{ status: number; body: Record<string, unknown> }> {
   if (method !== "POST") {
     return { status: 405, body: { error: "method_not_allowed" } };
+  }
+
+  if (aiPath === "conversation-summary") {
+    const payload = safeParse<{ messages?: unknown }>(rawBody);
+    const messages = normalizeCopilotMessages(payload.messages);
+    if (!messages) {
+      return {
+        status: 400,
+        body: { error: "messages must be a non-empty array (max 50) of {direction: inbound|outbound, text}" }
+      };
+    }
+    const system =
+      "You summarize WhatsApp customer conversations for support agents. Be factual, concise and neutral. " +
+      "Output 2-4 sentences covering the customer's need, the current status, and any commitments made. " +
+      "Never invent details that are not in the transcript.";
+    const result = await runWithFallback(system, copilotTranscript(messages), fallbackConversationSummary(messages));
+    return { status: 200, body: { requestId, mode: result.mode, summary: result.text } };
+  }
+
+  if (aiPath === "suggest-reply") {
+    const payload = safeParse<{ messages?: unknown }>(rawBody);
+    const messages = normalizeCopilotMessages(payload.messages);
+    if (!messages) {
+      return {
+        status: 400,
+        body: { error: "messages must be a non-empty array (max 50) of {direction: inbound|outbound, text}" }
+      };
+    }
+    const system =
+      "You draft the support agent's next WhatsApp reply. Output EXACTLY three numbered suggestions, " +
+      "each under 300 characters, in the conversation's language. Never invent order details, prices, " +
+      "or commitments that are not present in the transcript.";
+    const result = await runWithFallback(system, copilotTranscript(messages), FALLBACK_SUGGESTIONS.join("\n"));
+    return {
+      status: 200,
+      body: { requestId, mode: result.mode, suggestions: parseSuggestions(result.text) }
+    };
   }
 
   if (aiPath === "campaign-draft") {

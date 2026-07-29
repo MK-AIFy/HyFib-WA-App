@@ -3982,6 +3982,50 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
 
+  // ─── Inbox AI copilot (G15): summary + suggested replies ──────────────────
+  // The transcript is loaded SERVER-side (RLS-scoped) — clients cannot feed
+  // forged content into the model; the AI service additionally redacts PII.
+  if (
+    path.startsWith("/api/v1/conversations/") &&
+    (path.endsWith("/ai/summary") || path.endsWith("/ai/suggest-reply")) &&
+    method === "POST"
+  ) {
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager", "sales_agent", "support_agent"])) {
+      sendJson(res, 403, { error: "Insufficient role" });
+      return;
+    }
+    const conversationId = extractPathSegment(path, "/api/v1/conversations/");
+    if (!conversationId || !UUID.test(conversationId)) {
+      sendJson(res, 400, { error: "Invalid conversation id" });
+      return;
+    }
+    const conversation = await conversationRepository.getById(tenantId, conversationId);
+    if (!conversation) {
+      sendJson(res, 404, { error: "Conversation not found" });
+      return;
+    }
+    const history = await messageRepository.listByConversation(tenantId, conversationId, { limit: 30 });
+    const messages = history
+      .map((m) => ({
+        direction: m.direction,
+        text: typeof m.payload?.text === "string" ? (m.payload.text as string) : ""
+      }))
+      .filter((m) => m.text.trim().length > 0);
+    if (messages.length === 0) {
+      sendJson(res, 422, { error: "conversation_has_no_text_messages" });
+      return;
+    }
+    const aiPath = path.endsWith("/ai/summary") ? "conversation-summary" : "suggest-reply";
+    const { status, body } = await aiProxy(
+      { tenantId, requestId: ctx.requestId },
+      aiPath,
+      "POST",
+      JSON.stringify({ messages })
+    );
+    sendJson(res, status, body);
+    return;
+  }
+
   if (path.startsWith("/api/v1/conversations/") && path.endsWith("/state") && method === "POST") {
     if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "support_agent", "sales_agent", "marketing_manager"])) {
       sendJson(res, 403, { error: "Insufficient role" });
