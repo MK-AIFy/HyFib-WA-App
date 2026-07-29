@@ -11,6 +11,8 @@ import { loadConfig } from "@hyfib/config";
 import { createAuthenticator, hasAnyRole, normalizeRoles, AuthError, type AuthContext } from "@hyfib/auth";
 import { createEventBus, type EventBus } from "@hyfib/event-bus";
 import {
+  apiKeyRepository,
+  hashApiKey,
   auditRepository,
   autoReplyRuleRepository,
   automationRuleRepository,
@@ -710,8 +712,21 @@ async function resolveSessionToken(rawToken: string): Promise<AuthContext | unde
 }
 
 async function resolveAuth(req: IncomingMessage): Promise<AuthContext> {
-  // 1. Bearer session token (works in all modes) — takes precedence over the cookie.
   const authHeader = req.headers["authorization"];
+
+  // 0. Public API key (Phase D): "Bearer hyfib_…". The key's bound roles
+  // become the caller's roles, so every existing per-route RBAC check applies
+  // unchanged. An unknown or revoked key fails HARD — it must never fall
+  // through to weaker auth paths.
+  if (authHeader?.startsWith("Bearer hyfib_") && orgTenantId) {
+    const apiKey = await apiKeyRepository.findActiveByHash(orgTenantId, hashApiKey(authHeader.slice(7)));
+    if (!apiKey) {
+      throw new AuthError("Invalid or revoked API key", 401);
+    }
+    return { subject: `apikey:${apiKey.id}`, tenantId: orgTenantId, roles: normalizeRoles(apiKey.roles) };
+  }
+
+  // 1. Bearer session token (works in all modes) — takes precedence over the cookie.
   if (authHeader?.startsWith("Bearer ")) {
     const authCtx = await resolveSessionToken(authHeader.slice(7));
     if (authCtx) return authCtx;
@@ -1947,6 +1962,78 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   }
 
   // ─── Users ────────────────────────────────────────────────────────────────
+  // ─── Public API keys (Phase D) ────────────────────────────────────────────
+  if (path === "/api/v1/api-keys") {
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin"])) {
+      sendJson(res, 403, { error: "Only platform_owner/tenant_admin can manage API keys" });
+      return;
+    }
+    if (method === "GET") {
+      sendJson(res, 200, { items: await apiKeyRepository.list(tenantId) });
+      return;
+    }
+    if (method === "POST") {
+      const body = await readJsonBody<{ name?: string; roles?: unknown }>(req);
+      const nameCheck = boundedText(body.name, 120);
+      if (!nameCheck.ok) {
+        sendJson(res, 400, { error: `name ${nameCheck.error}` });
+        return;
+      }
+      if (!Array.isArray(body.roles) || body.roles.length === 0) {
+        sendJson(res, 400, { error: "roles must be a non-empty array" });
+        return;
+      }
+      // platform_owner is the break-glass human role; a long-lived credential
+      // must not carry it.
+      const invalid = body.roles.filter(
+        (role) => typeof role !== "string" || !VALID_ROLE_SET.has(role) || role === "platform_owner"
+      );
+      if (invalid.length > 0) {
+        sendJson(res, 400, { error: `Unknown or disallowed roles: ${invalid.join(", ")}` });
+        return;
+      }
+      const { key, record } = await apiKeyRepository.create(tenantId, {
+        name: nameCheck.value,
+        roles: [...new Set(body.roles as Role[])],
+        createdBy: asActorUuid(auth.subject)
+      });
+      await audit(tenantId, auth, {
+        action: "api_key.created",
+        resourceType: "ApiKey",
+        resourceId: record.id,
+        payload: { name: record.name, roles: record.roles, keyPrefix: record.keyPrefix }
+      });
+      sendJson(res, 201, {
+        key,
+        note: "Store this key now — it is shown exactly once and only its hash is retained.",
+        record
+      });
+      return;
+    }
+    sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+
+  if (path.startsWith("/api/v1/api-keys/") && method === "DELETE") {
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin"])) {
+      sendJson(res, 403, { error: "Only platform_owner/tenant_admin can manage API keys" });
+      return;
+    }
+    const keyId = extractPathSegment(path, "/api/v1/api-keys/");
+    if (!keyId || !UUID.test(keyId)) {
+      sendJson(res, 400, { error: "Invalid API key id" });
+      return;
+    }
+    const revoked = await apiKeyRepository.revoke(tenantId, keyId);
+    if (!revoked) {
+      sendJson(res, 404, { error: "API key not found or already revoked" });
+      return;
+    }
+    await audit(tenantId, auth, { action: "api_key.revoked", resourceType: "ApiKey", resourceId: keyId, payload: {} });
+    sendJson(res, 200, { status: "revoked", keyId });
+    return;
+  }
+
   if (path === "/api/v1/users") {
     if (method === "GET") {
       if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager", "support_agent"])) {
@@ -2275,13 +2362,19 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   if (path === "/api/v1/channels/whatsapp/settings") {
     if (method === "GET") {
       const stored = await whatsappSettingsRepository.getByTenant(tenantId);
-      sendJson(res, 200, {
-        settings: stored ?? {
-          graphVersion: config.whatsappGraphVersion,
-          retryMaxAttempts: config.whatsappDefaultRetryMaxAttempts,
-          retryBaseDelayMs: config.whatsappDefaultRetryBaseDelayMs
-        }
-      });
+      if (!stored) {
+        sendJson(res, 200, {
+          settings: {
+            graphVersion: config.whatsappGraphVersion,
+            retryMaxAttempts: config.whatsappDefaultRetryMaxAttempts,
+            retryBaseDelayMs: config.whatsappDefaultRetryBaseDelayMs
+          }
+        });
+        return;
+      }
+      // The signing secret never leaves the server; expose only its presence.
+      const { statusCallbackSecret, ...safe } = stored;
+      sendJson(res, 200, { settings: { ...safe, hasCallbackSecret: Boolean(statusCallbackSecret) } });
       return;
     }
     if (method === "PUT") {
@@ -2289,9 +2382,18 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         sendJson(res, 403, { error: "Only platform_owner/tenant_admin can update WhatsApp settings" });
         return;
       }
-      const payload = await readJsonBody<UpdateWhatsAppSettingsRequest>(req);
+      const payload = await readJsonBody<UpdateWhatsAppSettingsRequest & { statusCallbackSecret?: string }>(req);
+      if (payload.statusCallbackSecret !== undefined && typeof payload.statusCallbackSecret !== "string") {
+        sendJson(res, 400, { error: "statusCallbackSecret must be a string" });
+        return;
+      }
+      if (typeof payload.statusCallbackSecret === "string" && payload.statusCallbackSecret.length > 128) {
+        sendJson(res, 400, { error: "statusCallbackSecret must be at most 128 characters" });
+        return;
+      }
       const settings = await whatsappSettingsRepository.upsert(tenantId, {
         statusCallbackUrl: payload.statusCallbackUrl?.trim() || undefined,
+        statusCallbackSecret: payload.statusCallbackSecret?.trim() || undefined,
         graphVersion: payload.graphVersion?.trim() || config.whatsappGraphVersion,
         retryMaxAttempts: clampInt(payload.retryMaxAttempts, 1, 10, config.whatsappDefaultRetryMaxAttempts),
         retryBaseDelayMs: clampInt(payload.retryBaseDelayMs, 50, 60_000, config.whatsappDefaultRetryBaseDelayMs),
@@ -2306,7 +2408,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         resourceId: settings.id,
         payload: { graphVersion: settings.graphVersion, retryMaxAttempts: settings.retryMaxAttempts }
       });
-      sendJson(res, 200, { settings });
+      const { statusCallbackSecret, ...safe } = settings;
+      sendJson(res, 200, { settings: { ...safe, hasCallbackSecret: Boolean(statusCallbackSecret) } });
       return;
     }
     sendJson(res, 405, { error: "Method not allowed" });

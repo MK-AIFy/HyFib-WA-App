@@ -1,7 +1,9 @@
+import { createHash, randomBytes } from "node:crypto";
 import { query, withTenant, type QueryClient } from "./db.js";
 import { loadConfig } from "@hyfib/config";
 import { decryptSecret, encryptSecret } from "@hyfib/shared-core";
 import type {
+  ApiKey,
   AuditEvent,
   AutoReplyRule,
   AutomationActionConfig,
@@ -399,6 +401,7 @@ interface WhatsAppSettingsRow {
   id: string;
   tenant_id: string;
   status_callback_url: string | null;
+  status_callback_secret: string | null;
   graph_version: string;
   retry_max_attempts: number;
   retry_base_delay_ms: number;
@@ -413,6 +416,7 @@ function mapWhatsAppSettings(row: WhatsAppSettingsRow): WhatsAppSettings & { mon
     id: row.id,
     tenantId: row.tenant_id,
     statusCallbackUrl: row.status_callback_url ?? undefined,
+    statusCallbackSecret: row.status_callback_secret ?? undefined,
     graphVersion: row.graph_version,
     retryMaxAttempts: row.retry_max_attempts,
     retryBaseDelayMs: row.retry_base_delay_ms,
@@ -424,13 +428,14 @@ function mapWhatsAppSettings(row: WhatsAppSettingsRow): WhatsAppSettings & { mon
 }
 
 const WHATSAPP_SETTINGS_SELECT =
-  "SELECT id, tenant_id, status_callback_url, graph_version, retry_max_attempts, retry_base_delay_ms, outbound_rate_limit_per_minute, monthly_message_quota, created_at, updated_at";
+  "SELECT id, tenant_id, status_callback_url, status_callback_secret, graph_version, retry_max_attempts, retry_base_delay_ms, outbound_rate_limit_per_minute, monthly_message_quota, created_at, updated_at";
 
 export const whatsappSettingsRepository = {
   async upsert(
     tenantId: string,
     input: {
       statusCallbackUrl?: string;
+      statusCallbackSecret?: string;
       graphVersion: string;
       retryMaxAttempts: number;
       retryBaseDelayMs: number;
@@ -438,33 +443,39 @@ export const whatsappSettingsRepository = {
     }
   ): Promise<WhatsAppSettings> {
     return withTenant(tenantId, async (client) => {
-      const result = await client.query<WhatsAppSettingsRow>(
+      await client.query(
         `INSERT INTO whatsapp_settings (
           tenant_id,
           status_callback_url,
+          status_callback_secret,
           graph_version,
           retry_max_attempts,
           retry_base_delay_ms,
           outbound_rate_limit_per_minute,
           updated_at
         )
-        VALUES ($1, $2, $3, $4, $5, $6, now())
+        VALUES ($1, $2, $3, $4, $5, $6, $7, now())
         ON CONFLICT (tenant_id) DO UPDATE
           SET status_callback_url = EXCLUDED.status_callback_url,
+              status_callback_secret = EXCLUDED.status_callback_secret,
               graph_version = EXCLUDED.graph_version,
               retry_max_attempts = EXCLUDED.retry_max_attempts,
               retry_base_delay_ms = EXCLUDED.retry_base_delay_ms,
               outbound_rate_limit_per_minute = EXCLUDED.outbound_rate_limit_per_minute,
-              updated_at = now()
-        RETURNING ${WHATSAPP_SETTINGS_SELECT}`,
+              updated_at = now()`,
         [
           tenantId,
           input.statusCallbackUrl ?? null,
+          input.statusCallbackSecret ?? null,
           input.graphVersion,
           input.retryMaxAttempts,
           input.retryBaseDelayMs,
           input.outboundRateLimitPerMinute ?? null
         ]
+      );
+      const result = await client.query<WhatsAppSettingsRow>(
+        `${WHATSAPP_SETTINGS_SELECT} FROM whatsapp_settings WHERE tenant_id = $1`,
+        [tenantId]
       );
       return mapWhatsAppSettings(result.rows[0]!);
     });
@@ -476,6 +487,97 @@ export const whatsappSettingsRepository = {
          WHERE tenant_id = current_setting('app.tenant_id', true)::uuid LIMIT 1`
       );
       return result.rows[0] ? mapWhatsAppSettings(result.rows[0]) : undefined;
+    });
+  }
+};
+
+// ─── Public API keys (Phase D) ─────────────────────────────────────────────────
+
+interface ApiKeyRow {
+  id: string;
+  tenant_id: string;
+  name: string;
+  key_prefix: string;
+  roles: string[];
+  created_by: string | null;
+  last_used_at: Date | null;
+  revoked_at: Date | null;
+  created_at: Date;
+}
+
+function mapApiKey(row: ApiKeyRow): ApiKey {
+  return {
+    id: row.id,
+    tenantId: row.tenant_id,
+    name: row.name,
+    keyPrefix: row.key_prefix,
+    roles: row.roles as Role[],
+    createdBy: row.created_by ?? undefined,
+    lastUsedAt: row.last_used_at?.toISOString(),
+    revokedAt: row.revoked_at?.toISOString(),
+    createdAt: row.created_at.toISOString()
+  };
+}
+
+const API_KEY_COLUMNS = "id, tenant_id, name, key_prefix, roles, created_by, last_used_at, revoked_at, created_at";
+
+/** sha256 hex of a presented key — the only form ever persisted or compared. */
+export function hashApiKey(key: string): string {
+  return createHash("sha256").update(key).digest("hex");
+}
+
+export const apiKeyRepository = {
+  /**
+   * Mints a key and stores only its hash. The returned `key` is shown to the
+   * caller exactly once; afterwards only the prefix is recoverable.
+   */
+  async create(
+    tenantId: string,
+    input: { name: string; roles: Role[]; createdBy?: string }
+  ): Promise<{ key: string; record: ApiKey }> {
+    const key = `hyfib_${randomBytes(24).toString("hex")}`;
+    const record = await withTenant(tenantId, async (client) => {
+      const result = await client.query<ApiKeyRow>(
+        `INSERT INTO api_keys (tenant_id, name, key_hash, key_prefix, roles, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING ${API_KEY_COLUMNS}`,
+        [tenantId, input.name, hashApiKey(key), key.slice(0, 14), input.roles, input.createdBy ?? null]
+      );
+      return mapApiKey(result.rows[0]!);
+    });
+    return { key, record };
+  },
+  async list(tenantId: string): Promise<ApiKey[]> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<ApiKeyRow>(`SELECT ${API_KEY_COLUMNS} FROM api_keys ORDER BY created_at DESC`);
+      return result.rows.map(mapApiKey);
+    });
+  },
+  async revoke(tenantId: string, id: string): Promise<boolean> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query("UPDATE api_keys SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL", [
+        id
+      ]);
+      return (result.rowCount ?? 0) > 0;
+    });
+  },
+  /** Auth-path lookup: active key by hash. Bumps last_used_at at most once/minute. */
+  async findActiveByHash(tenantId: string, keyHash: string): Promise<ApiKey | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<ApiKeyRow>(
+        `SELECT ${API_KEY_COLUMNS} FROM api_keys WHERE key_hash = $1 AND revoked_at IS NULL`,
+        [keyHash]
+      );
+      const row = result.rows[0];
+      if (!row) {
+        return undefined;
+      }
+      await client.query(
+        `UPDATE api_keys SET last_used_at = now()
+         WHERE id = $1 AND (last_used_at IS NULL OR last_used_at < now() - interval '60 seconds')`,
+        [row.id]
+      );
+      return mapApiKey(row);
     });
   }
 };
