@@ -638,10 +638,7 @@ export const templateRepository = {
   },
   async getById(tenantId: string, id: string): Promise<Template | undefined> {
     return withTenant(tenantId, async (client) => {
-      const result = await client.query<TemplateRow>(
-        `SELECT ${TEMPLATE_COLUMNS} FROM templates WHERE id = $1`,
-        [id]
-      );
+      const result = await client.query<TemplateRow>(`SELECT ${TEMPLATE_COLUMNS} FROM templates WHERE id = $1`, [id]);
       return result.rows[0] ? mapTemplate(result.rows[0]) : undefined;
     });
   },

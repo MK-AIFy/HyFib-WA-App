@@ -329,7 +329,10 @@ export interface TemplateListRequest {
  * No token degrades to an empty list + warning so sync callers can no-op
  * gracefully; the HTTP route and the app-server monolith both delegate here.
  */
-export async function listTemplatesDirect(payload: TemplateListRequest, _requestId: string): Promise<MetaDispatchResult> {
+export async function listTemplatesDirect(
+  payload: TemplateListRequest,
+  _requestId: string
+): Promise<MetaDispatchResult> {
   if (!payload.wabaId) {
     return { status: 400, body: { error: "wabaId is required" } };
   }
@@ -430,7 +433,10 @@ export interface TemplateEditRequest {
  * Direct in-process template edit on Meta (POST /{templateId}). Meta re-reviews
  * every edit, so callers reset local status to pending on success.
  */
-export async function editTemplateDirect(payload: TemplateEditRequest, _requestId: string): Promise<MetaDispatchResult> {
+export async function editTemplateDirect(
+  payload: TemplateEditRequest,
+  _requestId: string
+): Promise<MetaDispatchResult> {
   if (!payload.metaTemplateId) {
     return { status: 400, body: { error: "metaTemplateId is required" } };
   }

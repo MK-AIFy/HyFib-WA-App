@@ -72,7 +72,9 @@ export function mapTemplateAdminProxyResult(
     return { kind: "error", status: 503, body: { error: "meta_adapter_unavailable", detail: details ?? errorName } };
   }
   const graphMessage =
-    body.details && typeof body.details === "object" && typeof (body.details as { message?: unknown }).message === "string"
+    body.details &&
+    typeof body.details === "object" &&
+    typeof (body.details as { message?: unknown }).message === "string"
       ? (body.details as { message: string }).message
       : undefined;
   return { kind: "error", status: 502, body: { error: fallbackError, detail: graphMessage ?? errorName } };
