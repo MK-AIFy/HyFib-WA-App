@@ -709,7 +709,10 @@ async function handleOutbound(event: EventEnvelope): Promise<void> {
     status: result.accepted ? "sent" : "queued",
     category: "service" as MessageCategory,
     externalMessageId: result.messageId,
-    payload: persistedPayload
+    payload: persistedPayload,
+    // Agent attribution (G11): actorId is set for human conversation sends
+    // and absent for automations, exactly the split the reports want.
+    senderUserId: command.actorId
   });
   incCounter("whatsapp_messages_sent_total", "Outbound WhatsApp template sends.", {
     result: result.accepted ? "accepted" : "queued"

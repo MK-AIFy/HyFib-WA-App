@@ -260,6 +260,10 @@ importers:
       '@hyfib/shared-core':
         specifier: workspace:*
         version: link:../../packages/shared-core
+    devDependencies:
+      '@hyfib/persistence':
+        specifier: workspace:*
+        version: link:../../packages/persistence
 
   services/web-app:
     dependencies:

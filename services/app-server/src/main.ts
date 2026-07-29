@@ -18,6 +18,7 @@ import {
   type GatewayModule,
   type IngestWebhookProxy,
   type ReportsOverviewProxy,
+  type AgentReportsProxy,
   type UsageProxy,
   type AiProxy,
   type SendTypingIndicatorProxy,
@@ -38,7 +39,7 @@ import {
   uploadMediaDirect
 } from "@hyfib/meta-adapter";
 import { registerWorkerConsumers, type WorkerMetaClient } from "@hyfib/notification-worker";
-import { getReportsOverview } from "@hyfib/reporting-service";
+import { getAgentPerformance, getReportsOverview } from "@hyfib/reporting-service";
 import { getUsage } from "@hyfib/billing-usage-service";
 import { dispatchAi } from "@hyfib/ai-intelligence-service";
 import { Logger, RedisIdempotencyStore, sendJson } from "@hyfib/shared-core";
@@ -50,6 +51,7 @@ export interface AppServerDeps {
   proxyWebhookToIngestor?: IngestWebhookProxy;
   /** Direct in-process reports/usage/AI; when omitted the gateway proxies over HTTP. */
   proxyReportsOverview?: ReportsOverviewProxy;
+  proxyAgentReports?: AgentReportsProxy;
   proxyUsage?: UsageProxy;
   proxyAi?: AiProxy;
   /** Direct in-process typing-indicator send; when omitted the gateway proxies over HTTP. */
@@ -80,6 +82,7 @@ export function createAppServer(deps: AppServerDeps): AppServer {
     eventBus: deps.eventBus,
     proxyWebhookToIngestor: deps.proxyWebhookToIngestor,
     proxyReportsOverview: deps.proxyReportsOverview,
+    proxyAgentReports: deps.proxyAgentReports,
     proxyUsage: deps.proxyUsage,
     proxyAi: deps.proxyAi,
     proxySendTypingIndicator: deps.proxySendTypingIndicator,
@@ -156,6 +159,10 @@ async function main(): Promise<void> {
     proxyWebhookToIngestor,
     // Direct in-process calls to the former read/AI services (no HTTP hop).
     proxyReportsOverview: async (ctx) => ({ status: 200, body: await getReportsOverview(ctx.tenantId) }),
+    proxyAgentReports: async (ctx, days) => ({
+      status: 200,
+      body: await getAgentPerformance(ctx.tenantId, Number(days))
+    }),
     proxyUsage: async (ctx, days) => ({ status: 200, body: await getUsage(ctx.tenantId, days) }),
     proxyAi: async (ctx, aiPath, method, rawBody) => dispatchAi(aiPath, method, rawBody, ctx.requestId),
     proxySendTypingIndicator: async (params) => {
