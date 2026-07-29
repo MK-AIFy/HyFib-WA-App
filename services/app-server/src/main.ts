@@ -21,12 +21,22 @@ import {
   type UsageProxy,
   type AiProxy,
   type SendTypingIndicatorProxy,
-  type UploadMediaProxy
+  type UploadMediaProxy,
+  type TemplateAdminProxy,
+  type ListMetaTemplatesProxy
 } from "@hyfib/api-gateway";
 import { processForwardedWebhook } from "@hyfib/webhook-ingestor";
 import { createDurableWebhookBus } from "./webhook-outbox-bus.js";
 import { createIngestWebhookProxy } from "./ingest-proxy.js";
-import { fetchMediaDirect, metaDispatch, uploadMediaDirect } from "@hyfib/meta-adapter";
+import {
+  deleteTemplateDirect,
+  editTemplateDirect,
+  fetchMediaDirect,
+  listTemplatesDirect,
+  metaDispatch,
+  submitTemplateDirect,
+  uploadMediaDirect
+} from "@hyfib/meta-adapter";
 import { registerWorkerConsumers, type WorkerMetaClient } from "@hyfib/notification-worker";
 import { getReportsOverview } from "@hyfib/reporting-service";
 import { getUsage } from "@hyfib/billing-usage-service";
@@ -46,6 +56,10 @@ export interface AppServerDeps {
   proxySendTypingIndicator?: SendTypingIndicatorProxy;
   /** Direct in-process media upload; when omitted the gateway proxies over HTTP. */
   proxyUploadMedia?: UploadMediaProxy;
+  /** Direct in-process template submit/edit/delete; when omitted the gateway proxies over HTTP. */
+  proxyTemplateAdmin?: TemplateAdminProxy;
+  /** Direct in-process Meta template list (sync); when omitted the gateway proxies over HTTP. */
+  proxyListMetaTemplates?: ListMetaTemplatesProxy;
 }
 
 export interface AppServer {
@@ -69,7 +83,9 @@ export function createAppServer(deps: AppServerDeps): AppServer {
     proxyUsage: deps.proxyUsage,
     proxyAi: deps.proxyAi,
     proxySendTypingIndicator: deps.proxySendTypingIndicator,
-    proxyUploadMedia: deps.proxyUploadMedia
+    proxyUploadMedia: deps.proxyUploadMedia,
+    proxyTemplateAdmin: deps.proxyTemplateAdmin,
+    proxyListMetaTemplates: deps.proxyListMetaTemplates
   });
 
   const server = createServer((req, res) => {
@@ -146,7 +162,19 @@ async function main(): Promise<void> {
       const { status, body } = await metaDispatch("/internal/v1/whatsapp/send-typing", params, randomUUID());
       return { status, body: body as Record<string, unknown> };
     },
-    proxyUploadMedia: async (params) => uploadMediaDirect(params, params.requestId)
+    proxyUploadMedia: async (params) => uploadMediaDirect(params, params.requestId),
+    proxyTemplateAdmin: async (op, ctx) => {
+      switch (op.kind) {
+        case "submit":
+          return submitTemplateDirect(op, ctx.requestId);
+        case "edit":
+          return editTemplateDirect(op, ctx.requestId);
+        case "delete":
+          return deleteTemplateDirect(op, ctx.requestId);
+      }
+    },
+    proxyListMetaTemplates: async (params) =>
+      listTemplatesDirect({ wabaId: params.wabaId, accessToken: params.accessToken }, params.requestId)
   });
 
   // Register worker consumers on the shared bus with a direct in-process meta

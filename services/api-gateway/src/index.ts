@@ -104,6 +104,8 @@ import {
   type TemplateAdminOp,
   type TemplateAdminProxy
 } from "./template-admin.js";
+
+export type { TemplateAdminOp, TemplateAdminProxy } from "./template-admin.js";
 import { SseHub } from "./sse-hub.js";
 import { parseCsv, serializeContactsCsv, extractMultipartFile } from "./csv.js";
 import { resolveOrgTenant } from "./single-org.js";
