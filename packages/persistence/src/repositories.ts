@@ -1,6 +1,6 @@
 import { query, withTenant, type QueryClient } from "./db.js";
 import { loadConfig } from "@hyfib/config";
-import { decryptSecret, encryptSecret } from "@hyfib/shared-core";
+import { EventTopics, decryptSecret, encryptSecret } from "@hyfib/shared-core";
 import type {
   AuditEvent,
   AutoReplyRule,
@@ -23,6 +23,8 @@ import type {
   QuietHoursConfig,
   Role,
   Segment,
+  Sequence,
+  SequenceStep,
   Tag,
   Task,
   Team,
@@ -2953,6 +2955,295 @@ export const savedReplyRepository = {
   async delete(tenantId: string, id: string): Promise<void> {
     await withTenant(tenantId, async (client) => {
       await client.query("DELETE FROM saved_replies WHERE id = $1", [id]);
+    });
+  }
+};
+
+// ─── Drip sequences (G7) ────────────────────────────────────────────────────────
+
+interface SequenceRow {
+  id: string;
+  tenant_id: string;
+  name: string;
+  channel_id: string;
+  status: string;
+  stop_on_reply: boolean;
+  created_at: Date;
+}
+
+function mapSequence(row: SequenceRow): Sequence {
+  return {
+    id: row.id,
+    tenantId: row.tenant_id,
+    name: row.name,
+    channelId: row.channel_id,
+    status: row.status as Sequence["status"],
+    stopOnReply: row.stop_on_reply,
+    createdAt: row.created_at.toISOString()
+  };
+}
+
+interface SequenceStepRow {
+  id: string;
+  sequence_id: string;
+  step_order: number;
+  delay_minutes: number;
+  template_id: string;
+  template_name: string | null;
+  template_language: string | null;
+}
+
+function mapSequenceStep(row: SequenceStepRow): SequenceStep {
+  return {
+    id: row.id,
+    sequenceId: row.sequence_id,
+    stepOrder: row.step_order,
+    delayMinutes: row.delay_minutes,
+    templateId: row.template_id,
+    templateName: row.template_name ?? undefined,
+    templateLanguage: row.template_language ?? undefined
+  };
+}
+
+const SEQUENCE_STEP_SELECT = `
+  SELECT st.id, st.sequence_id, st.step_order, st.delay_minutes, st.template_id,
+         t.name AS template_name, t.language AS template_language
+  FROM sequence_steps st
+  LEFT JOIN templates t ON t.id = st.template_id`;
+
+/** Payload the scheduler needs to enqueue one due step, or the terminal outcome. */
+export type SequenceAdvanceResult =
+  | {
+      action: "send";
+      stepOrder: number;
+      templateName: string;
+      templateLanguage: string;
+      channelId: string;
+      contactId: string;
+      contactPhoneE164: string;
+      completedAfterSend: boolean;
+    }
+  | { action: "completed" }
+  | { action: "stopped"; reason: string }
+  | { action: "skipped" };
+
+export const sequenceRepository = {
+  async create(
+    tenantId: string,
+    input: {
+      name: string;
+      channelId: string;
+      stopOnReply?: boolean;
+      steps: Array<{ delayMinutes: number; templateId: string }>;
+    }
+  ): Promise<Sequence> {
+    return withTenant(tenantId, async (client) => {
+      const inserted = await client.query<SequenceRow>(
+        `INSERT INTO sequences (tenant_id, name, channel_id, stop_on_reply)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, tenant_id, name, channel_id, status, stop_on_reply, created_at`,
+        [tenantId, input.name, input.channelId, input.stopOnReply ?? true]
+      );
+      const sequence = mapSequence(inserted.rows[0]!);
+      for (let i = 0; i < input.steps.length; i += 1) {
+        const step = input.steps[i]!;
+        await client.query(
+          `INSERT INTO sequence_steps (tenant_id, sequence_id, step_order, delay_minutes, template_id)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [tenantId, sequence.id, i + 1, step.delayMinutes, step.templateId]
+        );
+      }
+      return sequence;
+    });
+  },
+  async list(tenantId: string): Promise<Sequence[]> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<SequenceRow & { active: string; completed: string; stopped: string }>(
+        `SELECT s.id, s.tenant_id, s.name, s.channel_id, s.status, s.stop_on_reply, s.created_at,
+                COUNT(e.id) FILTER (WHERE e.status = 'active')::text AS active,
+                COUNT(e.id) FILTER (WHERE e.status = 'completed')::text AS completed,
+                COUNT(e.id) FILTER (WHERE e.status = 'stopped')::text AS stopped
+         FROM sequences s
+         LEFT JOIN sequence_enrollments e ON e.sequence_id = s.id
+         GROUP BY s.id
+         ORDER BY s.created_at DESC`
+      );
+      return result.rows.map((row) => ({
+        ...mapSequence(row),
+        enrollmentCounts: { active: Number(row.active), completed: Number(row.completed), stopped: Number(row.stopped) }
+      }));
+    });
+  },
+  async getById(tenantId: string, id: string): Promise<Sequence | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<SequenceRow>(
+        "SELECT id, tenant_id, name, channel_id, status, stop_on_reply, created_at FROM sequences WHERE id = $1",
+        [id]
+      );
+      if (!result.rows[0]) {
+        return undefined;
+      }
+      const steps = await client.query<SequenceStepRow>(
+        `${SEQUENCE_STEP_SELECT} WHERE st.sequence_id = $1 ORDER BY st.step_order ASC`,
+        [id]
+      );
+      return { ...mapSequence(result.rows[0]), steps: steps.rows.map(mapSequenceStep) };
+    });
+  },
+  async setStatus(tenantId: string, id: string, status: Sequence["status"]): Promise<Sequence | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<SequenceRow>(
+        `UPDATE sequences SET status = $2 WHERE id = $1
+         RETURNING id, tenant_id, name, channel_id, status, stop_on_reply, created_at`,
+        [id, status]
+      );
+      return result.rows[0] ? mapSequence(result.rows[0]) : undefined;
+    });
+  },
+  /**
+   * Enrolls contacts; duplicates are ignored (a contact runs a sequence once).
+   * next_step_at = now + step 1's delay. Opted-out contacts are excluded at
+   * enrollment AND re-checked at every advance — consent can be revoked
+   * mid-sequence.
+   */
+  async enroll(tenantId: string, sequenceId: string, contactIds: string[]): Promise<number> {
+    if (contactIds.length === 0) {
+      return 0;
+    }
+    return withTenant(tenantId, async (client) => {
+      const firstStep = await client.query<{ delay_minutes: number }>(
+        "SELECT delay_minutes FROM sequence_steps WHERE sequence_id = $1 AND step_order = 1",
+        [sequenceId]
+      );
+      if (!firstStep.rows[0]) {
+        return 0;
+      }
+      const result = await client.query(
+        `INSERT INTO sequence_enrollments (tenant_id, sequence_id, contact_id, next_step_at)
+         SELECT $1, $2, c.id, now() + ($3 || ' minutes')::interval
+         FROM contacts c
+         WHERE c.id = ANY($4)
+           AND (c.metadata->>'optedOut')::boolean IS NOT TRUE
+         ON CONFLICT (tenant_id, sequence_id, contact_id) DO NOTHING`,
+        [tenantId, sequenceId, String(firstStep.rows[0].delay_minutes), contactIds]
+      );
+      return result.rowCount ?? 0;
+    });
+  },
+  /**
+   * Advances one due enrollment atomically: re-checks due-ness and sequence
+   * status FOR UPDATE, re-checks the contact's opt-out, enqueues the step's
+   * template send on the durable outbox and moves the cursor — all in ONE
+   * transaction, so a scheduler crash never double-sends a step.
+   */
+  async advanceDueEnrollment(tenantId: string, enrollmentId: string): Promise<SequenceAdvanceResult> {
+    return withTenant(tenantId, async (client) => {
+      const row = await client.query<{
+        id: string;
+        sequence_id: string;
+        contact_id: string;
+        current_step: number;
+        status: string;
+        next_step_at: Date | null;
+        seq_status: string;
+        channel_id: string;
+      }>(
+        `SELECT e.id, e.sequence_id, e.contact_id, e.current_step, e.status, e.next_step_at,
+                s.status AS seq_status, s.channel_id
+         FROM sequence_enrollments e
+         JOIN sequences s ON s.id = e.sequence_id
+         WHERE e.id = $1
+         FOR UPDATE OF e`,
+        [enrollmentId]
+      );
+      const enrollment = row.rows[0];
+      if (
+        !enrollment ||
+        enrollment.status !== "active" ||
+        enrollment.seq_status !== "active" ||
+        !enrollment.next_step_at ||
+        enrollment.next_step_at.getTime() > Date.now()
+      ) {
+        return { action: "skipped" };
+      }
+      const contact = await client.query<{ phone_e164: string; opted_out: string | null }>(
+        "SELECT phone_e164, metadata->>'optedOut' AS opted_out FROM contacts WHERE id = $1",
+        [enrollment.contact_id]
+      );
+      if (!contact.rows[0] || contact.rows[0].opted_out === "true") {
+        await client.query(
+          `UPDATE sequence_enrollments SET status = 'stopped', stopped_reason = 'opted_out', updated_at = now()
+           WHERE id = $1`,
+          [enrollmentId]
+        );
+        return { action: "stopped", reason: "opted_out" };
+      }
+      const steps = await client.query<SequenceStepRow>(
+        `${SEQUENCE_STEP_SELECT} WHERE st.sequence_id = $1 AND st.step_order IN ($2, $3) ORDER BY st.step_order ASC`,
+        [enrollment.sequence_id, enrollment.current_step + 1, enrollment.current_step + 2]
+      );
+      const current = steps.rows.find((s) => s.step_order === enrollment.current_step + 1);
+      if (!current || !current.template_name || !current.template_language) {
+        await client.query(
+          "UPDATE sequence_enrollments SET status = 'completed', next_step_at = NULL, updated_at = now() WHERE id = $1",
+          [enrollmentId]
+        );
+        return { action: "completed" };
+      }
+      const next = steps.rows.find((s) => s.step_order === enrollment.current_step + 2);
+      await outboxRepository.enqueue(client, tenantId, {
+        topic: EventTopics.AutomationTemplateRequested,
+        payload: {
+          tenantId,
+          channelId: enrollment.channel_id,
+          contactPhoneE164: contact.rows[0].phone_e164,
+          templateName: current.template_name,
+          templateLanguage: current.template_language,
+          dispatchId: `seq-${enrollmentId}-step-${current.step_order}`
+        }
+      });
+      if (next) {
+        await client.query(
+          `UPDATE sequence_enrollments
+           SET current_step = $2, next_step_at = now() + ($3 || ' minutes')::interval, updated_at = now()
+           WHERE id = $1`,
+          [enrollmentId, current.step_order, String(next.delay_minutes)]
+        );
+      } else {
+        await client.query(
+          `UPDATE sequence_enrollments
+           SET current_step = $2, status = 'completed', next_step_at = NULL, updated_at = now()
+           WHERE id = $1`,
+          [enrollmentId, current.step_order]
+        );
+      }
+      return {
+        action: "send",
+        stepOrder: current.step_order,
+        templateName: current.template_name,
+        templateLanguage: current.template_language,
+        channelId: enrollment.channel_id,
+        contactId: enrollment.contact_id,
+        contactPhoneE164: contact.rows[0].phone_e164,
+        completedAfterSend: !next
+      };
+    });
+  },
+  /** Inbound reply: stop this contact's active enrollments in stop-on-reply sequences. */
+  async stopActiveForContact(tenantId: string, contactId: string, reason: string): Promise<number> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query(
+        `UPDATE sequence_enrollments e
+         SET status = 'stopped', stopped_reason = $3, next_step_at = NULL, updated_at = now()
+         FROM sequences s
+         WHERE s.id = e.sequence_id
+           AND e.contact_id = $2
+           AND e.status = 'active'
+           AND s.stop_on_reply = true
+           AND e.tenant_id = $1`,
+        [tenantId, contactId, reason]
+      );
+      return result.rowCount ?? 0;
     });
   }
 };

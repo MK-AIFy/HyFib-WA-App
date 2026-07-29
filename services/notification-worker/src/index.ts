@@ -26,6 +26,7 @@ import {
   messageRepository,
   outboxRepository,
   resolveChannelByPhoneNumberId,
+  sequenceRepository,
   taskRepository,
   teamRepository,
   userRepository,
@@ -890,6 +891,21 @@ async function handleInbound(event: EventEnvelope): Promise<void> {
   // working hours. Any real message type counts — a voice note deserves a
   // welcome as much as text — but reactions are not a contact reaching out.
   if (inbound.type !== "reaction") {
+    // Stop-on-reply (G7): a human reply supersedes any drip in flight. Never
+    // allowed to break inbound processing.
+    try {
+      const stopped = await sequenceRepository.stopActiveForContact(channel.tenantId, contact.id, "replied");
+      if (stopped > 0) {
+        incCounter("sequence_enrollments_stopped_total", "Drip enrollments stopped by an inbound reply.", {});
+        logger.info("sequence_stopped_on_reply", { tenantId: channel.tenantId, contactId: contact.id, stopped });
+      }
+    } catch (error) {
+      logger.error("sequence_stop_on_reply_failed", {
+        tenantId: channel.tenantId,
+        contactId: contact.id,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
     await runDefaultAutomations(channel, conversation.id, contact, createdMessage.id);
     // Round-robin auto-assignment (G9): only unassigned conversations — a
     // manual assignment or an earlier rotation is never overridden.
