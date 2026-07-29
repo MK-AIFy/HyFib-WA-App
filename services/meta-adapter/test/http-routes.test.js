@@ -132,3 +132,9 @@ test("template delete is registered and validates required fields (400, not 404)
   assert.equal(res.status, 400);
   assert.match(res.body.error, /wabaId|name/);
 });
+
+test("social send is registered and validates required fields (400, not 404)", async () => {
+  const res = await post("/internal/v1/social/send", {});
+  assert.equal(res.status, 400);
+  assert.match(res.body.error, /pageId/);
+});

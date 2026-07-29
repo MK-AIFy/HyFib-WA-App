@@ -1,15 +1,24 @@
 import { EventTopics, incCounter, verifyMetaSignature } from "@hyfib/shared-core";
 import type { Logger } from "@hyfib/shared-core";
 import type { EventBus } from "@hyfib/event-bus";
-import { normalizeInbound, normalizeStatus, type RawValue } from "./normalize.js";
+import {
+  normalizeInbound,
+  normalizeStatus,
+  type RawValue,
+  normalizeSocialInbound,
+  type RawMessagingEvent
+} from "./normalize.js";
 
 export interface WebhookPayload {
+  /** "whatsapp_business_account" | "page" (Messenger) | "instagram" */
+  object?: string;
   entry?: Array<{
     id?: string;
     changes?: Array<{
       field?: string;
       value?: RawValue;
     }>;
+    messaging?: RawMessagingEvent[];
   }>;
 }
 
@@ -70,6 +79,43 @@ export async function ingestMetaWebhook(
   let duplicates = 0;
 
   for (const entry of payload.entry ?? []) {
+    // Messenger/Instagram webhooks (Phase F): entry[].messaging[] instead of
+    // changes[]. Echoes (our own sends reflected back) are skipped; dedupe by
+    // message mid with the same claim/release discipline as WhatsApp.
+    if ((payload.object === "page" || payload.object === "instagram") && entry.messaging) {
+      for (const event of entry.messaging) {
+        if (!event.message?.mid || event.message.is_echo) {
+          continue;
+        }
+        const key = `social:${event.message.mid}`;
+        if (await deps.idempotency.isDuplicate(key)) {
+          duplicates += 1;
+          continue;
+        }
+        inbound += 1;
+        incCounter("events_published_total", "Events published to the bus.", {
+          topic: EventTopics.SocialInboundReceived
+        });
+        try {
+          await deps.eventBus.publish(
+            EventTopics.SocialInboundReceived,
+            { ...normalizeSocialInbound(payload.object, event, entry.id) },
+            tenantId
+          );
+        } catch (error) {
+          try {
+            await deps.idempotency.release?.(key);
+          } catch (releaseError) {
+            deps.logger?.warn("idempotency_release_failed", {
+              key,
+              error: releaseError instanceof Error ? releaseError.message : String(releaseError)
+            });
+          }
+          throw error;
+        }
+      }
+      continue;
+    }
     for (const change of entry.changes ?? []) {
       const value = change.value;
       if (!value) {

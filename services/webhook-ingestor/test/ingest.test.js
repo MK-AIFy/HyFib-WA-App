@@ -207,3 +207,37 @@ test("release() throwing without a logger dep still propagates the original erro
 
   await assert.rejects(() => ingestMetaWebhook(payload, "tenant-1", { eventBus: bus, idempotency: idem }), /db down/);
 });
+
+test("page-object webhooks publish social.inbound.received, dedupe by mid, skip echoes", async () => {
+  const { ingestMetaWebhook } = await import("../dist/ingest.js");
+  const published = [];
+  const seen = new Set();
+  const deps = {
+    eventBus: { publish: async (topic, payload) => published.push({ topic, payload }) },
+    idempotency: {
+      isDuplicate: async (key) => (seen.has(key) ? true : (seen.add(key), false)),
+      release: async (key) => seen.delete(key)
+    }
+  };
+  const payload = {
+    object: "page",
+    entry: [
+      {
+        id: "page-1",
+        messaging: [
+          { sender: { id: "psid-1" }, recipient: { id: "page-1" }, message: { mid: "m1", text: "hi" } },
+          { sender: { id: "page-1" }, recipient: { id: "psid-1" }, message: { mid: "m2", text: "echo", is_echo: true } }
+        ]
+      }
+    ]
+  };
+  const first = await ingestMetaWebhook(payload, "t1", deps);
+  assert.equal(first.inbound, 1, "echo skipped");
+  assert.equal(published.length, 1);
+  assert.equal(published[0].topic, "social.inbound.received");
+  assert.equal(published[0].payload.senderId, "psid-1");
+  assert.equal(published[0].payload.channelType, "messenger");
+
+  const second = await ingestMetaWebhook(payload, "t1", deps);
+  assert.equal(second.duplicates, 1, "mid-keyed dedupe");
+});

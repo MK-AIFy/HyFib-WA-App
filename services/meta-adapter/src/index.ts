@@ -35,6 +35,7 @@ import {
   buildMediaUploadForm,
   buildProductMessage,
   buildTemplateBody,
+  buildSocialSendBody,
   buildTemplateCreateBody,
   buildTemplateEditBody,
   buildTextBody,
@@ -319,6 +320,45 @@ export async function sendTypingIndicatorDirect(
   }
 }
 
+export interface SocialSendRequest {
+  /** Page (Messenger) or IG-linked page id — the send edge's owner. */
+  pageId: string;
+  recipientId: string;
+  text: string;
+  accessToken?: string;
+}
+
+/**
+ * Direct in-process Messenger/Instagram text send (Phase F multi-channel).
+ * Same graphRequest resilience (retries, breaker) and 202/502/503 mapping as
+ * the WhatsApp sends; both platforms share the /{page_id}/messages edge.
+ */
+export async function sendSocialDirect(payload: SocialSendRequest, requestId: string): Promise<MetaDispatchResult> {
+  if (!payload.pageId || !payload.recipientId || !payload.text?.trim()) {
+    return { status: 400, body: { error: "pageId, recipientId and text are required" } };
+  }
+  try {
+    const response = await graphRequest(
+      `/${payload.pageId}/messages`,
+      "POST",
+      buildSocialSendBody({ recipientId: payload.recipientId, text: payload.text }),
+      payload.accessToken
+    );
+    if (!response.ok) {
+      const graphError = await parseGraphError(response);
+      logger.warn("social_send_failed", { requestId, statusCode: response.status, graphError: graphError.message });
+      return { status: 502, body: { error: "social_send_failed", details: graphError } };
+    }
+    const parsed = (await response.json()) as { message_id?: string };
+    return { status: 202, body: { requestId, result: { messageId: parsed.message_id, status: "accepted" } } };
+  } catch (error) {
+    return {
+      status: 503,
+      body: { error: "meta_adapter_unavailable", details: error instanceof Error ? error.message : String(error) }
+    };
+  }
+}
+
 export interface TemplateListRequest {
   wabaId: string;
   accessToken?: string;
@@ -553,6 +593,8 @@ export async function metaDispatch(
   switch (endpoint) {
     case "/internal/v1/whatsapp/send-template":
       return sendTemplateDirect(payload as unknown as WhatsAppSendRequest, requestId);
+    case "/internal/v1/social/send":
+      return sendSocialDirect(payload as unknown as SocialSendRequest, requestId);
 
     case "/internal/v1/whatsapp/send-text": {
       if (!p.phoneNumberId || !p.to || !p.text) {
@@ -1402,6 +1444,22 @@ export const server = createServer(async (req, res) => {
         return;
       }
       const { status, body } = await listTemplatesDirect({ wabaId, accessToken }, ctx.requestId);
+      sendJson(res, status, body);
+      return;
+    }
+
+    if (path === "/internal/v1/social/send") {
+      if (method !== "POST") {
+        methodNotAllowed(res);
+        return;
+      }
+      const tokenHeader = req.headers["x-access-token"];
+      const accessToken =
+        (typeof tokenHeader === "string" && tokenHeader.length > 0 ? tokenHeader : undefined) ??
+        config.whatsappAccessToken ??
+        undefined;
+      const payload = await readJsonBody<SocialSendRequest>(req);
+      const { status, body } = await sendSocialDirect({ ...payload, accessToken }, ctx.requestId);
       sendJson(res, status, body);
       return;
     }

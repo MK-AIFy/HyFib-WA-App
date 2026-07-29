@@ -14,6 +14,7 @@ import {
   extractTemplateBody,
   buildTemplateCreateBody,
   buildTemplateEditBody,
+  buildSocialSendBody,
   buildProductMessage,
   buildCatalogMessage,
   buildFlowMessage
@@ -320,4 +321,15 @@ test("buildTemplateEditBody emits only the provided fields", () => {
     category: "MARKETING",
     components: [{ type: "BODY", text: "Yo" }]
   });
+});
+
+test("buildSocialSendBody emits the Messenger/IG send shape with a 2000-char cap", () => {
+  const body = buildSocialSendBody({ recipientId: "psid-1", text: "Hello!" });
+  assert.deepEqual(body, {
+    recipient: { id: "psid-1" },
+    messaging_type: "RESPONSE",
+    message: { text: "Hello!" }
+  });
+  const long = buildSocialSendBody({ recipientId: "psid-1", text: "x".repeat(3000) });
+  assert.equal(long.message.text.length, 2000);
 });

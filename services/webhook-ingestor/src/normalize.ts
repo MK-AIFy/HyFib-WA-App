@@ -2,6 +2,7 @@
  * Pure normalizers that turn raw Meta webhook `value` objects into the typed
  * events we publish on the bus. Kept I/O-free so they are unit-testable.
  */
+import type { SocialInboundEvent } from "@hyfib/shared-core";
 
 export interface RawMedia {
   id?: string;
@@ -217,4 +218,32 @@ export function normalizeStatus(value: RawValue, status: RawStatus, entryId?: st
     };
   }
   return event;
+}
+
+/** Raw Messenger/Instagram messaging event (entry[].messaging[]). */
+export interface RawMessagingEvent {
+  sender?: { id?: string };
+  recipient?: { id?: string };
+  timestamp?: number;
+  message?: { mid?: string; text?: string; is_echo?: boolean };
+}
+
+/**
+ * Normalizes a Messenger/Instagram inbound message (Phase F multi-channel).
+ * On inbound events the recipient is the page/IG account — that id routes to
+ * a channel row exactly like WhatsApp's phone_number_id.
+ */
+export function normalizeSocialInbound(
+  objectType: string,
+  event: RawMessagingEvent,
+  entryId?: string
+): SocialInboundEvent {
+  return {
+    channelType: objectType === "instagram" ? "instagram" : "messenger",
+    pageId: event.recipient?.id ?? entryId ?? "",
+    senderId: event.sender?.id ?? "",
+    messageId: event.message?.mid,
+    text: event.message?.text,
+    timestamp: event.timestamp ? new Date(event.timestamp).toISOString() : undefined
+  };
 }

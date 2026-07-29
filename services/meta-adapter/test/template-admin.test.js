@@ -59,3 +59,12 @@ test("deleteTemplateDirect maps a missing access token to 503 without calling Me
   assert.equal(res.status, 503);
   assert.equal(res.body.error, "meta_adapter_unavailable");
 });
+
+test("sendSocialDirect validates and maps a missing token to 503 without network", async () => {
+  const { sendSocialDirect } = await import("../dist/index.js");
+  const bad = await sendSocialDirect({ pageId: "pg" }, "req-so1");
+  assert.equal(bad.status, 400);
+  const noToken = await sendSocialDirect({ pageId: "pg", recipientId: "psid", text: "hi" }, "req-so2");
+  assert.equal(noToken.status, 503);
+  assert.equal(noToken.body.error, "meta_adapter_unavailable");
+});

@@ -155,6 +155,7 @@ interface CreateChannelRequest {
   phoneNumberId: string;
   displayPhoneNumber: string;
   accessToken?: string;
+  channelType?: string;
 }
 
 interface UpdateWhatsAppSettingsRequest {
@@ -2458,6 +2459,11 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         sendJson(res, 400, { error: `displayPhoneNumber ${displayPhoneCheck.error}` });
         return;
       }
+      const CHANNEL_TYPES = ["whatsapp", "messenger", "instagram"];
+      if (payload.channelType !== undefined && !CHANNEL_TYPES.includes(payload.channelType as string)) {
+        sendJson(res, 400, { error: `channelType must be one of: ${CHANNEL_TYPES.join(", ")}` });
+        return;
+      }
       if (payload.accessToken !== undefined) {
         if (typeof payload.accessToken !== "string" || payload.accessToken.length > 4096) {
           sendJson(res, 400, { error: "accessToken must be a string of at most 4096 characters" });
@@ -2470,7 +2476,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
           wabaId: wabaIdCheck.value,
           phoneNumberId: phoneNumberIdCheck.value,
           displayPhoneNumber: displayPhoneCheck.value,
-          accessToken: payload.accessToken
+          accessToken: payload.accessToken,
+          channelType: (payload.channelType as string | undefined) ?? "whatsapp"
         });
       } catch (error) {
         sendJson(res, 400, {

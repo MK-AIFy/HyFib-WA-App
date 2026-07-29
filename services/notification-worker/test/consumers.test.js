@@ -23,6 +23,7 @@ test("registerWorkerConsumers subscribes all worker topics on the injected bus",
     "inbound-messages",
     "media-fetch",
     "outbound-messages",
+    "social-inbound",
     "status-updates"
   ]);
 });

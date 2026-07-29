@@ -395,3 +395,16 @@ export function buildTemplateEditBody(input: { category?: string; bodyText?: str
   }
   return body;
 }
+
+/**
+ * Messenger / Instagram send body (Phase F multi-channel). Both platforms use
+ * the same POST /{page_id}/messages shape with a Page token; messaging_type
+ * RESPONSE marks replies inside the 24h standard-messaging window.
+ */
+export function buildSocialSendBody(input: { recipientId: string; text: string }): Record<string, unknown> {
+  return {
+    recipient: { id: input.recipientId },
+    messaging_type: "RESPONSE",
+    message: { text: input.text.slice(0, 2000) }
+  };
+}

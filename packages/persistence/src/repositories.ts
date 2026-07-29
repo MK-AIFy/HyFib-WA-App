@@ -744,6 +744,7 @@ interface ChannelRow {
   display_phone_number: string;
   quality_rating: string | null;
   is_active: boolean;
+  channel_type: string;
   created_at: Date;
   has_access_token: boolean;
 }
@@ -753,7 +754,7 @@ interface ChannelCredentialRow extends ChannelRow {
 }
 
 const CHANNEL_COLUMNS =
-  "id, tenant_id, waba_id, phone_number_id, display_phone_number, quality_rating, is_active, created_at, (access_token_encrypted IS NOT NULL) AS has_access_token";
+  "id, tenant_id, waba_id, phone_number_id, display_phone_number, quality_rating, is_active, channel_type, created_at, (access_token_encrypted IS NOT NULL) AS has_access_token";
 
 function mapChannel(row: ChannelRow): WhatsAppChannel {
   return {
@@ -764,6 +765,7 @@ function mapChannel(row: ChannelRow): WhatsAppChannel {
     displayPhoneNumber: row.display_phone_number,
     qualityRating: (row.quality_rating as WhatsAppChannel["qualityRating"]) ?? "unknown",
     status: row.is_active ? "active" : "inactive",
+    channelType: (row.channel_type ?? "whatsapp") as WhatsAppChannel["channelType"],
     hasAccessToken: row.has_access_token,
     createdAt: row.created_at.toISOString()
   };
@@ -788,6 +790,8 @@ export interface ChannelCredentials {
   id: string;
   wabaId: string;
   phoneNumberId: string;
+  /** "whatsapp" | "messenger" | "instagram" — routes outbound dispatch. */
+  channelType?: string;
   /** Decrypted per-channel access token, or undefined to fall back to the env token. */
   accessToken?: string;
 }
@@ -805,21 +809,40 @@ function mapChannelCredentials(row: ChannelCredentialRow): ChannelCredentials {
   if (row.access_token_encrypted) {
     accessToken = decryptSecret(row.access_token_encrypted, loadConfig().channelEncryptionKey);
   }
-  return { id: row.id, wabaId: row.waba_id, phoneNumberId: row.phone_number_id, accessToken };
+  return {
+    id: row.id,
+    wabaId: row.waba_id,
+    phoneNumberId: row.phone_number_id,
+    channelType: row.channel_type ?? "whatsapp",
+    accessToken
+  };
 }
 
 export const channelRepository = {
   async create(
     tenantId: string,
-    input: { wabaId: string; phoneNumberId: string; displayPhoneNumber: string; accessToken?: string }
+    input: {
+      wabaId: string;
+      phoneNumberId: string;
+      displayPhoneNumber: string;
+      accessToken?: string;
+      channelType?: string;
+    }
   ): Promise<WhatsAppChannel> {
     const encryptedToken = input.accessToken ? encryptChannelToken(input.accessToken) : null;
     return withTenant(tenantId, async (client) => {
       const result = await client.query<ChannelRow>(
-        `INSERT INTO whatsapp_channels (tenant_id, waba_id, phone_number_id, display_phone_number, quality_rating, is_active, access_token_encrypted)
-         VALUES ($1, $2, $3, $4, 'unknown', true, $5)
+        `INSERT INTO whatsapp_channels (tenant_id, waba_id, phone_number_id, display_phone_number, quality_rating, is_active, access_token_encrypted, channel_type)
+         VALUES ($1, $2, $3, $4, 'unknown', true, $5, $6)
          RETURNING ${CHANNEL_COLUMNS}`,
-        [tenantId, input.wabaId, input.phoneNumberId, input.displayPhoneNumber, encryptedToken]
+        [
+          tenantId,
+          input.wabaId,
+          input.phoneNumberId,
+          input.displayPhoneNumber,
+          encryptedToken,
+          input.channelType ?? "whatsapp"
+        ]
       );
       return mapChannel(result.rows[0]!);
     });

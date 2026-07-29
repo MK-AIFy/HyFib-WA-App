@@ -113,3 +113,29 @@ test("normalizes a status with pricing, conversation and errors", () => {
   assert.deepEqual(event.conversation, { id: "conv-1", originType: "marketing", expiresAt: "1700100000" });
   assert.equal(event.errors[0].message, "boom");
 });
+
+// ─── Messenger/Instagram normalization (Phase F multi-channel) ──────────────
+
+test("normalizeSocialInbound maps sender/recipient/mid/text and channel type", async () => {
+  const { normalizeSocialInbound } = await import("../dist/normalize.js");
+  const event = normalizeSocialInbound(
+    "instagram",
+    {
+      sender: { id: "igsid-77" },
+      recipient: { id: "page-9" },
+      timestamp: 1753760000000,
+      message: { mid: "mid.1", text: "love this product" }
+    },
+    "entry-9"
+  );
+  assert.deepEqual(event, {
+    channelType: "instagram",
+    pageId: "page-9",
+    senderId: "igsid-77",
+    messageId: "mid.1",
+    text: "love this product",
+    timestamp: new Date(1753760000000).toISOString()
+  });
+  assert.equal(normalizeSocialInbound("page", { sender: { id: "s" } }, "e").channelType, "messenger");
+  assert.equal(normalizeSocialInbound("page", { sender: { id: "s" } }, "entry-1").pageId, "entry-1");
+});

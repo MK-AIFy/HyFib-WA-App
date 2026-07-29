@@ -70,6 +70,8 @@ export interface WhatsAppChannel {
   displayPhoneNumber: string;
   qualityRating: "green" | "yellow" | "red" | "unknown";
   status: "active" | "inactive";
+  /** "whatsapp" (default) | "messenger" | "instagram" (Phase F multi-channel). */
+  channelType?: "whatsapp" | "messenger" | "instagram";
   hasAccessToken?: boolean;
   createdAt: string;
 }
@@ -687,10 +689,23 @@ export const EventTopics = {
   ComplianceOptOutEvent: "compliance.optout.event",
   AuditEventRecorded: "audit.event.recorded",
   MediaFetchRequested: "media.fetch.requested",
-  MediaStored: "media.stored"
+  MediaStored: "media.stored",
+  SocialInboundReceived: "social.inbound.received"
 } as const;
 
 export type EventTopic = (typeof EventTopics)[keyof typeof EventTopics];
+
+/** Inbound Messenger/Instagram message, normalized by the webhook ingestor (Phase F multi-channel). */
+export interface SocialInboundEvent {
+  /** "messenger" | "instagram" */
+  channelType: string;
+  /** The page/IG account id — routes to a channel row exactly like phone_number_id. */
+  pageId: string;
+  senderId: string;
+  messageId?: string;
+  text?: string;
+  timestamp?: string;
+}
 
 /** Fire-and-forget template send requested by an automation rule action. */
 export interface AutomationTemplateRequest {

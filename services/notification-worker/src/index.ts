@@ -54,6 +54,7 @@ import {
   type EventEnvelope,
   type MediaFetchRequest,
   type Message,
+  type SocialInboundEvent,
   type MessageCategory,
   type WhatsAppOutboundRequest
 } from "@hyfib/shared-core";
@@ -689,10 +690,33 @@ async function handleOutbound(event: EventEnvelope): Promise<void> {
   let adapterCallStarted = false;
   try {
     const channel = await resolveSendChannel(command.tenantId, command.channelId);
-    const call = buildOutboundAdapterCall(command, channel);
-    persistedPayload = call.persistedPayload;
-    adapterCallStarted = true;
-    result = await callMetaAdapter(call.endpoint, command.tenantId, call.payload);
+    // Multi-channel (Phase F): Messenger/Instagram conversations route text
+    // sends to the social edge; social contacts carry their PSID as
+    // "psid:<id>" in the phone field. Non-text kinds have no social
+    // counterpart yet and fail loudly instead of silently degrading.
+    if (channel.channelType === "messenger" || channel.channelType === "instagram") {
+      if (command.kind !== "text" || !command.text) {
+        throw new Error(`social_channel_unsupported_kind_${command.kind}`);
+      }
+      persistedPayload = {
+        kind: "text",
+        text: command.text,
+        actorId: command.actorId,
+        channelType: channel.channelType
+      };
+      adapterCallStarted = true;
+      result = await callMetaAdapter("/internal/v1/social/send", command.tenantId, {
+        pageId: channel.phoneNumberId,
+        recipientId: command.contactPhoneE164.replace(/^psid:/, ""),
+        text: command.text,
+        accessToken: channel.accessToken
+      });
+    } else {
+      const call = buildOutboundAdapterCall(command, channel);
+      persistedPayload = call.persistedPayload;
+      adapterCallStarted = true;
+      result = await callMetaAdapter(call.endpoint, command.tenantId, call.payload);
+    }
   } catch (error) {
     if (claimKey) {
       // Release the claim so redelivery of this dispatchId can retry the send.
@@ -1221,6 +1245,71 @@ async function runNewMessageAutomation(
   }
 }
 
+/**
+ * Messenger/Instagram inbound (Phase F): threads social messages through the
+ * same contact/conversation/message pipeline — social contacts carry their
+ * PSID as "psid:<id>" in the phone field, and the page id routes via the same
+ * resolver as WhatsApp phone-number ids. Keyword auto-replies reuse the
+ * standard matcher + durable outbox; the outbound path routes them to the
+ * social send edge by channel type.
+ */
+async function handleSocialInbound(event: EventEnvelope): Promise<void> {
+  incCounter("events_consumed_total", "Events consumed from the bus.", { topic: EventTopics.SocialInboundReceived });
+  const inbound = event.payload as SocialInboundEvent;
+  if (!inbound.pageId || !inbound.senderId) {
+    return;
+  }
+  const channel = await resolveChannel(inbound.pageId);
+  if (!channel) {
+    logger.warn("social_inbound_unroutable", { pageId: inbound.pageId, channelType: inbound.channelType });
+    return;
+  }
+  if (inbound.messageId) {
+    const existing = await messageRepository.findByExternalId(channel.tenantId, inbound.messageId);
+    if (existing) {
+      logger.info("social_inbound_replay_skipped", { tenantId: channel.tenantId, messageId: inbound.messageId });
+      return;
+    }
+  }
+  const contact = await contactRepository.findOrCreateByPhone(channel.tenantId, `psid:${inbound.senderId}`);
+  const conversation = await conversationRepository.findOrCreate(channel.tenantId, contact.id, channel.channelId);
+  await conversationRepository.touchInbound(channel.tenantId, conversation.id);
+  await messageRepository.create(channel.tenantId, {
+    conversationId: conversation.id,
+    direction: "inbound",
+    status: "delivered",
+    externalMessageId: inbound.messageId,
+    payload: { type: "text", text: inbound.text, channelType: inbound.channelType, timestamp: inbound.timestamp }
+  });
+  logger.info("social_inbound_recorded", {
+    tenantId: channel.tenantId,
+    channelType: inbound.channelType,
+    messageId: inbound.messageId
+  });
+
+  if (inbound.text) {
+    const rules = await autoReplyRuleRepository.listEnabled(channel.tenantId);
+    const matched = matchAutoReply(inbound.text, rules);
+    if (matched?.replyText) {
+      await withTenant(channel.tenantId, async (client) => {
+        await outboxRepository.enqueue(client, channel.tenantId, {
+          topic: EventTopics.WhatsAppOutboundRequested,
+          payload: {
+            tenantId: channel.tenantId,
+            channelId: channel.channelId,
+            conversationId: conversation.id,
+            contactPhoneE164: contact.phoneE164,
+            kind: "text",
+            text: matched.replyText,
+            dispatchId: randomUUID()
+          } satisfies WhatsAppOutboundRequest
+        });
+      });
+      incCounter("auto_replies_sent_total", "Auto-reply messages enqueued.", { matchType: matched.matchType });
+    }
+  }
+}
+
 async function handleStatus(event: EventEnvelope): Promise<void> {
   incCounter("events_consumed_total", "Events consumed from the bus.", { topic: EventTopics.WhatsAppStatusUpdated });
   const status = event.payload as StatusEvent;
@@ -1532,6 +1621,7 @@ export function registerWorkerConsumers(deps: WorkerDeps = {}): void {
   eventBus.subscribe(EventTopics.CampaignDispatchResult, "campaign-results", handleDispatchResult);
   eventBus.subscribe(EventTopics.CampaignRunRequested, "campaign-run", handleCampaignRun);
   eventBus.subscribe(EventTopics.WhatsAppInboundReceived, "inbound-messages", handleInbound);
+  eventBus.subscribe(EventTopics.SocialInboundReceived, "social-inbound", handleSocialInbound);
   eventBus.subscribe(EventTopics.WhatsAppStatusUpdated, "status-updates", handleStatus);
   eventBus.subscribe(EventTopics.WhatsAppOutboundRequested, "outbound-messages", handleOutbound);
   eventBus.subscribe(EventTopics.AutomationTemplateRequested, "automation-templates", handleAutomationTemplate);
