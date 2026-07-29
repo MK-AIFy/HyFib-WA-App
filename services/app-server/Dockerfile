@@ -2,11 +2,12 @@ FROM node:24-alpine AS build
 WORKDIR /app
 RUN corepack enable
 
-COPY package.json pnpm-workspace.yaml tsconfig.base.json ./
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml tsconfig.base.json ./
 COPY packages ./packages
 COPY services ./services
 
-RUN pnpm install --no-frozen-lockfile
+# Frozen: the shipped image must be built from exactly the committed lockfile.
+RUN pnpm install --frozen-lockfile
 RUN pnpm --filter @hyfib/app-server... build
 
 FROM node:24-alpine

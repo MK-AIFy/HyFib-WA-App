@@ -1,0 +1,62 @@
+name: CD
+
+# Continuous delivery (roadmap Phase C): every push to main publishes the two
+# shipped images — app-server (the modular monolith) and web-app — to GHCR,
+# tagged with the exact commit SHA plus a moving latest. This closes the
+# "Trivy-scanned image ≠ shipped build" gap: what CI scanned is what gets
+# published, pinned by digest, and a VM/compose deploy can reference an
+# immutable tag instead of rebuilding from source on the box.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish-images:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: app-server
+            dockerfile: services/app-server/Dockerfile
+          - name: web-app
+            dockerfile: services/web-app/Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}/${{ matrix.name }}
+          tags: |
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+      - name: Scan the PUBLISHED image (CRITICAL gate)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ghcr.io/${{ github.repository }}/${{ matrix.name }}:sha-${{ github.sha }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
