@@ -143,7 +143,10 @@ async function main(): Promise<void> {
     proxyWebhookToIngestor,
     // Direct in-process calls to the former read/AI services (no HTTP hop).
     proxyReportsOverview: async (ctx) => ({ status: 200, body: await getReportsOverview(ctx.tenantId) }),
-    proxyAgentReports: async (ctx, days) => ({ status: 200, body: await getAgentPerformance(ctx.tenantId, Number(days)) }),
+    proxyAgentReports: async (ctx, days) => ({
+      status: 200,
+      body: await getAgentPerformance(ctx.tenantId, Number(days))
+    }),
     proxyUsage: async (ctx, days) => ({ status: 200, body: await getUsage(ctx.tenantId, days) }),
     proxyAi: async (ctx, aiPath, method, rawBody) => dispatchAi(aiPath, method, rawBody, ctx.requestId),
     proxySendTypingIndicator: async (params) => {
