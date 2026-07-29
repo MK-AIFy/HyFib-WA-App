@@ -124,28 +124,32 @@ test("team: delete cascades members and returns false on a second delete", { ski
   assert.equal(await teamRepository.delete(tenant.id, team.id), false);
 });
 
-test("channel: update display number, active flag, and rotate token (cache must not serve stale creds)", { skip }, async () => {
-  const tenant = await tenantRepository.create("CRUD Channel Tenant");
-  const channel = await channelRepository.create(tenant.id, {
-    wabaId: `waba-${Date.now()}`,
-    phoneNumberId: `pn-${Date.now()}`,
-    displayPhoneNumber: "+15550009999"
-  });
+test(
+  "channel: update display number, active flag, and rotate token (cache must not serve stale creds)",
+  { skip },
+  async () => {
+    const tenant = await tenantRepository.create("CRUD Channel Tenant");
+    const channel = await channelRepository.create(tenant.id, {
+      wabaId: `waba-${Date.now()}`,
+      phoneNumberId: `pn-${Date.now()}`,
+      displayPhoneNumber: "+15550009999"
+    });
 
-  // Prime the credentials cache, then rotate — the update must invalidate it.
-  await channelRepository.getCredentials(tenant.id, channel.id);
-  const updated = await channelRepository.update(tenant.id, channel.id, {
-    displayPhoneNumber: "+15550008888",
-    isActive: false,
-    accessToken: "rotated-token"
-  });
-  assert.equal(updated?.displayPhoneNumber, "+15550008888");
-  assert.equal(updated?.status, "inactive");
-  assert.equal(updated?.hasAccessToken, true);
+    // Prime the credentials cache, then rotate — the update must invalidate it.
+    await channelRepository.getCredentials(tenant.id, channel.id);
+    const updated = await channelRepository.update(tenant.id, channel.id, {
+      displayPhoneNumber: "+15550008888",
+      isActive: false,
+      accessToken: "rotated-token"
+    });
+    assert.equal(updated?.displayPhoneNumber, "+15550008888");
+    assert.equal(updated?.status, "inactive");
+    assert.equal(updated?.hasAccessToken, true);
 
-  const creds = await channelRepository.getCredentials(tenant.id, channel.id);
-  assert.equal(creds?.accessToken, "rotated-token", "rotated token visible immediately (no stale cache)");
-});
+    const creds = await channelRepository.getCredentials(tenant.id, channel.id);
+    assert.equal(creds?.accessToken, "rotated-token", "rotated token visible immediately (no stale cache)");
+  }
+);
 
 test("contact: update names/timezone/country then delete; FK block when history exists", { skip }, async () => {
   const tenant = await tenantRepository.create("CRUD Contact Tenant");

@@ -71,7 +71,10 @@ test("automation patch: switching to assign_agent requires an assignee in the me
 });
 
 test("automation patch: existing assign_agent rule keeps satisfying the rule via existing config", () => {
-  const existing = { actionType: "assign_agent", actionConfig: { assigneeUserId: "11111111-1111-1111-1111-111111111111" } };
+  const existing = {
+    actionType: "assign_agent",
+    actionConfig: { assigneeUserId: "11111111-1111-1111-1111-111111111111" }
+  };
   const result = validateAutomationRulePatch({ name: "Reassign" }, existing);
   assert.equal(result.ok, true);
 });
