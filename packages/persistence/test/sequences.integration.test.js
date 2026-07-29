@@ -48,53 +48,57 @@ async function makeDue(tenantId, sequenceId, contactId) {
   );
 }
 
-test("sequence lifecycle: create → enroll → advance both steps → complete, outbox rows enqueued", { skip }, async () => {
-  const { tenant, channel, tpl1, tpl2, contact } = await fixture();
-  const sequence = await sequenceRepository.create(tenant.id, {
-    name: "Onboarding drip",
-    channelId: channel.id,
-    steps: [
-      { delayMinutes: 0, templateId: tpl1.id },
-      { delayMinutes: 60, templateId: tpl2.id }
-    ]
-  });
-  await sequenceRepository.setStatus(tenant.id, sequence.id, "active");
+test(
+  "sequence lifecycle: create → enroll → advance both steps → complete, outbox rows enqueued",
+  { skip },
+  async () => {
+    const { tenant, channel, tpl1, tpl2, contact } = await fixture();
+    const sequence = await sequenceRepository.create(tenant.id, {
+      name: "Onboarding drip",
+      channelId: channel.id,
+      steps: [
+        { delayMinutes: 0, templateId: tpl1.id },
+        { delayMinutes: 60, templateId: tpl2.id }
+      ]
+    });
+    await sequenceRepository.setStatus(tenant.id, sequence.id, "active");
 
-  assert.equal(await sequenceRepository.enroll(tenant.id, sequence.id, [contact.id]), 1);
-  assert.equal(await sequenceRepository.enroll(tenant.id, sequence.id, [contact.id]), 0, "re-enroll is a no-op");
+    assert.equal(await sequenceRepository.enroll(tenant.id, sequence.id, [contact.id]), 1);
+    assert.equal(await sequenceRepository.enroll(tenant.id, sequence.id, [contact.id]), 0, "re-enroll is a no-op");
 
-  const due = await query("SELECT * FROM due_sequence_enrollments($1)", [10]);
-  const mine = due.rows.find((r) => r.tenant_id === tenant.id);
-  assert.ok(mine, "enrollment with delay 0 is due immediately");
+    const due = await query("SELECT * FROM due_sequence_enrollments($1)", [10]);
+    const mine = due.rows.find((r) => r.tenant_id === tenant.id);
+    assert.ok(mine, "enrollment with delay 0 is due immediately");
 
-  const first = await sequenceRepository.advanceDueEnrollment(tenant.id, mine.id);
-  assert.equal(first.action, "send");
-  assert.equal(first.stepOrder, 1);
-  assert.equal(first.templateName, tpl1.name);
-  assert.equal(first.completedAfterSend, false);
+    const first = await sequenceRepository.advanceDueEnrollment(tenant.id, mine.id);
+    assert.equal(first.action, "send");
+    assert.equal(first.stepOrder, 1);
+    assert.equal(first.templateName, tpl1.name);
+    assert.equal(first.completedAfterSend, false);
 
-  // Not due again until step 2's delay elapses.
-  assert.deepEqual(await sequenceRepository.advanceDueEnrollment(tenant.id, mine.id), { action: "skipped" });
+    // Not due again until step 2's delay elapses.
+    assert.deepEqual(await sequenceRepository.advanceDueEnrollment(tenant.id, mine.id), { action: "skipped" });
 
-  await makeDue(tenant.id, sequence.id, contact.id);
-  const second = await sequenceRepository.advanceDueEnrollment(tenant.id, mine.id);
-  assert.equal(second.action, "send");
-  assert.equal(second.stepOrder, 2);
-  assert.equal(second.templateName, tpl2.name);
-  assert.equal(second.completedAfterSend, true);
+    await makeDue(tenant.id, sequence.id, contact.id);
+    const second = await sequenceRepository.advanceDueEnrollment(tenant.id, mine.id);
+    assert.equal(second.action, "send");
+    assert.equal(second.stepOrder, 2);
+    assert.equal(second.templateName, tpl2.name);
+    assert.equal(second.completedAfterSend, true);
 
-  const detail = await sequenceRepository.getById(tenant.id, sequence.id);
-  assert.equal(detail.steps.length, 2);
-  const listed = await sequenceRepository.list(tenant.id);
-  assert.deepEqual(listed[0].enrollmentCounts, { active: 0, completed: 1, stopped: 0 });
+    const detail = await sequenceRepository.getById(tenant.id, sequence.id);
+    assert.equal(detail.steps.length, 2);
+    const listed = await sequenceRepository.list(tenant.id);
+    assert.deepEqual(listed[0].enrollmentCounts, { active: 0, completed: 1, stopped: 0 });
 
-  // Both steps rode the durable outbox as automation-template sends.
-  const outbox = await withTenant(tenant.id, (client) =>
-    client.query("SELECT payload FROM outbox_events WHERE topic = 'automation.template.requested'")
-  );
-  const forContact = outbox.rows.filter((r) => r.payload.contactPhoneE164 === "+15558880002");
-  assert.equal(forContact.length, 2);
-});
+    // Both steps rode the durable outbox as automation-template sends.
+    const outbox = await withTenant(tenant.id, (client) =>
+      client.query("SELECT payload FROM outbox_events WHERE topic = 'automation.template.requested'")
+    );
+    const forContact = outbox.rows.filter((r) => r.payload.contactPhoneE164 === "+15558880002");
+    assert.equal(forContact.length, 2);
+  }
+);
 
 test("stop-on-reply stops active enrollments; opted-out contacts stop at advance", { skip }, async () => {
   const { tenant, channel, tpl1, contact } = await fixture();

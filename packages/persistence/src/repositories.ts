@@ -3083,7 +3083,10 @@ export const sequenceRepository = {
       if (!result.rows[0]) {
         return undefined;
       }
-      const steps = await client.query<SequenceStepRow>(`${SEQUENCE_STEP_SELECT} WHERE st.sequence_id = $1 ORDER BY st.step_order ASC`, [id]);
+      const steps = await client.query<SequenceStepRow>(
+        `${SEQUENCE_STEP_SELECT} WHERE st.sequence_id = $1 ORDER BY st.step_order ASC`,
+        [id]
+      );
       return { ...mapSequence(result.rows[0]), steps: steps.rows.map(mapSequenceStep) };
     });
   },
