@@ -98,6 +98,7 @@ import { buildMediaHeaders } from "./media-headers.js";
 import { mapMediaUploadProxyResult } from "./media-upload.js";
 import { SseHub } from "./sse-hub.js";
 import { parseCsv, serializeContactsCsv, extractMultipartFile } from "./csv.js";
+import { validateSegmentDefinition } from "./segment-definition.js";
 import { resolveOrgTenant } from "./single-org.js";
 import { runOutboxRelayOnce } from "./outbox-relay.js";
 import { classifyRoute, API_RATE_LIMITS } from "./rate-limit.js";
@@ -2321,6 +2322,20 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         sendJson(res, 400, { error: "name is required" });
         return;
       }
+      const definitionCheck = validateSegmentDefinition(payload.definition);
+      if (!definitionCheck.ok) {
+        sendJson(res, 400, { error: definitionCheck.error });
+        return;
+      }
+      // A retargeting clause must reference a campaign in this workspace.
+      if (
+        definitionCheck.value.campaign &&
+        !(await campaignRepository.getById(tenantId, definitionCheck.value.campaign.id))
+      ) {
+        sendJson(res, 422, { error: "campaign.id does not name a campaign in this workspace" });
+        return;
+      }
+      payload.definition = definitionCheck.value;
       const segment = await segmentRepository.create(tenantId, {
         name: payload.name.trim(),
         definition: payload.definition ?? {}
