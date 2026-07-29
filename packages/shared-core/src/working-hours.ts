@@ -39,7 +39,10 @@ function localParts(timezone: string, now: Date): { day: WeekDay; minutes: numbe
       hour12: false
     });
     const parts = formatter.formatToParts(now);
-    const weekday = parts.find((p) => p.type === "weekday")?.value.toLowerCase().slice(0, 3);
+    const weekday = parts
+      .find((p) => p.type === "weekday")
+      ?.value.toLowerCase()
+      .slice(0, 3);
     const hour = Number(parts.find((p) => p.type === "hour")?.value);
     const minute = Number(parts.find((p) => p.type === "minute")?.value);
     if (!weekday || !WEEK_DAYS.includes(weekday as WeekDay) || !Number.isFinite(hour) || !Number.isFinite(minute)) {

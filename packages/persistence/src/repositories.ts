@@ -447,10 +447,9 @@ export const automationSettingsRepository = {
     }
   ): Promise<AutomationSettings> {
     return withTenant(tenantId, async (client) => {
-      const existing = await client.query<AutomationSettingsRow>(
-        `${AUTOMATION_SETTINGS_SELECT} WHERE tenant_id = $1`,
-        [tenantId]
-      );
+      const existing = await client.query<AutomationSettingsRow>(`${AUTOMATION_SETTINGS_SELECT} WHERE tenant_id = $1`, [
+        tenantId
+      ]);
       const current = existing.rows[0];
       const merged = {
         timezone: patch.timezone ?? current?.timezone ?? "UTC",

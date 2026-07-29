@@ -12,7 +12,10 @@ export type DefaultAutomationDecision = { kind: "ooo" | "welcome"; text: string 
 
 export function decideDefaultAutomation(input: {
   settings:
-    | Pick<AutomationSettings, "timezone" | "workingHours" | "welcomeEnabled" | "welcomeText" | "oooEnabled" | "oooText">
+    | Pick<
+        AutomationSettings,
+        "timezone" | "workingHours" | "welcomeEnabled" | "welcomeText" | "oooEnabled" | "oooText"
+      >
     | undefined;
   firstInbound: boolean;
   now: Date;

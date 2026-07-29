@@ -15,9 +15,7 @@ export interface AutomationSettingsPatch {
   oooSuppressHours?: number;
 }
 
-export type AutomationSettingsPatchResult =
-  | { ok: true; value: AutomationSettingsPatch }
-  | { ok: false; error: string };
+export type AutomationSettingsPatchResult = { ok: true; value: AutomationSettingsPatch } | { ok: false; error: string };
 
 function isValidTimezone(zone: string): boolean {
   try {
