@@ -10,8 +10,19 @@ quarterly).
 
 ## Backups
 
-1. **PostgreSQL**: nightly base backup + continuous WAL archiving to off-host
-   storage (e.g. `pgBackRest`/`wal-g`). Verify restore weekly.
+1. **PostgreSQL — implemented**: `scripts/backup.sh` produces a verified
+   (`pg_restore --list`) custom-format dump with a sha256 checksum, prunes to
+   `BACKUP_RETENTION` local copies, and ships off-host via `BACKUP_REMOTE_CMD`
+   (its failure fails the run — a dump that never leaves the host is not DR).
+   On the production VM the `hyfib-backup.timer` unit (installed by
+   `deploy/oracle/setup-vm.sh`, daily 02:30 UTC, `Persistent=true`) drives it
+   with credentials from `/etc/hyfib/migrate.env`; set `BACKUP_REMOTE_CMD` in
+   `/etc/hyfib/backup.env`. Restore with `scripts/restore.sh <dump>` (checksum
+   and integrity verified, refuses live/existing DBs without `RESTORE_FORCE=1`,
+   prints migration/tenant/RLS evidence). CI rehearses the full cycle on every
+   PR (`backup-restore-drill` job: migrate → dump → drop → restore → run the
+   persistence suite against the restored DB). Upgrade path for tighter RPO:
+   continuous WAL archiving (`pgBackRest`/`wal-g`) on top of these dumps.
 2. **RabbitMQ**: durable exchanges/queues + persistent messages survive restart;
    the transactional **outbox** in Postgres is the source of truth for unpublished
    events, so a broker loss does not lose dispatch intent.

@@ -1,0 +1,15 @@
+[Unit]
+Description=HyFib PostgreSQL backup (pg_dump + verify + retention + optional off-host ship)
+Documentation=file:/opt/hyfib/app/docs/runbooks/dr-drill.md
+After=postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=oneshot
+# migrate.env carries the platform-superuser credentials backup/restore need.
+EnvironmentFile=/etc/hyfib/migrate.env
+Environment=BACKUP_DIR=/var/backups/hyfib
+# Optional: create /etc/hyfib/backup.env with BACKUP_REMOTE_CMD/BACKUP_RETENTION
+# to ship dumps off-host — a backup that never leaves the VM is not DR.
+EnvironmentFile=-/etc/hyfib/backup.env
+ExecStart=/usr/bin/bash /opt/hyfib/app/scripts/backup.sh

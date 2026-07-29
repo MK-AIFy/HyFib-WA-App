@@ -68,7 +68,8 @@ Then `sudo systemctl restart hyfib-app`.
 | App logs | `journalctl -u hyfib-app -f` |
 | Caddy/TLS logs | `journalctl -u caddy -f` |
 | Restart app | `sudo systemctl restart hyfib-app` |
-| DB backup | `sudo -u postgres pg_dump hyfib_wa \| gzip > hyfib_wa.sql.gz` |
+| DB backup (manual run) | `sudo systemctl start hyfib-backup` — daily timer `hyfib-backup.timer` runs `scripts/backup.sh`; dumps in `/var/backups/hyfib` |
+| DB restore | `sudo bash -c "set -a; . /etc/hyfib/migrate.env; set +a; RESTORE_FORCE=1 bash /opt/hyfib/app/scripts/restore.sh /var/backups/hyfib/<dump>"` (stop `hyfib-app` first) |
 | Secrets / env | `/etc/hyfib/hyfib.env` (root-only, chmod 600) |
 
 Layout on the VM: source is synced to `~/hyfib-src` (built there as the

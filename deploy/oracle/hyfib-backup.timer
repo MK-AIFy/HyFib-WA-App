@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily HyFib PostgreSQL backup
+
+[Timer]
+OnCalendar=*-*-* 02:30:00 UTC
+RandomizedDelaySec=15m
+# Run at next boot if the VM was down at the scheduled time.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
