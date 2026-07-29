@@ -13,6 +13,7 @@ import { createEventBus, type EventBus } from "@hyfib/event-bus";
 import {
   auditRepository,
   autoReplyRuleRepository,
+  automationSettingsRepository,
   automationRuleRepository,
   campaignRecipientRepository,
   campaignRepository,
@@ -98,6 +99,7 @@ import { buildMediaHeaders } from "./media-headers.js";
 import { mapMediaUploadProxyResult } from "./media-upload.js";
 import { SseHub } from "./sse-hub.js";
 import { parseCsv, serializeContactsCsv, extractMultipartFile } from "./csv.js";
+import { validateAutomationSettingsPatch } from "./automation-settings.js";
 import { resolveOrgTenant } from "./single-org.js";
 import { runOutboxRelayOnce } from "./outbox-relay.js";
 import { classifyRoute, API_RATE_LIMITS } from "./rate-limit.js";
@@ -3380,6 +3382,46 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   }
 
   // ─── Auto-reply rules ─────────────────────────────────────────────────────
+  // ─── Default automations settings: working hours / welcome / OOO (G8) ─────
+  if (path === "/api/v1/automation-settings") {
+    if (method === "GET") {
+      const settings = await automationSettingsRepository.get(tenantId);
+      sendJson(res, 200, {
+        settings: settings ?? {
+          tenantId,
+          timezone: "UTC",
+          workingHours: {},
+          welcomeEnabled: false,
+          oooEnabled: false,
+          oooSuppressHours: 12
+        }
+      });
+      return;
+    }
+    if (method === "PUT") {
+      if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager"])) {
+        sendJson(res, 403, { error: "Insufficient role to update automation settings" });
+        return;
+      }
+      const patch = validateAutomationSettingsPatch(await readJsonBody<Record<string, unknown>>(req));
+      if (!patch.ok) {
+        sendJson(res, 400, { error: patch.error });
+        return;
+      }
+      const settings = await automationSettingsRepository.upsert(tenantId, patch.value);
+      await audit(tenantId, auth, {
+        action: "automation.settings.updated",
+        resourceType: "AutomationSettings",
+        resourceId: tenantId,
+        payload: { fields: Object.keys(patch.value) }
+      });
+      sendJson(res, 200, { settings });
+      return;
+    }
+    sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+
   if (path === "/api/v1/auto-reply-rules") {
     if (method === "GET") {
       sendJson(res, 200, { items: await autoReplyRuleRepository.list(tenantId) });
