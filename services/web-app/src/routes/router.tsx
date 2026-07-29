@@ -11,6 +11,7 @@ import { CampaignsPage } from "@/pages/CampaignsPage";
 import { TemplatesPage } from "@/pages/TemplatesPage";
 import { TasksPage } from "@/pages/TasksPage";
 import { AutomationPage } from "@/pages/AutomationPage";
+import { FlowsPage } from "@/pages/flows/FlowsPage";
 import { AnalyticsPage } from "@/pages/AnalyticsPage";
 import { ReportsPage } from "@/pages/ReportsPage";
 import { UsagePage } from "@/pages/UsagePage";
@@ -60,6 +61,7 @@ export const router = createBrowserRouter([
           { path: "templates", element: <TemplatesPage /> },
           { path: "tasks", element: <TasksPage /> },
           { path: "automation", element: <AutomationPage /> },
+          { path: "flows", element: <FlowsPage /> },
           { path: "teams", element: <TeamsPage /> },
           { path: "analytics", element: <AnalyticsPage /> },
           { path: "reports", element: <ReportsPage /> },
