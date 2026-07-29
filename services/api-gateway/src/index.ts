@@ -4623,6 +4623,104 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   }
 
   // ─── Orders ───────────────────────────────────────────────────────────────
+  // ─── Order lifecycle + payment links (G16 core) ───────────────────────────
+  if (path.startsWith("/api/v1/orders/") && method === "POST" && path.endsWith("/status")) {
+    if (!canCreateOrder(auth)) {
+      sendJson(res, 403, { error: "Insufficient role to update orders" });
+      return;
+    }
+    const orderId = extractPathSegment(path, "/api/v1/orders/");
+    if (!orderId || !UUID.test(orderId)) {
+      sendJson(res, 400, { error: "Invalid order id" });
+      return;
+    }
+    const body = await readJsonBody<{ status?: string }>(req);
+    // Legal transitions: created→confirmed|cancelled, confirmed→paid|cancelled.
+    const ORDER_TRANSITIONS: Record<string, Array<"created" | "confirmed" | "paid" | "cancelled">> = {
+      confirmed: ["created"],
+      paid: ["confirmed"],
+      cancelled: ["created", "confirmed"]
+    };
+    const target = body.status as "confirmed" | "paid" | "cancelled";
+    const allowedFrom = target ? ORDER_TRANSITIONS[target] : undefined;
+    if (!allowedFrom) {
+      sendJson(res, 400, { error: "status must be confirmed, paid, or cancelled" });
+      return;
+    }
+    const order = await orderRepository.transition(tenantId, orderId, allowedFrom, target);
+    if (!order) {
+      const current = await orderRepository.getById(tenantId, orderId);
+      if (!current) {
+        sendJson(res, 404, { error: "Order not found" });
+        return;
+      }
+      sendJson(res, 409, {
+        error: `Cannot mark a ${current.status} order as ${target}; it must be ${allowedFrom.join(" or ")}`
+      });
+      return;
+    }
+    await eventBus.publish(
+      EventTopics.CommerceOrderEvent,
+      { tenantId, orderId, status: order.status, externalOrderId: order.externalOrderId },
+      tenantId
+    );
+    await audit(tenantId, auth, {
+      action: "order.status.updated",
+      resourceType: "Order",
+      resourceId: orderId,
+      payload: { status: order.status }
+    });
+    sendJson(res, 200, { ...order });
+    return;
+  }
+
+  if (path.startsWith("/api/v1/orders/") && method === "PATCH") {
+    if (!canCreateOrder(auth)) {
+      sendJson(res, 403, { error: "Insufficient role to update orders" });
+      return;
+    }
+    const orderId = extractPathSegment(path, "/api/v1/orders/");
+    if (!orderId || !UUID.test(orderId) || path !== `/api/v1/orders/${orderId}`) {
+      sendJson(res, 400, { error: "Invalid order id" });
+      return;
+    }
+    const body = await readJsonBody<{ paymentLink?: unknown }>(req);
+    if (body.paymentLink === undefined) {
+      sendJson(res, 400, { error: "paymentLink is required (string URL or null to clear)" });
+      return;
+    }
+    let link: string | null = null;
+    if (body.paymentLink !== null) {
+      if (typeof body.paymentLink !== "string" || body.paymentLink.length > 1024) {
+        sendJson(res, 400, { error: "paymentLink must be a URL of at most 1024 characters, or null" });
+        return;
+      }
+      try {
+        const parsed = new URL(body.paymentLink);
+        if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+          throw new Error("scheme");
+        }
+      } catch {
+        sendJson(res, 400, { error: "paymentLink must be an http(s) URL" });
+        return;
+      }
+      link = body.paymentLink;
+    }
+    const order = await orderRepository.setPaymentLink(tenantId, orderId, link);
+    if (!order) {
+      sendJson(res, 404, { error: "Order not found" });
+      return;
+    }
+    await audit(tenantId, auth, {
+      action: "order.payment_link.updated",
+      resourceType: "Order",
+      resourceId: orderId,
+      payload: { cleared: link === null }
+    });
+    sendJson(res, 200, { ...order });
+    return;
+  }
+
   if (path === "/api/v1/orders") {
     if (method === "GET") {
       sendJson(res, 200, { items: await orderRepository.list(tenantId) });

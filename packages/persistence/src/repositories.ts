@@ -1631,6 +1631,7 @@ interface OrderRow {
   amount_minor: string;
   currency: string;
   status: string;
+  payment_link: string | null;
   created_at: Date;
 }
 
@@ -1643,6 +1644,7 @@ function mapOrder(row: OrderRow): Order {
     amountMinor: Number(row.amount_minor),
     currency: row.currency,
     status: row.status as Order["status"],
+    paymentLink: row.payment_link ?? undefined,
     createdAt: row.created_at.toISOString()
   };
 }
@@ -1656,7 +1658,7 @@ export const orderRepository = {
       const result = await client.query<OrderRow>(
         `INSERT INTO orders (tenant_id, contact_id, external_order_id, amount_minor, currency, status)
          VALUES ($1, $2, $3, $4, $5, 'created')
-         RETURNING id, tenant_id, contact_id, external_order_id, amount_minor, currency, status, created_at`,
+         RETURNING id, tenant_id, contact_id, external_order_id, amount_minor, currency, status, payment_link, created_at`,
         [tenantId, input.contactId, input.externalOrderId, input.amountMinor, input.currency]
       );
       return mapOrder(result.rows[0]!);
@@ -1665,10 +1667,48 @@ export const orderRepository = {
   async list(tenantId: string): Promise<Order[]> {
     return withTenant(tenantId, async (client) => {
       const result = await client.query<OrderRow>(
-        `SELECT id, tenant_id, contact_id, external_order_id, amount_minor, currency, status, created_at
+        `SELECT id, tenant_id, contact_id, external_order_id, amount_minor, currency, status, payment_link, created_at
          FROM orders ORDER BY created_at DESC`
       );
       return result.rows.map(mapOrder);
+    });
+  },
+  /** Compare-and-swap transition: applies only when the current status is in `from`. */
+  async transition(
+    tenantId: string,
+    id: string,
+    from: Array<Order["status"]>,
+    to: Order["status"]
+  ): Promise<Order | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<OrderRow>(
+        `UPDATE orders SET status = $3, updated_at = now()
+         WHERE id = $1 AND status = ANY($2)
+         RETURNING id, tenant_id, contact_id, external_order_id, amount_minor, currency, status, payment_link, created_at`,
+        [id, from, to]
+      );
+      return result.rows[0] ? mapOrder(result.rows[0]) : undefined;
+    });
+  },
+  async setPaymentLink(tenantId: string, id: string, link: string | null): Promise<Order | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<OrderRow>(
+        `UPDATE orders SET payment_link = $2, updated_at = now()
+         WHERE id = $1
+         RETURNING id, tenant_id, contact_id, external_order_id, amount_minor, currency, status, payment_link, created_at`,
+        [id, link]
+      );
+      return result.rows[0] ? mapOrder(result.rows[0]) : undefined;
+    });
+  },
+  async getById(tenantId: string, id: string): Promise<Order | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<OrderRow>(
+        `SELECT id, tenant_id, contact_id, external_order_id, amount_minor, currency, status, payment_link, created_at
+         FROM orders WHERE id = $1`,
+        [id]
+      );
+      return result.rows[0] ? mapOrder(result.rows[0]) : undefined;
     });
   }
 };
