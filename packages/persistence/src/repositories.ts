@@ -2961,6 +2961,15 @@ export const autoReplyRuleRepository = {
       return result.rows.map(mapAutoReplyRule);
     });
   },
+  async getById(tenantId: string, id: string): Promise<AutoReplyRule | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<AutoReplyRuleRow>(
+        "SELECT id, tenant_id, match_type, keyword, reply_kind, reply_text, enabled, priority, created_at FROM auto_reply_rules WHERE id = $1",
+        [id]
+      );
+      return result.rows[0] ? mapAutoReplyRule(result.rows[0]) : undefined;
+    });
+  },
   async setEnabled(tenantId: string, id: string, enabled: boolean): Promise<void> {
     await withTenant(tenantId, async (client) => {
       await client.query("UPDATE auto_reply_rules SET enabled = $2 WHERE id = $1", [id, enabled]);
@@ -3163,6 +3172,12 @@ export const automationRuleRepository = {
         [triggerType]
       );
       return result.rows.map(mapAutomationRule);
+    });
+  },
+  async getById(tenantId: string, id: string): Promise<AutomationRule | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<AutomationRuleRow>(`${AUTOMATION_SELECT} WHERE id = $1`, [id]);
+      return result.rows[0] ? mapAutomationRule(result.rows[0]) : undefined;
     });
   },
   async setEnabled(tenantId: string, id: string, enabled: boolean): Promise<void> {
