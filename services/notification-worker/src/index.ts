@@ -27,6 +27,7 @@ import {
   outboxRepository,
   resolveChannelByPhoneNumberId,
   taskRepository,
+  teamRepository,
   userRepository,
   whatsappSettingsRepository,
   withTenant,
@@ -890,6 +891,11 @@ async function handleInbound(event: EventEnvelope): Promise<void> {
   // welcome as much as text — but reactions are not a contact reaching out.
   if (inbound.type !== "reaction") {
     await runDefaultAutomations(channel, conversation.id, contact, createdMessage.id);
+    // Round-robin auto-assignment (G9): only unassigned conversations — a
+    // manual assignment or an earlier rotation is never overridden.
+    if (!conversation.assignedUserId) {
+      await runRoundRobinAssignment(channel.tenantId, conversation.id);
+    }
   }
 
   // Auto-reply evaluation (only text/button messages; skip reactions, read receipts).
@@ -988,6 +994,35 @@ async function runDefaultAutomations(
   } catch (error) {
     logger.error("default_automation_failed", {
       tenantId: channel.tenantId,
+      conversationId,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+}
+
+/**
+ * Round-robin auto-assignment (G9): rotate unassigned new conversations among
+ * the configured team's active members. Failures never break inbound
+ * processing; enabled-without-team is a deliberate no-op (G8's
+ * OOO-without-hours precedent).
+ */
+async function runRoundRobinAssignment(tenantId: string, conversationId: string): Promise<void> {
+  try {
+    const settings = await automationSettingsRepository.get(tenantId);
+    if (!settings?.roundRobinEnabled || !settings.roundRobinTeamId) {
+      return;
+    }
+    const assignee = await teamRepository.nextRoundRobinAssignee(tenantId, settings.roundRobinTeamId);
+    if (!assignee) {
+      logger.warn("round_robin_no_active_members", { tenantId, teamId: settings.roundRobinTeamId });
+      return;
+    }
+    await conversationRepository.assign(tenantId, conversationId, assignee.id);
+    incCounter("round_robin_assignments_total", "Conversations auto-assigned by round-robin.", {});
+    logger.info("round_robin_assigned", { tenantId, conversationId, userId: assignee.id });
+  } catch (error) {
+    logger.error("round_robin_assignment_failed", {
+      tenantId,
       conversationId,
       error: error instanceof Error ? error.message : String(error)
     });
