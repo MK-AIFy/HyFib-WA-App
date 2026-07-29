@@ -301,6 +301,8 @@ export interface Order {
   amountMinor: number;
   currency: string;
   status: "created" | "confirmed" | "paid" | "cancelled";
+  /** Provider-agnostic checkout URL attached by an operator or integration. */
+  paymentLink?: string;
   createdAt: string;
 }
 
