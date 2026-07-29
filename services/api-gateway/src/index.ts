@@ -124,6 +124,7 @@ import {
 import QRCodeSvg from "qrcode-svg";
 import { buildWaLink, renderWidgetScript } from "./click-to-chat.js";
 import { openApiSpec } from "./openapi.js";
+import { createRazorpayPaymentLink } from "./payment-provider.js";
 import { SseHub } from "./sse-hub.js";
 import { parseCsv, serializeContactsCsv, serializeCampaignRecipientsCsv, extractMultipartFile } from "./csv.js";
 import { validateSegmentDefinition } from "./segment-definition.js";
@@ -4999,7 +5000,28 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       resourceId: orderId,
       payload: { status: order.status }
     });
-    sendJson(res, 200, { ...order });
+    // Payment link auto-creation (G16): best-effort provider enrichment on
+    // confirm — a failure never blocks the transition, and operators can
+    // always attach a link manually via PATCH.
+    let enriched = order;
+    if (order.status === "confirmed" && !order.paymentLink && config.paymentProvider === "razorpay") {
+      const linkResult = await createRazorpayPaymentLink(
+        { keyId: config.razorpayKeyId, keySecret: config.razorpayKeySecret },
+        {
+          amountMinor: order.amountMinor,
+          currency: order.currency,
+          description: `Order ${order.externalOrderId}`,
+          referenceId: order.id
+        }
+      );
+      if (linkResult.ok) {
+        enriched = (await orderRepository.setPaymentLink(tenantId, orderId, linkResult.link)) ?? order;
+        logger.info("payment_link_created", { tenantId, orderId, providerRef: linkResult.providerRef });
+      } else {
+        logger.warn("payment_link_failed", { tenantId, orderId, error: linkResult.error });
+      }
+    }
+    sendJson(res, 200, { ...enriched });
     return;
   }
 

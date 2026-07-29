@@ -64,6 +64,10 @@ export interface PlatformConfig {
   vaultAddr: string;
   anthropicModel: string;
   anthropicApiKey: string;
+  /** "none" (default) or "razorpay" — gates automatic payment-link creation on order confirm. */
+  paymentProvider: string;
+  razorpayKeyId: string;
+  razorpayKeySecret: string;
   anthropicMaxTokens: number;
   aiDeterministicFallback: boolean;
 }
@@ -189,6 +193,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PlatformConfig
     vaultAddr: env.VAULT_ADDR ?? "http://vault:8200",
     anthropicModel: env.ANTHROPIC_MODEL ?? "claude-opus-4-8",
     anthropicApiKey: env.ANTHROPIC_API_KEY ?? "",
+    paymentProvider: env.PAYMENT_PROVIDER ?? "none",
+    razorpayKeyId: env.RAZORPAY_KEY_ID ?? "",
+    razorpayKeySecret: env.RAZORPAY_KEY_SECRET ?? "",
     anthropicMaxTokens: parseNumber("ANTHROPIC_MAX_TOKENS", env.ANTHROPIC_MAX_TOKENS, 1500),
     aiDeterministicFallback: parseBoolean(env.AI_DETERMINISTIC_FALLBACK, true)
   };
