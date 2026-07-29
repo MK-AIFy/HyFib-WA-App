@@ -11,6 +11,7 @@ import { loadConfig } from "@hyfib/config";
 import { createAuthenticator, hasAnyRole, normalizeRoles, AuthError, type AuthContext } from "@hyfib/auth";
 import { createEventBus, type EventBus } from "@hyfib/event-bus";
 import {
+  attributionRepository,
   auditRepository,
   autoReplyRuleRepository,
   automationRuleRepository,
@@ -3720,6 +3721,14 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   }
 
   // ─── Analytics & Audit ────────────────────────────────────────────────────
+  // Click-to-WhatsApp ads attribution (G18): inbound referral aggregation.
+  if (path === "/api/v1/analytics/ctwa" && method === "GET") {
+    const days = Number(parseQuery(req.url).get("days") ?? "30");
+    const sources = await attributionRepository.ctwaSources(tenantId, days);
+    sendJson(res, 200, { days: Math.min(Math.max(Math.trunc(days) || 30, 1), 365), sources });
+    return;
+  }
+
   if (path === "/api/v1/analytics/link-clicks" && method === "GET") {
     if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager", "analyst"])) {
       sendJson(res, 403, { error: "Insufficient role" });

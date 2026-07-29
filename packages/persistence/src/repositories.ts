@@ -3012,6 +3012,70 @@ export const contactImportRepository = {
 
 // ─── Link clicks ────────────────────────────────────────────────────────────────
 
+/**
+ * Click-to-WhatsApp ads attribution (roadmap G18). The webhook ingestor has
+ * always normalized Meta's `referral` object onto inbound message payloads;
+ * this aggregates it per ad source. No new write path — pure read model.
+ */
+export const attributionRepository = {
+  async ctwaSources(
+    tenantId: string,
+    days: number
+  ): Promise<
+    Array<{
+      sourceId?: string;
+      sourceType?: string;
+      sourceUrl?: string;
+      headline?: string;
+      messages: number;
+      conversations: number;
+      firstSeen: string;
+      lastSeen: string;
+    }>
+  > {
+    const clamped = Math.min(Math.max(Math.trunc(days) || 30, 1), 365);
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<{
+        source_id: string | null;
+        source_type: string | null;
+        source_url: string | null;
+        headline: string | null;
+        messages: string;
+        conversations: string;
+        first_seen: Date;
+        last_seen: Date;
+      }>(
+        `SELECT payload->'referral'->>'source_id' AS source_id,
+                payload->'referral'->>'source_type' AS source_type,
+                payload->'referral'->>'source_url' AS source_url,
+                payload->'referral'->>'headline' AS headline,
+                COUNT(*)::text AS messages,
+                COUNT(DISTINCT conversation_id)::text AS conversations,
+                MIN(created_at) AS first_seen,
+                MAX(created_at) AS last_seen
+         FROM messages
+         WHERE direction = 'inbound'
+           AND payload ? 'referral'
+           AND created_at >= now() - ($1 || ' days')::interval
+         GROUP BY 1, 2, 3, 4
+         ORDER BY COUNT(*) DESC
+         LIMIT 100`,
+        [String(clamped)]
+      );
+      return result.rows.map((row) => ({
+        sourceId: row.source_id ?? undefined,
+        sourceType: row.source_type ?? undefined,
+        sourceUrl: row.source_url ?? undefined,
+        headline: row.headline ?? undefined,
+        messages: Number(row.messages),
+        conversations: Number(row.conversations),
+        firstSeen: row.first_seen.toISOString(),
+        lastSeen: row.last_seen.toISOString()
+      }));
+    });
+  }
+};
+
 export const linkClickRepository = {
   async create(
     tenantId: string,
