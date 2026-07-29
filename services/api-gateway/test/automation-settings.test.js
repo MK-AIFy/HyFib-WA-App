@@ -46,3 +46,18 @@ test("empty or non-object bodies are rejected", () => {
   assert.equal(validateAutomationSettingsPatch(null).ok, false);
   assert.equal(validateAutomationSettingsPatch([1]).ok, false);
 });
+
+test("round-robin fields: booleans, team UUID or null", () => {
+  assert.equal(
+    validateAutomationSettingsPatch({
+      roundRobinEnabled: true,
+      roundRobinTeamId: "11111111-1111-1111-1111-111111111111"
+    }).ok,
+    true
+  );
+  const cleared = validateAutomationSettingsPatch({ roundRobinTeamId: null });
+  assert.equal(cleared.ok, true);
+  assert.equal(cleared.value.roundRobinTeamId, null);
+  assert.equal(validateAutomationSettingsPatch({ roundRobinTeamId: "not-a-uuid" }).ok, false);
+  assert.equal(validateAutomationSettingsPatch({ roundRobinEnabled: "yes" }).ok, false);
+});

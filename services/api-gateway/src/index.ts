@@ -3393,7 +3393,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
           workingHours: {},
           welcomeEnabled: false,
           oooEnabled: false,
-          oooSuppressHours: 12
+          oooSuppressHours: 12,
+          roundRobinEnabled: false
         }
       });
       return;
@@ -3406,6 +3407,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       const patch = validateAutomationSettingsPatch(await readJsonBody<Record<string, unknown>>(req));
       if (!patch.ok) {
         sendJson(res, 400, { error: patch.error });
+        return;
+      }
+      if (patch.value.roundRobinTeamId && !(await teamRepository.getById(tenantId, patch.value.roundRobinTeamId))) {
+        sendJson(res, 422, { error: "roundRobinTeamId does not name a team in this workspace" });
         return;
       }
       const settings = await automationSettingsRepository.upsert(tenantId, patch.value);

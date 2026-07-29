@@ -13,7 +13,11 @@ export interface AutomationSettingsPatch {
   oooEnabled?: boolean;
   oooText?: string | null;
   oooSuppressHours?: number;
+  roundRobinEnabled?: boolean;
+  roundRobinTeamId?: string | null;
 }
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export type AutomationSettingsPatchResult = { ok: true; value: AutomationSettingsPatch } | { ok: false; error: string };
 
@@ -49,7 +53,16 @@ export function validateAutomationSettingsPatch(payload: unknown): AutomationSet
     }
     value.workingHours = hours.value;
   }
-  for (const field of ["welcomeEnabled", "oooEnabled"] as const) {
+  if (raw.roundRobinTeamId !== undefined) {
+    if (raw.roundRobinTeamId === null) {
+      value.roundRobinTeamId = null;
+    } else if (typeof raw.roundRobinTeamId === "string" && UUID_RE.test(raw.roundRobinTeamId)) {
+      value.roundRobinTeamId = raw.roundRobinTeamId;
+    } else {
+      return { ok: false, error: "roundRobinTeamId must be a team UUID or null" };
+    }
+  }
+  for (const field of ["welcomeEnabled", "oooEnabled", "roundRobinEnabled"] as const) {
     if (raw[field] !== undefined) {
       if (typeof raw[field] !== "boolean") {
         return { ok: false, error: `${field} must be a boolean` };

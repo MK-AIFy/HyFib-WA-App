@@ -352,6 +352,43 @@ export const teamRepository = {
       await client.query("DELETE FROM team_members WHERE team_id = $1 AND user_id = $2", [teamId, userId]);
     });
   },
+  /**
+   * Strict round-robin pick among a team's ACTIVE members (roadmap G9). The
+   * cursor lives on automation_settings.round_robin_last_user_id; the settings
+   * row is locked FOR UPDATE so concurrent inbounds serialize on the pick and
+   * the rotation stays fair. Returns undefined when the team has no active
+   * members. Callers only invoke this when round-robin is enabled, so a
+   * settings row exists and the cursor persists.
+   */
+  async nextRoundRobinAssignee(tenantId: string, teamId: string): Promise<{ id: string } | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const members = await client.query<{ user_id: string }>(
+        `SELECT tm.user_id
+         FROM team_members tm
+         JOIN users u ON u.id = tm.user_id
+         WHERE tm.team_id = $1 AND u.status = 'active'
+         ORDER BY u.created_at ASC, u.id ASC`,
+        [teamId]
+      );
+      const ids = members.rows.map((row) => row.user_id);
+      if (ids.length === 0) {
+        return undefined;
+      }
+      const cursor = await client.query<{ round_robin_last_user_id: string | null }>(
+        "SELECT round_robin_last_user_id FROM automation_settings WHERE tenant_id = $1 FOR UPDATE",
+        [tenantId]
+      );
+      const last = cursor.rows[0]?.round_robin_last_user_id ?? null;
+      const lastIndex = last ? ids.indexOf(last) : -1;
+      // A departed/suspended cursor user is simply not found: restart at 0.
+      const next = ids[(lastIndex + 1) % ids.length]!;
+      await client.query("UPDATE automation_settings SET round_robin_last_user_id = $2 WHERE tenant_id = $1", [
+        tenantId,
+        next
+      ]);
+      return { id: next };
+    });
+  },
   async listMembers(tenantId: string, teamId: string): Promise<User[]> {
     return withTenant(tenantId, async (client) => {
       const result = await client.query<UserRow>(
@@ -400,6 +437,8 @@ interface AutomationSettingsRow {
   ooo_enabled: boolean;
   ooo_text: string | null;
   ooo_suppress_hours: number;
+  round_robin_enabled: boolean;
+  round_robin_team_id: string | null;
   updated_at: Date;
 }
 
@@ -413,12 +452,14 @@ function mapAutomationSettings(row: AutomationSettingsRow): AutomationSettings {
     oooEnabled: row.ooo_enabled,
     oooText: row.ooo_text ?? undefined,
     oooSuppressHours: row.ooo_suppress_hours,
+    roundRobinEnabled: row.round_robin_enabled,
+    roundRobinTeamId: row.round_robin_team_id ?? undefined,
     updatedAt: row.updated_at.toISOString()
   };
 }
 
 const AUTOMATION_SETTINGS_SELECT =
-  "SELECT tenant_id, timezone, working_hours, welcome_enabled, welcome_text, ooo_enabled, ooo_text, ooo_suppress_hours, updated_at FROM automation_settings";
+  "SELECT tenant_id, timezone, working_hours, welcome_enabled, welcome_text, ooo_enabled, ooo_text, ooo_suppress_hours, round_robin_enabled, round_robin_team_id, updated_at FROM automation_settings";
 
 export const automationSettingsRepository = {
   async get(tenantId: string): Promise<AutomationSettings | undefined> {
@@ -444,6 +485,8 @@ export const automationSettingsRepository = {
       oooEnabled?: boolean;
       oooText?: string | null;
       oooSuppressHours?: number;
+      roundRobinEnabled?: boolean;
+      roundRobinTeamId?: string | null;
     }
   ): Promise<AutomationSettings> {
     return withTenant(tenantId, async (client) => {
@@ -458,12 +501,15 @@ export const automationSettingsRepository = {
         welcomeText: patch.welcomeText !== undefined ? patch.welcomeText : (current?.welcome_text ?? null),
         oooEnabled: patch.oooEnabled ?? current?.ooo_enabled ?? false,
         oooText: patch.oooText !== undefined ? patch.oooText : (current?.ooo_text ?? null),
-        oooSuppressHours: patch.oooSuppressHours ?? current?.ooo_suppress_hours ?? 12
+        oooSuppressHours: patch.oooSuppressHours ?? current?.ooo_suppress_hours ?? 12,
+        roundRobinEnabled: patch.roundRobinEnabled ?? current?.round_robin_enabled ?? false,
+        roundRobinTeamId:
+          patch.roundRobinTeamId !== undefined ? patch.roundRobinTeamId : (current?.round_robin_team_id ?? null)
       };
       const result = await client.query<AutomationSettingsRow>(
         `INSERT INTO automation_settings
-           (tenant_id, timezone, working_hours, welcome_enabled, welcome_text, ooo_enabled, ooo_text, ooo_suppress_hours, updated_at)
-         VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, $8, now())
+           (tenant_id, timezone, working_hours, welcome_enabled, welcome_text, ooo_enabled, ooo_text, ooo_suppress_hours, round_robin_enabled, round_robin_team_id, updated_at)
+         VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, $8, $9, $10, now())
          ON CONFLICT (tenant_id) DO UPDATE SET
            timezone = EXCLUDED.timezone,
            working_hours = EXCLUDED.working_hours,
@@ -472,8 +518,10 @@ export const automationSettingsRepository = {
            ooo_enabled = EXCLUDED.ooo_enabled,
            ooo_text = EXCLUDED.ooo_text,
            ooo_suppress_hours = EXCLUDED.ooo_suppress_hours,
+           round_robin_enabled = EXCLUDED.round_robin_enabled,
+           round_robin_team_id = EXCLUDED.round_robin_team_id,
            updated_at = now()
-         RETURNING tenant_id, timezone, working_hours, welcome_enabled, welcome_text, ooo_enabled, ooo_text, ooo_suppress_hours, updated_at`,
+         RETURNING tenant_id, timezone, working_hours, welcome_enabled, welcome_text, ooo_enabled, ooo_text, ooo_suppress_hours, round_robin_enabled, round_robin_team_id, updated_at`,
         [
           tenantId,
           merged.timezone,
@@ -482,7 +530,9 @@ export const automationSettingsRepository = {
           merged.welcomeText,
           merged.oooEnabled,
           merged.oooText,
-          merged.oooSuppressHours
+          merged.oooSuppressHours,
+          merged.roundRobinEnabled,
+          merged.roundRobinTeamId
         ]
       );
       return mapAutomationSettings(result.rows[0]!);
