@@ -79,13 +79,23 @@ test("campaign funnel statuses + clicks drive segment resolution", { skip }, asy
   );
 
   const failedOnly = await resolve({ campaign: { id: campaign.id, statuses: ["failed"] } });
-  assert.deepEqual(failedOnly.map((c) => c.phoneE164), ["+15557770003"]);
+  assert.deepEqual(
+    failedOnly.map((c) => c.phoneE164),
+    ["+15557770003"]
+  );
 
   const clicked = await resolve({ campaign: { id: campaign.id, clicked: true } });
-  assert.deepEqual(clicked.map((c) => c.phoneE164), ["+15557770002"]);
+  assert.deepEqual(
+    clicked.map((c) => c.phoneE164),
+    ["+15557770002"]
+  );
 
   const ignoredLinks = await resolve({ campaign: { id: campaign.id, statuses: ["read"], clicked: false } });
-  assert.deepEqual(ignoredLinks.map((c) => c.phoneE164), [], "read AND unclicked excludes the clicker");
+  assert.deepEqual(
+    ignoredLinks.map((c) => c.phoneE164),
+    [],
+    "read AND unclicked excludes the clicker"
+  );
 
   // Count + sample agree with the resolver (shared builder — no drift).
   assert.equal(await segmentRepository.previewCount(tenant.id, { campaign: { id: campaign.id } }), 3);

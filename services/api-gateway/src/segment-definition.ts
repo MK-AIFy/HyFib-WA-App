@@ -27,7 +27,11 @@ export function validateSegmentDefinition(value: unknown): SegmentDefinitionResu
   }
   const result: Segment["definition"] = {};
   if (raw.tags !== undefined) {
-    if (!Array.isArray(raw.tags) || raw.tags.length > 50 || raw.tags.some((t) => typeof t !== "string" || t.length === 0 || t.length > 100)) {
+    if (
+      !Array.isArray(raw.tags) ||
+      raw.tags.length > 50 ||
+      raw.tags.some((t) => typeof t !== "string" || t.length === 0 || t.length > 100)
+    ) {
       return { ok: false, error: "tags must be an array of at most 50 non-empty strings (max 100 chars)" };
     }
     result.tags = raw.tags as string[];
