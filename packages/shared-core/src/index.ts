@@ -262,6 +262,8 @@ export interface WhatsAppSettings {
   id: string;
   tenantId: string;
   statusCallbackUrl?: string;
+  /** HMAC secret for outbound webhook signatures; stripped from API responses. */
+  statusCallbackSecret?: string;
   graphVersion: string;
   retryMaxAttempts: number;
   retryBaseDelayMs: number;
@@ -301,6 +303,20 @@ export interface Order {
   amountMinor: number;
   currency: string;
   status: "created" | "confirmed" | "paid" | "cancelled";
+  createdAt: string;
+}
+
+/** Public developer API key (Phase D). The full key is returned exactly once at creation. */
+export interface ApiKey {
+  id: string;
+  tenantId: string;
+  name: string;
+  /** Display prefix, e.g. "hyfib_ab12cd34". The full key is never stored. */
+  keyPrefix: string;
+  roles: Role[];
+  createdBy?: string;
+  lastUsedAt?: string;
+  revokedAt?: string;
   createdAt: string;
 }
 
