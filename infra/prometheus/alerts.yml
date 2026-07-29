@@ -1,0 +1,44 @@
+groups:
+  - name: hyfib-platform
+    rules:
+      # The app is one process; it being unscrapeable IS the outage.
+      - alert: AppServerDown
+        expr: up{job="app-server"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "app-server is not responding to metrics scrapes"
+          description: "The HyFib monolith has been unreachable for 2 minutes — the platform is down."
+
+      # The outbox relay is the durability backbone: sustained publish
+      # failures mean sends/webhooks/automations are silently queueing up.
+      - alert: OutboxPublishFailures
+        expr: increase(outbox_publish_failures_total[10m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Outbox relay is failing to publish events"
+          description: "outbox_publish_failures_total grew over the last 10 minutes; rows are retrying with backoff and may dead-letter. Check broker/bus health and /api/v1/admin/dead-letters."
+
+      # A rate-limit spike is either an integration gone rogue or an attack.
+      - alert: RateLimitSpike
+        expr: increase(rate_limited_total[5m]) > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 100 requests rate-limited in 5 minutes"
+          description: "A caller is hammering the API. Identify the subject via gateway logs (rate_limited events)."
+
+      # Message flow heartbeat: an active workspace that stops consuming
+      # events entirely for 30m during business operation deserves a look.
+      - alert: EventConsumptionStalled
+        expr: rate(events_consumed_total[30m]) == 0 and rate(events_published_total[30m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Events are being published but none are consumed"
+          description: "Publishers are active but consumers have processed nothing for 30 minutes — worker consumers may be wedged."
