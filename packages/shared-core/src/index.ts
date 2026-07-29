@@ -259,6 +259,19 @@ export interface ConversationNote {
   createdAt: string;
 }
 
+/** Default automations (G8): working hours, welcome message, out-of-office. */
+export interface AutomationSettings {
+  tenantId: string;
+  timezone: string;
+  workingHours: import("./working-hours.js").WorkingHours;
+  welcomeEnabled: boolean;
+  welcomeText?: string;
+  oooEnabled: boolean;
+  oooText?: string;
+  oooSuppressHours: number;
+  updatedAt: string;
+}
+
 export interface WhatsAppSettings {
   id: string;
   tenantId: string;

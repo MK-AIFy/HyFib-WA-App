@@ -7,6 +7,8 @@ import type {
   AutomationActionConfig,
   AutomationConditions,
   AutomationRule,
+  AutomationSettings,
+  WorkingHours,
   Campaign,
   CampaignRecipient,
   ContactNote,
@@ -388,6 +390,106 @@ function mapWhatsAppSettings(row: WhatsAppSettingsRow): WhatsAppSettings & { mon
     updatedAt: row.updated_at.toISOString()
   };
 }
+
+interface AutomationSettingsRow {
+  tenant_id: string;
+  timezone: string;
+  working_hours: WorkingHours;
+  welcome_enabled: boolean;
+  welcome_text: string | null;
+  ooo_enabled: boolean;
+  ooo_text: string | null;
+  ooo_suppress_hours: number;
+  updated_at: Date;
+}
+
+function mapAutomationSettings(row: AutomationSettingsRow): AutomationSettings {
+  return {
+    tenantId: row.tenant_id,
+    timezone: row.timezone,
+    workingHours: row.working_hours ?? {},
+    welcomeEnabled: row.welcome_enabled,
+    welcomeText: row.welcome_text ?? undefined,
+    oooEnabled: row.ooo_enabled,
+    oooText: row.ooo_text ?? undefined,
+    oooSuppressHours: row.ooo_suppress_hours,
+    updatedAt: row.updated_at.toISOString()
+  };
+}
+
+const AUTOMATION_SETTINGS_SELECT =
+  "SELECT tenant_id, timezone, working_hours, welcome_enabled, welcome_text, ooo_enabled, ooo_text, ooo_suppress_hours, updated_at FROM automation_settings";
+
+export const automationSettingsRepository = {
+  async get(tenantId: string): Promise<AutomationSettings | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<AutomationSettingsRow>(`${AUTOMATION_SETTINGS_SELECT} WHERE tenant_id = $1`, [
+        tenantId
+      ]);
+      return result.rows[0] ? mapAutomationSettings(result.rows[0]) : undefined;
+    });
+  },
+  /**
+   * Partial upsert: absent fields keep their stored (or default) values.
+   * Read-modify-write inside one tenant-scoped transaction — settings writes
+   * are rare and low-contention.
+   */
+  async upsert(
+    tenantId: string,
+    patch: {
+      timezone?: string;
+      workingHours?: WorkingHours;
+      welcomeEnabled?: boolean;
+      welcomeText?: string | null;
+      oooEnabled?: boolean;
+      oooText?: string | null;
+      oooSuppressHours?: number;
+    }
+  ): Promise<AutomationSettings> {
+    return withTenant(tenantId, async (client) => {
+      const existing = await client.query<AutomationSettingsRow>(
+        `${AUTOMATION_SETTINGS_SELECT} WHERE tenant_id = $1`,
+        [tenantId]
+      );
+      const current = existing.rows[0];
+      const merged = {
+        timezone: patch.timezone ?? current?.timezone ?? "UTC",
+        workingHours: patch.workingHours ?? current?.working_hours ?? {},
+        welcomeEnabled: patch.welcomeEnabled ?? current?.welcome_enabled ?? false,
+        welcomeText: patch.welcomeText !== undefined ? patch.welcomeText : (current?.welcome_text ?? null),
+        oooEnabled: patch.oooEnabled ?? current?.ooo_enabled ?? false,
+        oooText: patch.oooText !== undefined ? patch.oooText : (current?.ooo_text ?? null),
+        oooSuppressHours: patch.oooSuppressHours ?? current?.ooo_suppress_hours ?? 12
+      };
+      const result = await client.query<AutomationSettingsRow>(
+        `INSERT INTO automation_settings
+           (tenant_id, timezone, working_hours, welcome_enabled, welcome_text, ooo_enabled, ooo_text, ooo_suppress_hours, updated_at)
+         VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, $8, now())
+         ON CONFLICT (tenant_id) DO UPDATE SET
+           timezone = EXCLUDED.timezone,
+           working_hours = EXCLUDED.working_hours,
+           welcome_enabled = EXCLUDED.welcome_enabled,
+           welcome_text = EXCLUDED.welcome_text,
+           ooo_enabled = EXCLUDED.ooo_enabled,
+           ooo_text = EXCLUDED.ooo_text,
+           ooo_suppress_hours = EXCLUDED.ooo_suppress_hours,
+           updated_at = now()
+         RETURNING tenant_id, timezone, working_hours, welcome_enabled, welcome_text, ooo_enabled, ooo_text, ooo_suppress_hours, updated_at`,
+        [
+          tenantId,
+          merged.timezone,
+          JSON.stringify(merged.workingHours),
+          merged.welcomeEnabled,
+          merged.welcomeText,
+          merged.oooEnabled,
+          merged.oooText,
+          merged.oooSuppressHours
+        ]
+      );
+      return mapAutomationSettings(result.rows[0]!);
+    });
+  }
+};
 
 const WHATSAPP_SETTINGS_SELECT =
   "SELECT id, tenant_id, status_callback_url, graph_version, retry_max_attempts, retry_base_delay_ms, outbound_rate_limit_per_minute, monthly_message_quota, created_at, updated_at";
@@ -1871,6 +1973,23 @@ export const messageRepository = {
    * id). Used to resolve the message id a typing indicator must reference —
    * rides idx_messages_conversation_created (see 005_channel_credentials.sql).
    */
+  /**
+   * True when the conversation already had an inbound message BEFORE the one
+   * just persisted — i.e. false exactly for a contact's first message, which
+   * is what the welcome default-automation keys on.
+   */
+  async hasPriorInbound(tenantId: string, conversationId: string, excludeMessageId: string): Promise<boolean> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<{ exists: boolean }>(
+        `SELECT EXISTS (
+           SELECT 1 FROM messages
+           WHERE conversation_id = $1 AND direction = 'inbound' AND id <> $2
+         ) AS exists`,
+        [conversationId, excludeMessageId]
+      );
+      return result.rows[0]?.exists ?? false;
+    });
+  },
   async lastInboundExternalId(tenantId: string, conversationId: string): Promise<string | undefined> {
     return withTenant(tenantId, async (client) => {
       const result = await client.query<{ external_message_id: string | null }>(
