@@ -74,6 +74,7 @@ import {
   type Segment,
   type Template,
   type TemplateComponent,
+  type User,
   type VariableMapping,
   type WhatsAppContactCard,
   type WhatsAppInteractivePayload,
@@ -106,6 +107,14 @@ import {
 } from "./template-admin.js";
 
 export type { TemplateAdminOp, TemplateAdminProxy } from "./template-admin.js";
+import {
+  validateAutoReplyRulePatch,
+  validateAutomationRulePatch,
+  validateSegmentPatch,
+  validateContactPatch,
+  validateChannelPatch,
+  validateUserPatch
+} from "./entity-crud.js";
 import { SseHub } from "./sse-hub.js";
 import { parseCsv, serializeContactsCsv, extractMultipartFile } from "./csv.js";
 import { resolveOrgTenant } from "./single-org.js";
@@ -526,6 +535,7 @@ const VALID_ROLE_NAMES: ReadonlyArray<string> = [
   "analyst",
   "compliance_auditor"
 ];
+const VALID_ROLE_SET: ReadonlySet<string> = new Set(VALID_ROLE_NAMES);
 
 /** Returns the first path segment after `prefix`, or null when absent or empty. */
 function extractPathSegment(path: string, prefix: string): string | null {
@@ -1996,7 +2006,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
 
-  // PATCH /api/v1/users/:id — tenant_admin updates user status/roles
+  // PATCH /api/v1/users/:id — tenant_admin updates user status/roles (A5)
   if (path.match(/^\/api\/v1\/users\/[^/]+$/) && method === "PATCH") {
     if (!hasAnyRole(auth, ["platform_owner", "tenant_admin"])) {
       sendJson(res, 403, { error: "Insufficient role" });
@@ -2007,11 +2017,40 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 400, { error: "Invalid user id" });
       return;
     }
-    const body = await readJsonBody<{ status?: string }>(req);
-    if (body.status) {
-      await userRepository.updateStatus(tenantId, userId, body.status);
+    const body = await readJsonBody<Record<string, unknown>>(req);
+    const patch = validateUserPatch(body, VALID_ROLE_SET);
+    if (!patch.ok) {
+      sendJson(res, 400, { error: patch.error });
+      return;
     }
-    sendJson(res, 200, { status: "updated" });
+    // Editing your own roles is how an admin locks themselves (or everyone)
+    // out; require a second admin for role changes to self.
+    if (patch.value.roles && userId === auth.subject) {
+      sendJson(res, 403, { error: "cannot_change_own_roles" });
+      return;
+    }
+    const target = await userRepository.getById(tenantId, userId);
+    if (!target) {
+      sendJson(res, 404, { error: "User not found" });
+      return;
+    }
+    if (patch.value.status) {
+      await userRepository.updateStatus(tenantId, userId, patch.value.status);
+    }
+    let updated = patch.value.status ? { ...target, status: patch.value.status as User["status"] } : target;
+    if (patch.value.roles) {
+      const withRoles = await userRepository.updateRoles(tenantId, userId, patch.value.roles as Role[]);
+      if (withRoles) {
+        updated = { ...withRoles, status: updated.status };
+      }
+    }
+    await audit(tenantId, auth, {
+      action: "user.updated",
+      resourceType: "User",
+      resourceId: userId,
+      payload: { status: patch.value.status, roles: patch.value.roles }
+    });
+    sendJson(res, 200, { ...updated });
     return;
   }
 
@@ -2110,6 +2149,38 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       payload: { name: body.name }
     });
     sendJson(res, 200, updated as unknown as Record<string, unknown>);
+    return;
+  }
+
+  // DELETE /api/v1/teams/:id — members cascade; user/conversation assignments
+  // are ON DELETE SET NULL, so this cannot orphan history.
+  if (/^\/api\/v1\/teams\/[^/]+$/.test(path) && method === "DELETE") {
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin"])) {
+      sendJson(res, 403, { error: "Insufficient role to delete team" });
+      return;
+    }
+    const teamId = path.split("/").at(-1)!;
+    if (!UUID.test(teamId)) {
+      sendJson(res, 400, { error: "Invalid team id" });
+      return;
+    }
+    const team = await teamRepository.getById(tenantId, teamId);
+    if (!team) {
+      sendJson(res, 404, { error: "Team not found" });
+      return;
+    }
+    if (team.isDefault) {
+      sendJson(res, 409, { error: "default_team_undeletable", detail: "Assign another default team first" });
+      return;
+    }
+    await teamRepository.delete(tenantId, teamId);
+    await audit(tenantId, auth, {
+      action: "team.deleted",
+      resourceType: "Team",
+      resourceId: teamId,
+      payload: { name: team.name }
+    });
+    sendJson(res, 200, { status: "deleted", teamId });
     return;
   }
 
@@ -2213,6 +2284,54 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return;
     }
     sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+
+  // PATCH /api/v1/channels/whatsapp/:id — display number, active flag, token
+  // rotation/clearing. There is deliberately no DELETE: conversations and
+  // messages reference the channel, so retirement is isActive=false.
+  if (path.startsWith("/api/v1/channels/whatsapp/") && method === "PATCH") {
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin"])) {
+      sendJson(res, 403, { error: "Only platform_owner/tenant_admin can update channels" });
+      return;
+    }
+    const channelId = extractPathSegment(path, "/api/v1/channels/whatsapp/");
+    if (!channelId || !UUID.test(channelId) || path !== `/api/v1/channels/whatsapp/${channelId}`) {
+      sendJson(res, 400, { error: "Invalid channel id" });
+      return;
+    }
+    const patch = validateChannelPatch(await readJsonBody<Record<string, unknown>>(req));
+    if (!patch.ok) {
+      sendJson(res, 400, { error: patch.error });
+      return;
+    }
+    let channel;
+    try {
+      channel = await channelRepository.update(tenantId, channelId, patch.value);
+    } catch (error) {
+      // encryptChannelToken throws when CHANNEL_ENCRYPTION_KEY is unset.
+      sendJson(res, 422, {
+        error: "channel_update_failed",
+        detail: error instanceof Error ? error.message : "failed"
+      });
+      return;
+    }
+    if (!channel) {
+      sendJson(res, 404, { error: "Channel not found" });
+      return;
+    }
+    await audit(tenantId, auth, {
+      action: "channel.updated",
+      resourceType: "WhatsAppChannel",
+      resourceId: channelId,
+      payload: {
+        displayPhoneNumber: patch.value.displayPhoneNumber,
+        isActive: patch.value.isActive,
+        tokenRotated: typeof patch.value.accessToken === "string",
+        tokenCleared: patch.value.accessToken === null
+      }
+    });
+    sendJson(res, 200, { ...channel });
     return;
   }
 
@@ -2697,6 +2816,66 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
 
+  // PATCH/DELETE /api/v1/segments/:id
+  if (path.startsWith("/api/v1/segments/") && (method === "PATCH" || method === "DELETE")) {
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager"])) {
+      sendJson(res, 403, { error: "Insufficient role to modify segments" });
+      return;
+    }
+    const segmentId = extractPathSegment(path, "/api/v1/segments/");
+    if (!segmentId || !UUID.test(segmentId) || path !== `/api/v1/segments/${segmentId}`) {
+      sendJson(res, 400, { error: "Invalid segment id" });
+      return;
+    }
+    if (method === "PATCH") {
+      const patch = validateSegmentPatch(await readJsonBody<Record<string, unknown>>(req));
+      if (!patch.ok) {
+        sendJson(res, 400, { error: patch.error });
+        return;
+      }
+      const segment = await segmentRepository.update(tenantId, segmentId, {
+        name: patch.value.name,
+        definition: patch.value.definition as Segment["definition"] | undefined
+      });
+      if (!segment) {
+        sendJson(res, 404, { error: "Segment not found" });
+        return;
+      }
+      await audit(tenantId, auth, {
+        action: "segment.updated",
+        resourceType: "Segment",
+        resourceId: segmentId,
+        payload: { fields: Object.keys(patch.value) }
+      });
+      sendJson(res, 200, { ...segment });
+      return;
+    }
+    try {
+      const deleted = await segmentRepository.delete(tenantId, segmentId);
+      if (!deleted) {
+        sendJson(res, 404, { error: "Segment not found" });
+        return;
+      }
+    } catch (error) {
+      if ((error as { code?: string }).code === "23503") {
+        sendJson(res, 409, {
+          error: "segment_in_use",
+          detail: "One or more campaigns reference this segment; delete them first"
+        });
+        return;
+      }
+      throw error;
+    }
+    await audit(tenantId, auth, {
+      action: "segment.deleted",
+      resourceType: "Segment",
+      resourceId: segmentId,
+      payload: {}
+    });
+    sendJson(res, 200, { status: "deleted", segmentId });
+    return;
+  }
+
   // ─── Contacts ─────────────────────────────────────────────────────────────
   if (path === "/api/v1/contacts") {
     if (method === "GET") {
@@ -3058,6 +3237,71 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return;
     }
     sendJson(res, 200, { ...contact });
+    return;
+  }
+
+  // PATCH /api/v1/contacts/:id — profile fields only; tags/opt-out/custom
+  // fields keep their dedicated endpoints. Subroutes (/fields, /tags, …)
+  // are matched earlier in the chain; the exact-path guard keeps this narrow.
+  if (path.startsWith("/api/v1/contacts/") && (method === "PATCH" || method === "DELETE")) {
+    const contactId = extractPathSegment(path, "/api/v1/contacts/");
+    if (!contactId || !UUID.test(contactId) || path !== `/api/v1/contacts/${contactId}`) {
+      sendJson(res, 400, { error: "Invalid contact id" });
+      return;
+    }
+    if (method === "PATCH") {
+      if (!canCreateContact(auth)) {
+        sendJson(res, 403, { error: "Insufficient role to update contacts" });
+        return;
+      }
+      const patch = validateContactPatch(await readJsonBody<Record<string, unknown>>(req));
+      if (!patch.ok) {
+        sendJson(res, 400, { error: patch.error });
+        return;
+      }
+      const contact = await contactRepository.update(tenantId, contactId, patch.value);
+      if (!contact) {
+        sendJson(res, 404, { error: "Contact not found" });
+        return;
+      }
+      await audit(tenantId, auth, {
+        action: "contact.updated",
+        resourceType: "Contact",
+        resourceId: contactId,
+        payload: { fields: Object.keys(patch.value) }
+      });
+      sendJson(res, 200, { ...contact });
+      return;
+    }
+    // DELETE is admin-only: irreversible, and consent/tag/note/recipient rows
+    // cascade away with the contact.
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin"])) {
+      sendJson(res, 403, { error: "Only platform_owner/tenant_admin can delete contacts" });
+      return;
+    }
+    try {
+      const deleted = await contactRepository.delete(tenantId, contactId);
+      if (!deleted) {
+        sendJson(res, 404, { error: "Contact not found" });
+        return;
+      }
+    } catch (error) {
+      if ((error as { code?: string }).code === "23503") {
+        sendJson(res, 409, {
+          error: "contact_has_history",
+          detail: "Contact has conversations, messages or orders; history must be retained"
+        });
+        return;
+      }
+      throw error;
+    }
+    await audit(tenantId, auth, {
+      action: "contact.deleted",
+      resourceType: "Contact",
+      resourceId: contactId,
+      payload: {}
+    });
+    sendJson(res, 200, { status: "deleted", contactId });
     return;
   }
 
@@ -3776,7 +4020,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
 
-  if (path.startsWith("/api/v1/auto-reply-rules/") && method === "PATCH") {
+  if (path.startsWith("/api/v1/auto-reply-rules/") && (method === "PATCH" || method === "DELETE")) {
     const ruleId = extractPathSegment(path, "/api/v1/auto-reply-rules/");
     if (!ruleId || !UUID.test(ruleId)) {
       sendJson(res, 400, { error: "Invalid rule id" });
@@ -3786,13 +4030,39 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 403, { error: "Insufficient role" });
       return;
     }
-    const body = await readJsonBody<{ enabled: boolean }>(req);
-    if (typeof body.enabled !== "boolean") {
-      sendJson(res, 400, { error: "enabled must be a boolean" });
+    if (method === "DELETE") {
+      const deleted = await autoReplyRuleRepository.delete(tenantId, ruleId);
+      if (!deleted) {
+        sendJson(res, 404, { error: "Rule not found" });
+        return;
+      }
+      await audit(tenantId, auth, {
+        action: "auto_reply_rule.deleted",
+        resourceType: "AutoReplyRule",
+        resourceId: ruleId,
+        payload: {}
+      });
+      sendJson(res, 200, { status: "deleted", ruleId });
       return;
     }
-    await autoReplyRuleRepository.setEnabled(tenantId, ruleId, body.enabled);
-    sendJson(res, 200, { status: "updated", ruleId, enabled: body.enabled });
+    const existing = await autoReplyRuleRepository.getById(tenantId, ruleId);
+    if (!existing) {
+      sendJson(res, 404, { error: "Rule not found" });
+      return;
+    }
+    const patch = validateAutoReplyRulePatch(await readJsonBody<Record<string, unknown>>(req), existing);
+    if (!patch.ok) {
+      sendJson(res, 400, { error: patch.error });
+      return;
+    }
+    const rule = await autoReplyRuleRepository.update(tenantId, ruleId, patch.value);
+    await audit(tenantId, auth, {
+      action: "auto_reply_rule.updated",
+      resourceType: "AutoReplyRule",
+      resourceId: ruleId,
+      payload: { fields: Object.keys(patch.value) }
+    });
+    sendJson(res, 200, { ...rule });
     return;
   }
 
@@ -3902,7 +4172,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
 
-  if (path.startsWith("/api/v1/automation-rules/") && method === "PATCH") {
+  if (path.startsWith("/api/v1/automation-rules/") && (method === "PATCH" || method === "DELETE")) {
     const ruleId = extractPathSegment(path, "/api/v1/automation-rules/");
     if (!ruleId || !UUID.test(ruleId)) {
       sendJson(res, 400, { error: "Invalid rule id" });
@@ -3912,13 +4182,50 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 403, { error: "Insufficient role" });
       return;
     }
-    const body = await readJsonBody<{ enabled: boolean }>(req);
-    if (typeof body.enabled !== "boolean") {
-      sendJson(res, 400, { error: "enabled must be a boolean" });
+    if (method === "DELETE") {
+      const deleted = await automationRuleRepository.delete(tenantId, ruleId);
+      if (!deleted) {
+        sendJson(res, 404, { error: "Rule not found" });
+        return;
+      }
+      await audit(tenantId, auth, {
+        action: "automation.rule.deleted",
+        resourceType: "AutomationRule",
+        resourceId: ruleId,
+        payload: {}
+      });
+      sendJson(res, 200, { status: "deleted", ruleId });
       return;
     }
-    await automationRuleRepository.setEnabled(tenantId, ruleId, body.enabled);
-    sendJson(res, 200, { status: "updated", ruleId, enabled: body.enabled });
+    const existing = await automationRuleRepository.getById(tenantId, ruleId);
+    if (!existing) {
+      sendJson(res, 404, { error: "Rule not found" });
+      return;
+    }
+    const patch = validateAutomationRulePatch(await readJsonBody<Record<string, unknown>>(req), existing);
+    if (!patch.ok) {
+      sendJson(res, 400, { error: patch.error });
+      return;
+    }
+    // The validator proved the merged assignee is a plausible id; confirm it
+    // actually belongs to this tenant before persisting.
+    const mergedActionType = patch.value.actionType ?? existing.actionType;
+    const mergedConfig = patch.value.actionConfig ?? existing.actionConfig ?? {};
+    if (mergedActionType === "assign_agent") {
+      const assignee = (mergedConfig as { assigneeUserId?: string }).assigneeUserId;
+      if (!assignee || !(await userRepository.getById(tenantId, assignee))) {
+        sendJson(res, 422, { error: "actionConfig.assigneeUserId does not belong to this tenant" });
+        return;
+      }
+    }
+    const rule = await automationRuleRepository.update(tenantId, ruleId, patch.value);
+    await audit(tenantId, auth, {
+      action: "automation.rule.updated",
+      resourceType: "AutomationRule",
+      resourceId: ruleId,
+      payload: { fields: Object.keys(patch.value) }
+    });
+    sendJson(res, 200, { ...rule });
     return;
   }
 
