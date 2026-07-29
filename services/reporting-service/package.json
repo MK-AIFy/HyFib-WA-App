@@ -15,5 +15,8 @@
     "@hyfib/config": "workspace:*",
     "@hyfib/db": "workspace:*",
     "@hyfib/shared-core": "workspace:*"
+  },
+  "devDependencies": {
+    "@hyfib/persistence": "workspace:*"
   }
 }

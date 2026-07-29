@@ -320,6 +320,30 @@ async function defaultReportsOverviewProxy(
   return { status: upstream.ok ? 200 : upstream.status, body };
 }
 
+export type AgentReportsProxy = (
+  ctx: ServiceProxyContext,
+  days: string
+) => Promise<{ status: number; body: Record<string, unknown> }>;
+
+async function defaultAgentReportsProxy(
+  ctx: ServiceProxyContext,
+  days: string
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const upstream = await fetch(
+    `${config.reportingServiceUrl}/internal/v1/reports/agents?days=${encodeURIComponent(days)}`,
+    {
+      headers: {
+        "x-tenant-id": ctx.tenantId,
+        "x-request-id": ctx.requestId,
+        "x-internal-secret": config.internalServiceSecret
+      },
+      signal: AbortSignal.timeout(10_000)
+    }
+  );
+  const body = (await upstream.json()) as Record<string, unknown>;
+  return { status: upstream.ok ? 200 : upstream.status, body };
+}
+
 async function defaultUsageProxy(
   ctx: ServiceProxyContext,
   days: string
@@ -358,6 +382,7 @@ async function defaultAiProxy(
 }
 
 let reportsOverviewProxy: ReportsOverviewProxy = defaultReportsOverviewProxy;
+let agentReportsProxy: AgentReportsProxy = defaultAgentReportsProxy;
 let usageProxy: UsageProxy = defaultUsageProxy;
 let aiProxy: AiProxy = defaultAiProxy;
 
@@ -3151,7 +3176,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 400, { error: "state must be open, pending, or closed" });
       return;
     }
-    await conversationRepository.setState(tenantId, conversationId, body.state);
+    await conversationRepository.setState(tenantId, conversationId, body.state, asActorUuid(auth.subject));
     sseHub.broadcast(tenantId, "conversation.state_changed", randomUUID(), { conversationId, state: body.state });
     sendJson(res, 200, { status: "updated", conversationId, state: body.state });
     return;
@@ -3803,6 +3828,18 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
 
+  // Agent performance (G11): FRT, resolution time, solved counts per agent.
+  if (path === "/api/v1/reports/agents" && method === "GET") {
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager", "analyst"])) {
+      sendJson(res, 403, { error: "Insufficient role to view agent reports" });
+      return;
+    }
+    const days = parseQuery(req.url).get("days") ?? "30";
+    const { status, body } = await agentReportsProxy({ tenantId, requestId: ctx.requestId }, days);
+    sendJson(res, status, body);
+    return;
+  }
+
   // ─── Billing / usage proxy ────────────────────────────────────────────────
   if (path === "/api/v1/usage" && method === "GET") {
     const days = parseQuery(req.url).get("days") ?? "7";
@@ -3844,6 +3881,8 @@ export interface GatewayDeps {
   proxyWebhookToIngestor?: IngestWebhookProxy;
   /** Direct in-process reports/overview (Phase 8). */
   proxyReportsOverview?: ReportsOverviewProxy;
+  /** Direct in-process agent performance reports (G11). */
+  proxyAgentReports?: AgentReportsProxy;
   /** Direct in-process usage (Phase 7). */
   proxyUsage?: UsageProxy;
   /** Direct in-process AI intelligence (Phase 6). */
@@ -3878,6 +3917,7 @@ export function createGatewayHandler(deps: GatewayDeps = {}): GatewayModule {
   if (deps.proxyReportsOverview) {
     reportsOverviewProxy = deps.proxyReportsOverview;
   }
+  agentReportsProxy = deps.proxyAgentReports ?? defaultAgentReportsProxy;
   if (deps.proxyUsage) {
     usageProxy = deps.proxyUsage;
   }

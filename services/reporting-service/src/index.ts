@@ -67,6 +67,94 @@ export async function getReportsOverview(tenantId: string): Promise<Record<strin
   return { tenantId, ...data };
 }
 
+interface MetricRow {
+  user_id: string;
+  n: string;
+  avg_minutes: string | null;
+}
+
+/**
+ * Per-agent performance (roadmap G11): messages sent, conversations closed +
+ * average resolution time, and first-response counts/times. Attribution comes
+ * from messages.sender_user_id (stamped on human conversation sends, absent on
+ * automations) and conversations.closed_at/closed_by_user_id (migration 028).
+ * Every active user appears, zero-filled, so an idle agent is visible rather
+ * than missing. Exported so app-server calls it in-process.
+ */
+export async function getAgentPerformance(tenantId: string, days: number): Promise<Record<string, unknown>> {
+  const clamped = Math.min(Math.max(Math.trunc(days) || 30, 1), 90);
+  const data = await withTenant(tenantId, async (tx) => {
+    const sent = await tx.query<MetricRow>(
+      `SELECT sender_user_id AS user_id, COUNT(*)::text AS n, NULL AS avg_minutes
+         FROM messages
+        WHERE direction = 'outbound' AND sender_user_id IS NOT NULL
+          AND created_at >= now() - ($1 || ' days')::interval
+        GROUP BY 1`,
+      [String(clamped)]
+    );
+    const closed = await tx.query<MetricRow>(
+      `SELECT closed_by_user_id AS user_id, COUNT(*)::text AS n,
+              avg(EXTRACT(EPOCH FROM (closed_at - created_at)) / 60)::text AS avg_minutes
+         FROM conversations
+        WHERE closed_by_user_id IS NOT NULL
+          AND closed_at >= now() - ($1 || ' days')::interval
+        GROUP BY 1`,
+      [String(clamped)]
+    );
+    // First response: per conversation, the earliest attributed outbound after
+    // the earliest inbound; credited to the agent who sent it.
+    const frt = await tx.query<MetricRow>(
+      `WITH firsts AS (
+         SELECT conversation_id,
+                MIN(created_at) FILTER (WHERE direction = 'inbound') AS first_in,
+                MIN(created_at) FILTER (WHERE direction = 'outbound' AND sender_user_id IS NOT NULL) AS first_out
+           FROM messages
+          WHERE created_at >= now() - ($1 || ' days')::interval
+          GROUP BY conversation_id
+       )
+       SELECT m.sender_user_id AS user_id, COUNT(*)::text AS n,
+              avg(EXTRACT(EPOCH FROM (f.first_out - f.first_in)) / 60)::text AS avg_minutes
+         FROM firsts f
+         JOIN messages m
+           ON m.conversation_id = f.conversation_id
+          AND m.created_at = f.first_out
+          AND m.direction = 'outbound'
+          AND m.sender_user_id IS NOT NULL
+        WHERE f.first_in IS NOT NULL AND f.first_out > f.first_in
+        GROUP BY 1`,
+      [String(clamped)]
+    );
+    const users = await tx.query<{ id: string; display_name: string }>(
+      "SELECT id, display_name FROM users WHERE status = 'active' ORDER BY display_name ASC"
+    );
+
+    const index = (rows: MetricRow[]): Map<string, { n: number; avg: number | null }> => {
+      const map = new Map<string, { n: number; avg: number | null }>();
+      for (const row of rows) {
+        map.set(row.user_id, { n: Number(row.n), avg: row.avg_minutes === null ? null : Number(row.avg_minutes) });
+      }
+      return map;
+    };
+    const sentBy = index(sent);
+    const closedBy = index(closed);
+    const frtBy = index(frt);
+
+    const round = (value: number | null | undefined): number | null =>
+      value === null || value === undefined ? null : Math.round(value * 10) / 10;
+
+    return users.map((user) => ({
+      userId: user.id,
+      displayName: user.display_name,
+      messagesSent: sentBy.get(user.id)?.n ?? 0,
+      conversationsClosed: closedBy.get(user.id)?.n ?? 0,
+      avgResolutionMinutes: round(closedBy.get(user.id)?.avg),
+      firstResponses: frtBy.get(user.id)?.n ?? 0,
+      avgFirstResponseMinutes: round(frtBy.get(user.id)?.avg)
+    }));
+  });
+  return { tenantId, days: clamped, agents: data };
+}
+
 const server = createServer(async (req, res) => {
   try {
     const path = parseUrlPath(req.url);
@@ -94,6 +182,16 @@ const server = createServer(async (req, res) => {
         return;
       }
       sendJson(res, 200, await getReportsOverview(tenantId));
+      return;
+    }
+
+    if (path === "/internal/v1/reports/agents") {
+      if (!tenantId) {
+        sendJson(res, 400, { error: "x-tenant-id required" });
+        return;
+      }
+      const days = Number(new URL(req.url ?? "/", "http://local").searchParams.get("days") ?? "30");
+      sendJson(res, 200, await getAgentPerformance(tenantId, days));
       return;
     }
 
