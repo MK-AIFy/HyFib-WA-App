@@ -362,3 +362,36 @@ export function extractTemplateBody(components: unknown): string {
   }
   return "";
 }
+
+export interface TemplateCreateInput {
+  name: string;
+  language: string;
+  category: string;
+  bodyText: string;
+}
+
+/**
+ * Graph body for POST /{wabaId}/message_templates. Body-only components —
+ * matches the extractTemplateBody model used on sync pulls; header/footer/
+ * button components are a later iteration.
+ */
+export function buildTemplateCreateBody(input: TemplateCreateInput): Record<string, unknown> {
+  return {
+    name: input.name,
+    language: input.language,
+    category: input.category.toUpperCase(),
+    components: [{ type: "BODY", text: input.bodyText }]
+  };
+}
+
+/** Graph body for POST /{templateId} (template edit) — only provided fields. */
+export function buildTemplateEditBody(input: { category?: string; bodyText?: string }): Record<string, unknown> {
+  const body: Record<string, unknown> = {};
+  if (input.category !== undefined) {
+    body.category = input.category.toUpperCase();
+  }
+  if (input.bodyText !== undefined) {
+    body.components = [{ type: "BODY", text: input.bodyText }];
+  }
+  return body;
+}

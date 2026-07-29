@@ -12,6 +12,8 @@ import {
   buildMediaUploadForm,
   mapMetaTemplateStatus,
   extractTemplateBody,
+  buildTemplateCreateBody,
+  buildTemplateEditBody,
   buildProductMessage,
   buildCatalogMessage,
   buildFlowMessage
@@ -292,4 +294,30 @@ test("buildFlowMessage includes draft mode when specified", () => {
     mode: "draft"
   });
   assert.equal(body.interactive.action.parameters.mode, "draft");
+});
+
+test("buildTemplateCreateBody uppercases the category and wraps bodyText in a BODY component", () => {
+  const body = buildTemplateCreateBody({
+    name: "promo_july",
+    language: "en_US",
+    category: "marketing",
+    bodyText: "Hello {{1}}"
+  });
+  assert.deepEqual(body, {
+    name: "promo_july",
+    language: "en_US",
+    category: "MARKETING",
+    components: [{ type: "BODY", text: "Hello {{1}}" }]
+  });
+});
+
+test("buildTemplateEditBody emits only the provided fields", () => {
+  assert.deepEqual(buildTemplateEditBody({ category: "utility" }), { category: "UTILITY" });
+  assert.deepEqual(buildTemplateEditBody({ bodyText: "Hi" }), {
+    components: [{ type: "BODY", text: "Hi" }]
+  });
+  assert.deepEqual(buildTemplateEditBody({ category: "marketing", bodyText: "Yo" }), {
+    category: "MARKETING",
+    components: [{ type: "BODY", text: "Yo" }]
+  });
 });

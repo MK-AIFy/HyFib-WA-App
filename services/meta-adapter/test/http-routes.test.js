@@ -111,3 +111,24 @@ test("media upload over the 16MB cap receives a delivered 413 with maxBytes (soc
   assert.equal(body.error, "media_too_large");
   assert.equal(body.maxBytes, 16 * 1024 * 1024);
 });
+
+// Template-admin routes (roadmap A3). Same registration proof as the send-*
+// routes: an empty body must hit the route's own validation (400), never 404.
+
+test("template submit (POST /templates) is registered and validates required fields (400, not 404)", async () => {
+  const res = await post("/internal/v1/whatsapp/templates", {});
+  assert.equal(res.status, 400);
+  assert.match(res.body.error, /wabaId|name/);
+});
+
+test("template edit is registered and validates required fields (400, not 404)", async () => {
+  const res = await post("/internal/v1/whatsapp/templates/edit", {});
+  assert.equal(res.status, 400);
+  assert.match(res.body.error, /metaTemplateId/);
+});
+
+test("template delete is registered and validates required fields (400, not 404)", async () => {
+  const res = await post("/internal/v1/whatsapp/templates/delete", {});
+  assert.equal(res.status, 400);
+  assert.match(res.body.error, /wabaId|name/);
+});

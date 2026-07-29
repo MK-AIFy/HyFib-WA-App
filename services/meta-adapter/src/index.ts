@@ -35,6 +35,8 @@ import {
   buildMediaUploadForm,
   buildProductMessage,
   buildTemplateBody,
+  buildTemplateCreateBody,
+  buildTemplateEditBody,
   buildTextBody,
   buildTypingIndicatorBody,
   extractTemplateBody,
@@ -88,7 +90,7 @@ function backoffDelay(attempt: number, retryAfterHeader: string | null): number 
 
 async function rawGraphRequest(
   path: string,
-  method: "GET" | "POST",
+  method: "GET" | "POST" | "DELETE",
   body?: Record<string, unknown> | FormData,
   accessToken?: string
 ): Promise<Response> {
@@ -120,7 +122,7 @@ async function rawGraphRequest(
  */
 async function graphRequest(
   path: string,
-  method: "GET" | "POST",
+  method: "GET" | "POST" | "DELETE",
   body?: Record<string, unknown> | FormData,
   accessToken?: string
 ): Promise<Response> {
@@ -309,6 +311,130 @@ export async function sendTypingIndicatorDirect(
       return { status: 502, body: { error: "meta_typing_indicator_failed", details: graphError } };
     }
     return { status: 200, body: { status: "typing_indicator_sent", messageId: payload.messageId } };
+  } catch (error) {
+    return {
+      status: 503,
+      body: { error: "meta_adapter_unavailable", details: error instanceof Error ? error.message : String(error) }
+    };
+  }
+}
+
+export interface TemplateSubmitRequest {
+  wabaId: string;
+  accessToken?: string;
+  name: string;
+  language: string;
+  category: string;
+  bodyText: string;
+}
+
+/**
+ * Direct in-process template submission to Meta review (roadmap A3). Mirrors
+ * `POST /internal/v1/whatsapp/templates`; the gateway proxy calls this in the
+ * monolith instead of an HTTP hop. Success returns the Graph template id and
+ * the mapped review status (normally "pending").
+ */
+export async function submitTemplateDirect(
+  payload: TemplateSubmitRequest,
+  _requestId: string
+): Promise<MetaDispatchResult> {
+  if (!payload.wabaId || !payload.name || !payload.language || !payload.category || !payload.bodyText) {
+    return { status: 400, body: { error: "wabaId, name, language, category and bodyText are required" } };
+  }
+  try {
+    const response = await graphRequest(
+      `/${payload.wabaId}/message_templates`,
+      "POST",
+      buildTemplateCreateBody(payload),
+      payload.accessToken
+    );
+    if (!response.ok) {
+      const graphError = await parseGraphError(response);
+      return { status: 502, body: { error: "meta_template_submit_failed", details: graphError } };
+    }
+    const body = (await response.json()) as { id?: string; status?: string };
+    return { status: 200, body: { id: body.id ?? null, status: mapMetaTemplateStatus(body.status) } };
+  } catch (error) {
+    return {
+      status: 503,
+      body: { error: "meta_adapter_unavailable", details: error instanceof Error ? error.message : String(error) }
+    };
+  }
+}
+
+export interface TemplateEditRequest {
+  metaTemplateId: string;
+  accessToken?: string;
+  category?: string;
+  bodyText?: string;
+}
+
+/**
+ * Direct in-process template edit on Meta (POST /{templateId}). Meta re-reviews
+ * every edit, so callers reset local status to pending on success.
+ */
+export async function editTemplateDirect(payload: TemplateEditRequest, _requestId: string): Promise<MetaDispatchResult> {
+  if (!payload.metaTemplateId) {
+    return { status: 400, body: { error: "metaTemplateId is required" } };
+  }
+  if (payload.category === undefined && payload.bodyText === undefined) {
+    return { status: 400, body: { error: "at least one of category or bodyText is required" } };
+  }
+  try {
+    const response = await graphRequest(
+      `/${payload.metaTemplateId}`,
+      "POST",
+      buildTemplateEditBody(payload),
+      payload.accessToken
+    );
+    if (!response.ok) {
+      const graphError = await parseGraphError(response);
+      return { status: 502, body: { error: "meta_template_edit_failed", details: graphError } };
+    }
+    return { status: 200, body: { status: "updated" } };
+  } catch (error) {
+    return {
+      status: 503,
+      body: { error: "meta_adapter_unavailable", details: error instanceof Error ? error.message : String(error) }
+    };
+  }
+}
+
+export interface TemplateDeleteRequest {
+  wabaId: string;
+  accessToken?: string;
+  name: string;
+  metaTemplateId?: string;
+}
+
+/**
+ * Direct in-process template delete on Meta. With metaTemplateId (hsm_id) the
+ * delete targets one template; name-only deletes every language of that name —
+ * Meta's own API semantics.
+ */
+export async function deleteTemplateDirect(
+  payload: TemplateDeleteRequest,
+  _requestId: string
+): Promise<MetaDispatchResult> {
+  if (!payload.wabaId || !payload.name) {
+    return { status: 400, body: { error: "wabaId and name are required" } };
+  }
+  try {
+    const params = new URLSearchParams({ name: payload.name });
+    if (payload.metaTemplateId) {
+      params.set("hsm_id", payload.metaTemplateId);
+    }
+    const response = await graphRequest(
+      `/${payload.wabaId}/message_templates?${params.toString()}`,
+      "DELETE",
+      undefined,
+      payload.accessToken
+    );
+    if (!response.ok) {
+      const graphError = await parseGraphError(response);
+      return { status: 502, body: { error: "meta_template_delete_failed", details: graphError } };
+    }
+    return { status: 200, body: { status: "deleted" } };
   } catch (error) {
     return {
       status: 503,
@@ -1187,17 +1313,27 @@ export const server = createServer(async (req, res) => {
     }
 
     if (path === "/internal/v1/whatsapp/templates") {
+      const tokenHeader = req.headers["x-access-token"];
+      const accessToken =
+        (typeof tokenHeader === "string" && tokenHeader.length > 0 ? tokenHeader : undefined) ??
+        config.whatsappAccessToken ??
+        undefined;
+      if (method === "POST") {
+        // Submit a locally drafted template to Meta review (roadmap A3).
+        const payload = await readJsonBody<TemplateSubmitRequest>(req);
+        const { status, body } = await submitTemplateDirect(
+          { ...payload, wabaId: payload.wabaId || (config.whatsappWabaId ?? ""), accessToken },
+          ctx.requestId
+        );
+        sendJson(res, status, body);
+        return;
+      }
       if (method !== "GET") {
         methodNotAllowed(res);
         return;
       }
       const query = parseQuery(req.url);
       const wabaId = query.get("wabaId") ?? config.whatsappWabaId;
-      const tokenHeader = req.headers["x-access-token"];
-      const accessToken =
-        (typeof tokenHeader === "string" && tokenHeader.length > 0 ? tokenHeader : undefined) ??
-        config.whatsappAccessToken ??
-        undefined;
       if (!wabaId) {
         sendJson(res, 400, { error: "wabaId is required" });
         return;
@@ -1209,7 +1345,7 @@ export const server = createServer(async (req, res) => {
       }
       try {
         const response = await graphRequest(
-          `/${wabaId}/message_templates?limit=200&fields=name,language,status,category,components`,
+          `/${wabaId}/message_templates?limit=200&fields=id,name,language,status,category,components`,
           "GET",
           undefined,
           accessToken
@@ -1220,7 +1356,14 @@ export const server = createServer(async (req, res) => {
           return;
         }
         const body = (await response.json()) as {
-          data?: Array<{ name?: string; language?: string; status?: string; category?: string; components?: unknown }>;
+          data?: Array<{
+            id?: string;
+            name?: string;
+            language?: string;
+            status?: string;
+            category?: string;
+            components?: unknown;
+          }>;
         };
         const templates: MetaTemplateSummary[] = (body.data ?? [])
           .filter((entry) => entry.name && entry.language)
@@ -1229,7 +1372,8 @@ export const server = createServer(async (req, res) => {
             language: entry.language!,
             status: mapMetaTemplateStatus(entry.status),
             category: entry.category ? entry.category.toLowerCase() : undefined,
-            body: extractTemplateBody(entry.components)
+            body: extractTemplateBody(entry.components),
+            metaTemplateId: entry.id
           }));
         sendJson(res, 200, { items: templates });
       } catch (error) {
@@ -1238,6 +1382,41 @@ export const server = createServer(async (req, res) => {
           details: error instanceof Error ? error.message : String(error)
         });
       }
+      return;
+    }
+
+    if (path === "/internal/v1/whatsapp/templates/edit") {
+      if (method !== "POST") {
+        methodNotAllowed(res);
+        return;
+      }
+      const tokenHeader = req.headers["x-access-token"];
+      const accessToken =
+        (typeof tokenHeader === "string" && tokenHeader.length > 0 ? tokenHeader : undefined) ??
+        config.whatsappAccessToken ??
+        undefined;
+      const payload = await readJsonBody<TemplateEditRequest>(req);
+      const { status, body } = await editTemplateDirect({ ...payload, accessToken }, ctx.requestId);
+      sendJson(res, status, body);
+      return;
+    }
+
+    if (path === "/internal/v1/whatsapp/templates/delete") {
+      if (method !== "POST") {
+        methodNotAllowed(res);
+        return;
+      }
+      const tokenHeader = req.headers["x-access-token"];
+      const accessToken =
+        (typeof tokenHeader === "string" && tokenHeader.length > 0 ? tokenHeader : undefined) ??
+        config.whatsappAccessToken ??
+        undefined;
+      const payload = await readJsonBody<TemplateDeleteRequest>(req);
+      const { status, body } = await deleteTemplateDirect(
+        { ...payload, wabaId: payload.wabaId || (config.whatsappWabaId ?? ""), accessToken },
+        ctx.requestId
+      );
+      sendJson(res, status, body);
       return;
     }
 

@@ -539,6 +539,8 @@ export interface MetaTemplateSummary {
   status: string;
   category?: string;
   body?: string;
+  /** Meta's Graph template id, when the fields list requested it. */
+  metaTemplateId?: string;
 }
 
 /**
