@@ -98,6 +98,7 @@ import { buildMediaHeaders } from "./media-headers.js";
 import { mapMediaUploadProxyResult } from "./media-upload.js";
 import QRCodeSvg from "qrcode-svg";
 import { buildWaLink, renderWidgetScript } from "./click-to-chat.js";
+import { openApiSpec } from "./openapi.js";
 import { SseHub } from "./sse-hub.js";
 import { parseCsv, serializeContactsCsv, extractMultipartFile } from "./csv.js";
 import { resolveOrgTenant } from "./single-org.js";
@@ -1481,6 +1482,15 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       database: db,
       timestamp: new Date().toISOString()
     });
+    return;
+  }
+
+  // ─── OpenAPI description (public, like any API's docs) ───────────────────
+  if (path === "/api/v1/openapi.json" && method === "GET") {
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    res.end(JSON.stringify(openApiSpec));
     return;
   }
 
