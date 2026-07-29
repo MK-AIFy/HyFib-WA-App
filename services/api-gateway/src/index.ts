@@ -97,7 +97,7 @@ import { canCreateContact, canCreateOrder } from "./authorization.js";
 import { buildMediaHeaders } from "./media-headers.js";
 import { mapMediaUploadProxyResult } from "./media-upload.js";
 import { SseHub } from "./sse-hub.js";
-import { parseCsv, serializeContactsCsv, extractMultipartFile } from "./csv.js";
+import { parseCsv, serializeContactsCsv, serializeCampaignRecipientsCsv, extractMultipartFile } from "./csv.js";
 import { resolveOrgTenant } from "./single-org.js";
 import { runOutboxRelayOnce } from "./outbox-relay.js";
 import { classifyRoute, API_RATE_LIMITS } from "./rate-limit.js";
@@ -3042,11 +3042,47 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 404, { error: "Campaign not found" });
       return;
     }
-    const [funnel, recipients] = await Promise.all([
+    const [funnel, recipients, clicks] = await Promise.all([
       campaignRecipientRepository.funnelCounts(tenantId, campaignId),
-      campaignRecipientRepository.listByCampaign(tenantId, campaignId, { limit: 500 })
+      campaignRecipientRepository.listByCampaign(tenantId, campaignId, { limit: 500 }),
+      linkClickRepository.campaignClickStats(tenantId, campaignId)
     ]);
-    sendJson(res, 200, { campaign, funnel, recipients });
+    sendJson(res, 200, { campaign, funnel, clicks, recipients });
+    return;
+  }
+
+  // GET /api/v1/campaigns/:id/export — per-recipient funnel as CSV (G10).
+  if (path.startsWith("/api/v1/campaigns/") && path.endsWith("/export") && method === "GET") {
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager", "analyst"])) {
+      sendJson(res, 403, { error: "Insufficient role to export campaign analytics" });
+      return;
+    }
+    const campaignId = extractPathSegment(path, "/api/v1/campaigns/");
+    if (!campaignId || !UUID.test(campaignId)) {
+      sendJson(res, 400, { error: "Invalid campaign id" });
+      return;
+    }
+    const campaign = await campaignRepository.getById(tenantId, campaignId);
+    if (!campaign) {
+      sendJson(res, 404, { error: "Campaign not found" });
+      return;
+    }
+    const recipients = await campaignRecipientRepository.listForExport(tenantId, campaignId);
+    const truncated = recipients.length === 50_000;
+    const csv = serializeCampaignRecipientsCsv(recipients);
+    await audit(tenantId, auth, {
+      action: "campaign.exported",
+      resourceType: "Campaign",
+      resourceId: campaignId,
+      payload: { count: recipients.length, truncated }
+    });
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="campaign-${campaignId}.csv"`);
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("X-Export-Count", String(recipients.length));
+    if (truncated) res.setHeader("X-Export-Truncated", "true");
+    res.end(csv);
     return;
   }
 
