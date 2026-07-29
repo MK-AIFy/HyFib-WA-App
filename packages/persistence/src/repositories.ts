@@ -2,6 +2,7 @@ import { query, withTenant, type QueryClient } from "./db.js";
 import { loadConfig } from "@hyfib/config";
 import { EventTopics, decryptSecret, encryptSecret } from "@hyfib/shared-core";
 import type {
+  FlowDefinition,
   AuditEvent,
   AutoReplyRule,
   AutomationActionConfig,
@@ -2955,6 +2956,187 @@ export const savedReplyRepository = {
   async delete(tenantId: string, id: string): Promise<void> {
     await withTenant(tenantId, async (client) => {
       await client.query("DELETE FROM saved_replies WHERE id = $1", [id]);
+    });
+  }
+};
+
+// ─── Chatbot flows (G14) ────────────────────────────────────────────────────────
+
+interface FlowRow {
+  id: string;
+  tenant_id: string;
+  name: string;
+  status: string;
+  trigger_keyword: string | null;
+  definition: FlowDefinition;
+  created_at: Date;
+}
+
+export interface Flow {
+  id: string;
+  tenantId: string;
+  name: string;
+  status: "draft" | "active" | "paused";
+  triggerKeyword?: string;
+  definition: FlowDefinition;
+  createdAt: string;
+}
+
+function mapFlow(row: FlowRow): Flow {
+  return {
+    id: row.id,
+    tenantId: row.tenant_id,
+    name: row.name,
+    status: row.status as Flow["status"],
+    triggerKeyword: row.trigger_keyword ?? undefined,
+    definition: row.definition,
+    createdAt: row.created_at.toISOString()
+  };
+}
+
+const FLOW_COLUMNS = "id, tenant_id, name, status, trigger_keyword, definition, created_at";
+
+export interface FlowSession {
+  id: string;
+  flowId: string;
+  conversationId: string;
+  contactId: string;
+  currentNode: string;
+  status: "active" | "completed" | "cancelled";
+}
+
+export const flowRepository = {
+  async create(
+    tenantId: string,
+    input: { name: string; triggerKeyword?: string; definition: FlowDefinition }
+  ): Promise<Flow> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<FlowRow>(
+        `INSERT INTO flows (tenant_id, name, trigger_keyword, definition)
+         VALUES ($1, $2, $3, $4::jsonb)
+         RETURNING ${FLOW_COLUMNS}`,
+        [tenantId, input.name, input.triggerKeyword ?? null, JSON.stringify(input.definition)]
+      );
+      return mapFlow(result.rows[0]!);
+    });
+  },
+  async list(tenantId: string): Promise<Array<Flow & { activeSessions: number }>> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<FlowRow & { active_sessions: string }>(
+        `SELECT f.id, f.tenant_id, f.name, f.status, f.trigger_keyword, f.definition, f.created_at,
+                COUNT(s.id) FILTER (WHERE s.status = 'active')::text AS active_sessions
+         FROM flows f
+         LEFT JOIN flow_sessions s ON s.flow_id = f.id
+         GROUP BY f.id
+         ORDER BY f.created_at DESC`
+      );
+      return result.rows.map((row) => ({ ...mapFlow(row), activeSessions: Number(row.active_sessions) }));
+    });
+  },
+  async getById(tenantId: string, id: string): Promise<Flow | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<FlowRow>(`SELECT ${FLOW_COLUMNS} FROM flows WHERE id = $1`, [id]);
+      return result.rows[0] ? mapFlow(result.rows[0]) : undefined;
+    });
+  },
+  async setStatus(tenantId: string, id: string, status: Flow["status"]): Promise<Flow | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<FlowRow>(
+        `UPDATE flows SET status = $2, updated_at = now() WHERE id = $1 RETURNING ${FLOW_COLUMNS}`,
+        [id, status]
+      );
+      return result.rows[0] ? mapFlow(result.rows[0]) : undefined;
+    });
+  },
+  /** Active flow whose trigger keyword matches the inbound text (case-insensitive exact). */
+  async findByTrigger(tenantId: string, text: string): Promise<Flow | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<FlowRow>(
+        `SELECT ${FLOW_COLUMNS} FROM flows
+         WHERE status = 'active' AND trigger_keyword IS NOT NULL AND lower(trigger_keyword) = lower($1)
+         ORDER BY created_at ASC LIMIT 1`,
+        [text.trim()]
+      );
+      return result.rows[0] ? mapFlow(result.rows[0]) : undefined;
+    });
+  },
+  /**
+   * Starts a session unless the conversation already has an active one (the
+   * partial unique index closes the race; conflict = no-op returning undefined).
+   */
+  async startSession(
+    tenantId: string,
+    input: { flowId: string; conversationId: string; contactId: string; currentNode: string }
+  ): Promise<FlowSession | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<{
+        id: string;
+        flow_id: string;
+        conversation_id: string;
+        contact_id: string;
+        current_node: string;
+        status: string;
+      }>(
+        `INSERT INTO flow_sessions (tenant_id, flow_id, conversation_id, contact_id, current_node)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (tenant_id, conversation_id) WHERE status = 'active' DO NOTHING
+         RETURNING id, flow_id, conversation_id, contact_id, current_node, status`,
+        [tenantId, input.flowId, input.conversationId, input.contactId, input.currentNode]
+      );
+      const row = result.rows[0];
+      return row
+        ? {
+            id: row.id,
+            flowId: row.flow_id,
+            conversationId: row.conversation_id,
+            contactId: row.contact_id,
+            currentNode: row.current_node,
+            status: row.status as FlowSession["status"]
+          }
+        : undefined;
+    });
+  },
+  async activeSessionForConversation(tenantId: string, conversationId: string): Promise<FlowSession | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<{
+        id: string;
+        flow_id: string;
+        conversation_id: string;
+        contact_id: string;
+        current_node: string;
+        status: string;
+      }>(
+        `SELECT id, flow_id, conversation_id, contact_id, current_node, status
+         FROM flow_sessions WHERE conversation_id = $1 AND status = 'active' LIMIT 1`,
+        [conversationId]
+      );
+      const row = result.rows[0];
+      return row
+        ? {
+            id: row.id,
+            flowId: row.flow_id,
+            conversationId: row.conversation_id,
+            contactId: row.contact_id,
+            currentNode: row.current_node,
+            status: row.status as FlowSession["status"]
+          }
+        : undefined;
+    });
+  },
+  async updateSession(
+    tenantId: string,
+    sessionId: string,
+    update: { currentNode?: string; status?: FlowSession["status"] }
+  ): Promise<void> {
+    await withTenant(tenantId, async (client) => {
+      await client.query(
+        `UPDATE flow_sessions
+         SET current_node = COALESCE($2, current_node),
+             status = COALESCE($3, status),
+             updated_at = now()
+         WHERE id = $1`,
+        [sessionId, update.currentNode ?? null, update.status ?? null]
+      );
     });
   }
 };
