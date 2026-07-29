@@ -2,6 +2,7 @@ import type { Role } from "@hyfib/shared-core";
 import {
   BarChart3,
   Bot,
+  Workflow,
   CheckSquare,
   Inbox,
   LineChart,
@@ -30,6 +31,7 @@ const BASE_NAV: NavItem[] = [
   { id: "campaigns", to: "/campaigns", label: "Campaigns", icon: Megaphone },
   { id: "tasks", to: "/tasks", label: "Tasks", icon: CheckSquare },
   { id: "automation", to: "/automation", label: "Automation", icon: Zap },
+  { id: "flows", to: "/flows", label: "Flows", icon: Workflow },
   { id: "teams", to: "/teams", label: "Teams", icon: UsersRound },
   { id: "analytics", to: "/analytics", label: "Analytics", icon: BarChart3 },
   { id: "reports", to: "/reports", label: "Reports", icon: LineChart },
