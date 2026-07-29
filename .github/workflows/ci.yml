@@ -58,6 +58,8 @@ jobs:
       POSTGRES_APP_USER: hyfib_app
       POSTGRES_APP_PASSWORD: apppw
       RUN_DB_TESTS: "1"
+      # Test-only key: the channel-credential rotation test encrypts a token.
+      CHANNEL_ENCRYPTION_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

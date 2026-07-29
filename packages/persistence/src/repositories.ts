@@ -216,6 +216,30 @@ export const userRepository = {
     await withTenant(tenantId, async (client) => {
       await client.query("UPDATE users SET status = $1 WHERE id = $2", [status, id]);
     });
+  },
+  /**
+   * Replaces a user's role set atomically in BOTH stores: role_bindings (the
+   * source USER_SELECT aggregates) and the denormalized users.roles column
+   * (the fast path resolveAuth reads). Roles take effect on the next request —
+   * sessions carry no role snapshot, so no revocation is needed.
+   */
+  async updateRoles(tenantId: string, id: string, roles: Role[]): Promise<User | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const exists = await client.query<{ id: string }>("SELECT id FROM users WHERE id = $1", [id]);
+      if (!exists.rows[0]) {
+        return undefined;
+      }
+      await client.query("DELETE FROM role_bindings WHERE user_id = $1", [id]);
+      for (const role of roles) {
+        await client.query(
+          "INSERT INTO role_bindings (tenant_id, user_id, role) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+          [tenantId, id, role]
+        );
+      }
+      await client.query("UPDATE users SET roles = $1 WHERE id = $2", [roles, id]);
+      const result = await client.query<UserRow>(`${USER_SELECT} WHERE u.id = $1 GROUP BY u.id`, [id]);
+      return result.rows[0] ? mapUser(result.rows[0]) : undefined;
+    });
   }
 };
 
@@ -348,6 +372,16 @@ export const teamRepository = {
   async removeMember(tenantId: string, teamId: string, userId: string): Promise<void> {
     await withTenant(tenantId, async (client) => {
       await client.query("DELETE FROM team_members WHERE team_id = $1 AND user_id = $2", [teamId, userId]);
+    });
+  },
+  /**
+   * Hard delete. team_members cascade; users.team_id and
+   * conversations.assigned_team_id are ON DELETE SET NULL, so no FK can block.
+   */
+  async delete(tenantId: string, id: string): Promise<boolean> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query("DELETE FROM teams WHERE id = $1", [id]);
+      return (result.rowCount ?? 0) > 0;
     });
   },
   async listMembers(tenantId: string, teamId: string): Promise<User[]> {
@@ -549,6 +583,54 @@ export const channelRepository = {
       );
       return result.rows[0] ? mapChannel(result.rows[0]) : undefined;
     });
+  },
+  /**
+   * Partial update. accessToken: undefined keeps, null clears, string rotates
+   * (re-encrypted). Invalidates the credentials cache so a rotated token is
+   * visible immediately — a 5-minute stale window on credentials would mean
+   * sends with a revoked token.
+   */
+  async update(
+    tenantId: string,
+    id: string,
+    patch: { displayPhoneNumber?: string; isActive?: boolean; accessToken?: string | null }
+  ): Promise<WhatsAppChannel | undefined> {
+    const sets: string[] = [];
+    const params: unknown[] = [];
+    if (patch.displayPhoneNumber !== undefined) {
+      params.push(patch.displayPhoneNumber);
+      sets.push(`display_phone_number = $${params.length}`);
+    }
+    if (patch.isActive !== undefined) {
+      params.push(patch.isActive);
+      sets.push(`is_active = $${params.length}`);
+    }
+    if (patch.accessToken !== undefined) {
+      params.push(patch.accessToken === null ? null : encryptChannelToken(patch.accessToken));
+      sets.push(`access_token_encrypted = $${params.length}`);
+    }
+    if (sets.length === 0) {
+      return withTenant(tenantId, async (client) => {
+        const result = await client.query<ChannelRow>(
+          `SELECT ${CHANNEL_COLUMNS} FROM whatsapp_channels WHERE id = $1`,
+          [id]
+        );
+        return result.rows[0] ? mapChannel(result.rows[0]) : undefined;
+      });
+    }
+    params.push(id);
+    const updated = await withTenant(tenantId, async (client) => {
+      const result = await client.query<ChannelRow>(
+        `UPDATE whatsapp_channels SET ${sets.join(", ")} WHERE id = $${params.length}
+         RETURNING ${CHANNEL_COLUMNS}`,
+        params
+      );
+      return result.rows[0] ? mapChannel(result.rows[0]) : undefined;
+    });
+    if (updated) {
+      credsByChannelIdCache.delete(`${tenantId}:${id}`);
+    }
+    return updated;
   },
   /** Loads a channel's send credentials (number + decrypted token) by id. Cached for 5 min. */
   async getCredentials(tenantId: string, channelId: string): Promise<ChannelCredentials | undefined> {
@@ -1024,6 +1106,58 @@ export const contactRepository = {
     return withTenant(tenantId, async (client) => {
       const result = await client.query<ContactRow>(`${CONTACT_SELECT} FROM contacts ORDER BY created_at DESC`);
       return result.rows.map(mapContact);
+    });
+  },
+  /**
+   * Profile update (names/timezone are columns, country lives in metadata).
+   * Tags, opt-out state and custom fields are deliberately untouched — they
+   * have their own endpoints with their own semantics.
+   */
+  async update(
+    tenantId: string,
+    id: string,
+    patch: { firstName?: string | null; lastName?: string | null; timezone?: string | null; country?: string }
+  ): Promise<Contact | undefined> {
+    const sets: string[] = [];
+    const params: unknown[] = [];
+    if (patch.firstName !== undefined) {
+      params.push(patch.firstName);
+      sets.push(`first_name = $${params.length}`);
+    }
+    if (patch.lastName !== undefined) {
+      params.push(patch.lastName);
+      sets.push(`last_name = $${params.length}`);
+    }
+    if (patch.timezone !== undefined) {
+      params.push(patch.timezone);
+      sets.push(`timezone = $${params.length}`);
+    }
+    if (patch.country !== undefined) {
+      params.push(JSON.stringify({ country: patch.country }));
+      sets.push(`metadata = metadata || $${params.length}::jsonb`);
+    }
+    if (sets.length === 0) {
+      return contactRepository.getById(tenantId, id);
+    }
+    params.push(id);
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<ContactRow>(
+        `UPDATE contacts SET ${sets.join(", ")} WHERE id = $${params.length}
+         RETURNING id, tenant_id, phone_e164, first_name, last_name, timezone, metadata`,
+        params
+      );
+      return result.rows[0] ? mapContact(result.rows[0]) : undefined;
+    });
+  },
+  /**
+   * Hard delete. Tags/notes/consent/campaign-recipient rows cascade; FK
+   * violations from history that must survive (conversations, messages,
+   * orders, link_clicks) propagate for the caller to map to 409.
+   */
+  async delete(tenantId: string, id: string): Promise<boolean> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query("DELETE FROM contacts WHERE id = $1", [id]);
+      return (result.rowCount ?? 0) > 0;
     });
   },
   /** Search/filter/paginate contacts for the CRM contact list. */
@@ -2314,6 +2448,30 @@ export const segmentRepository = {
       return result.rows[0] ? mapSegment(result.rows[0]) : undefined;
     });
   },
+  async update(
+    tenantId: string,
+    id: string,
+    patch: { name?: string; definition?: Segment["definition"] }
+  ): Promise<Segment | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<SegmentRow>(
+        `UPDATE segments
+           SET name = COALESCE($2, name),
+               definition = COALESCE($3::jsonb, definition)
+         WHERE id = $1
+         RETURNING id, tenant_id, name, definition, created_at`,
+        [id, patch.name ?? null, patch.definition !== undefined ? JSON.stringify(patch.definition) : null]
+      );
+      return result.rows[0] ? mapSegment(result.rows[0]) : undefined;
+    });
+  },
+  /** Hard delete; campaigns.segment_id FK violations propagate (caller maps to 409). */
+  async delete(tenantId: string, id: string): Promise<boolean> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query("DELETE FROM segments WHERE id = $1", [id]);
+      return (result.rowCount ?? 0) > 0;
+    });
+  },
   /**
    * Resolves contacts matching a segment definition.
    * Returns lightweight rows suitable for fan-out (id, phone_e164).
@@ -2807,6 +2965,64 @@ export const autoReplyRuleRepository = {
     await withTenant(tenantId, async (client) => {
       await client.query("UPDATE auto_reply_rules SET enabled = $2 WHERE id = $1", [id, enabled]);
     });
+  },
+  async update(
+    tenantId: string,
+    id: string,
+    patch: {
+      matchType?: AutoReplyRule["matchType"];
+      keyword?: string | null;
+      replyText?: string;
+      priority?: number;
+      enabled?: boolean;
+    }
+  ): Promise<AutoReplyRule | undefined> {
+    const sets: string[] = [];
+    const params: unknown[] = [];
+    if (patch.matchType !== undefined) {
+      params.push(patch.matchType);
+      sets.push(`match_type = $${params.length}`);
+    }
+    if (patch.keyword !== undefined) {
+      params.push(patch.keyword);
+      sets.push(`keyword = $${params.length}`);
+    }
+    if (patch.replyText !== undefined) {
+      params.push(patch.replyText);
+      sets.push(`reply_text = $${params.length}`);
+    }
+    if (patch.priority !== undefined) {
+      params.push(patch.priority);
+      sets.push(`priority = $${params.length}`);
+    }
+    if (patch.enabled !== undefined) {
+      params.push(patch.enabled);
+      sets.push(`enabled = $${params.length}`);
+    }
+    if (sets.length === 0) {
+      return withTenant(tenantId, async (client) => {
+        const result = await client.query<AutoReplyRuleRow>(
+          "SELECT id, tenant_id, match_type, keyword, reply_kind, reply_text, enabled, priority, created_at FROM auto_reply_rules WHERE id = $1",
+          [id]
+        );
+        return result.rows[0] ? mapAutoReplyRule(result.rows[0]) : undefined;
+      });
+    }
+    params.push(id);
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<AutoReplyRuleRow>(
+        `UPDATE auto_reply_rules SET ${sets.join(", ")} WHERE id = $${params.length}
+         RETURNING id, tenant_id, match_type, keyword, reply_kind, reply_text, enabled, priority, created_at`,
+        params
+      );
+      return result.rows[0] ? mapAutoReplyRule(result.rows[0]) : undefined;
+    });
+  },
+  async delete(tenantId: string, id: string): Promise<boolean> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query("DELETE FROM auto_reply_rules WHERE id = $1", [id]);
+      return (result.rowCount ?? 0) > 0;
+    });
   }
 };
 
@@ -2952,6 +3168,71 @@ export const automationRuleRepository = {
   async setEnabled(tenantId: string, id: string, enabled: boolean): Promise<void> {
     await withTenant(tenantId, async (client) => {
       await client.query("UPDATE automation_rules SET enabled = $2 WHERE id = $1", [id, enabled]);
+    });
+  },
+  async update(
+    tenantId: string,
+    id: string,
+    patch: {
+      name?: string;
+      triggerType?: AutomationRule["triggerType"];
+      conditions?: AutomationConditions;
+      actionType?: AutomationRule["actionType"];
+      actionConfig?: AutomationActionConfig;
+      priority?: number;
+      enabled?: boolean;
+    }
+  ): Promise<AutomationRule | undefined> {
+    const sets: string[] = [];
+    const params: unknown[] = [];
+    if (patch.name !== undefined) {
+      params.push(patch.name);
+      sets.push(`name = $${params.length}`);
+    }
+    if (patch.triggerType !== undefined) {
+      params.push(patch.triggerType);
+      sets.push(`trigger_type = $${params.length}`);
+    }
+    if (patch.conditions !== undefined) {
+      params.push(JSON.stringify(patch.conditions));
+      sets.push(`conditions = $${params.length}::jsonb`);
+    }
+    if (patch.actionType !== undefined) {
+      params.push(patch.actionType);
+      sets.push(`action_type = $${params.length}`);
+    }
+    if (patch.actionConfig !== undefined) {
+      params.push(JSON.stringify(patch.actionConfig));
+      sets.push(`action_config = $${params.length}::jsonb`);
+    }
+    if (patch.priority !== undefined) {
+      params.push(patch.priority);
+      sets.push(`priority = $${params.length}`);
+    }
+    if (patch.enabled !== undefined) {
+      params.push(patch.enabled);
+      sets.push(`enabled = $${params.length}`);
+    }
+    if (sets.length === 0) {
+      return withTenant(tenantId, async (client) => {
+        const result = await client.query<AutomationRuleRow>(`${AUTOMATION_SELECT} WHERE id = $1`, [id]);
+        return result.rows[0] ? mapAutomationRule(result.rows[0]) : undefined;
+      });
+    }
+    params.push(id);
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<AutomationRuleRow>(
+        `UPDATE automation_rules SET ${sets.join(", ")} WHERE id = $${params.length}
+         RETURNING id, tenant_id, name, trigger_type, conditions, action_type, action_config, enabled, priority, created_at`,
+        params
+      );
+      return result.rows[0] ? mapAutomationRule(result.rows[0]) : undefined;
+    });
+  },
+  async delete(tenantId: string, id: string): Promise<boolean> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query("DELETE FROM automation_rules WHERE id = $1", [id]);
+      return (result.rowCount ?? 0) > 0;
     });
   }
 };
