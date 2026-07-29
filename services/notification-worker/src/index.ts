@@ -64,6 +64,7 @@ import { mintTrackedParameters } from "./click-tracking.js";
 import { matchAutoReply } from "./autoreply.js";
 import { evaluateAutomationRules } from "./automation.js";
 import { processMediaFetch } from "./media.js";
+import { deliverCustomerWebhook } from "./customer-webhook.js";
 
 const config = loadConfig();
 const logger = new Logger("notification-worker", config.logLevel as "debug" | "info" | "warn" | "error");
@@ -839,6 +840,15 @@ async function handleInbound(event: EventEnvelope): Promise<void> {
   });
   logger.info("inbound_recorded", { tenantId: channel.tenantId, messageId: inbound.messageId, type: inbound.type });
 
+  // Outbound customer webhook (Phase D): fire-and-forget.
+  void notifyCustomerWebhook(channel.tenantId, "message.inbound", {
+    messageId: inbound.messageId,
+    from: inbound.from,
+    type: inbound.type,
+    text: inbound.text,
+    conversationId: conversation.id
+  });
+
   // Inbound media (image/video/audio/document/sticker): enqueue an async fetch of the
   // bytes via the outbox. Idempotent by media id (see media.ts's upsertPending
   // short-circuit), so redelivery of this outbox row or a future replay is safe.
@@ -1029,6 +1039,49 @@ async function handleStatus(event: EventEnvelope): Promise<void> {
         }
       }
     }
+  }
+
+  // Outbound customer webhook (Phase D): fire-and-forget so a slow receiver
+  // never blocks status processing.
+  void notifyCustomerWebhook(channel.tenantId, "message.status", {
+    messageId: status.messageId,
+    status: mapped,
+    recipient: status.recipientId
+  });
+}
+
+/**
+ * Delivers a signed event to the tenant's status_callback_url when one is
+ * configured (Phase D). Errors are counted and logged, never thrown — webhook
+ * delivery is strictly best-effort relative to the pipeline.
+ */
+async function notifyCustomerWebhook(
+  tenantId: string,
+  type: "message.status" | "message.inbound",
+  data: Record<string, unknown>
+): Promise<void> {
+  try {
+    const settings = await whatsappSettingsRepository.getByTenant(tenantId);
+    const url = settings?.statusCallbackUrl;
+    if (!url) {
+      return;
+    }
+    const result = await deliverCustomerWebhook(
+      { url, secret: settings.statusCallbackSecret },
+      { type, occurredAt: new Date().toISOString(), data }
+    );
+    incCounter("customer_webhooks_total", "Outbound customer webhooks.", {
+      result: result.ok ? "delivered" : "failed"
+    });
+    if (!result.ok) {
+      logger.warn("customer_webhook_failed", { tenantId, type, status: result.status });
+    }
+  } catch (error) {
+    logger.warn("customer_webhook_error", {
+      tenantId,
+      type,
+      error: error instanceof Error ? error.message : String(error)
+    });
   }
 }
 

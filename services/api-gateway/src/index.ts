@@ -2196,13 +2196,19 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   if (path === "/api/v1/channels/whatsapp/settings") {
     if (method === "GET") {
       const stored = await whatsappSettingsRepository.getByTenant(tenantId);
-      sendJson(res, 200, {
-        settings: stored ?? {
-          graphVersion: config.whatsappGraphVersion,
-          retryMaxAttempts: config.whatsappDefaultRetryMaxAttempts,
-          retryBaseDelayMs: config.whatsappDefaultRetryBaseDelayMs
-        }
-      });
+      if (!stored) {
+        sendJson(res, 200, {
+          settings: {
+            graphVersion: config.whatsappGraphVersion,
+            retryMaxAttempts: config.whatsappDefaultRetryMaxAttempts,
+            retryBaseDelayMs: config.whatsappDefaultRetryBaseDelayMs
+          }
+        });
+        return;
+      }
+      // The signing secret never leaves the server; expose only its presence.
+      const { statusCallbackSecret, ...safe } = stored;
+      sendJson(res, 200, { settings: { ...safe, hasCallbackSecret: Boolean(statusCallbackSecret) } });
       return;
     }
     if (method === "PUT") {
@@ -2210,9 +2216,18 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         sendJson(res, 403, { error: "Only platform_owner/tenant_admin can update WhatsApp settings" });
         return;
       }
-      const payload = await readJsonBody<UpdateWhatsAppSettingsRequest>(req);
+      const payload = await readJsonBody<UpdateWhatsAppSettingsRequest & { statusCallbackSecret?: string }>(req);
+      if (payload.statusCallbackSecret !== undefined && typeof payload.statusCallbackSecret !== "string") {
+        sendJson(res, 400, { error: "statusCallbackSecret must be a string" });
+        return;
+      }
+      if (typeof payload.statusCallbackSecret === "string" && payload.statusCallbackSecret.length > 128) {
+        sendJson(res, 400, { error: "statusCallbackSecret must be at most 128 characters" });
+        return;
+      }
       const settings = await whatsappSettingsRepository.upsert(tenantId, {
         statusCallbackUrl: payload.statusCallbackUrl?.trim() || undefined,
+        statusCallbackSecret: payload.statusCallbackSecret?.trim() || undefined,
         graphVersion: payload.graphVersion?.trim() || config.whatsappGraphVersion,
         retryMaxAttempts: clampInt(payload.retryMaxAttempts, 1, 10, config.whatsappDefaultRetryMaxAttempts),
         retryBaseDelayMs: clampInt(payload.retryBaseDelayMs, 50, 60_000, config.whatsappDefaultRetryBaseDelayMs),
@@ -2227,7 +2242,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         resourceId: settings.id,
         payload: { graphVersion: settings.graphVersion, retryMaxAttempts: settings.retryMaxAttempts }
       });
-      sendJson(res, 200, { settings });
+      const { statusCallbackSecret, ...safe } = settings;
+      sendJson(res, 200, { settings: { ...safe, hasCallbackSecret: Boolean(statusCallbackSecret) } });
       return;
     }
     sendJson(res, 405, { error: "Method not allowed" });
