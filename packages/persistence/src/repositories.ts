@@ -2525,6 +2525,23 @@ export const campaignRecipientRepository = {
       return result.rows.map(mapRecipient);
     });
   },
+  /**
+   * Full-funnel listing for the CSV export. Bounded at 50K rows (matching the
+   * contacts export cap) — callers signal truncation via X-Export-Truncated.
+   */
+  async listForExport(tenantId: string, campaignId: string): Promise<CampaignRecipient[]> {
+    const EXPORT_LIMIT = 50_000;
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<CampaignRecipientRow>(
+        `SELECT id, tenant_id, campaign_id, contact_id, phone_e164, status,
+                external_message_id, error, skip_reason, sent_at, delivered_at, read_at, created_at
+         FROM campaign_recipients WHERE campaign_id = $1
+         ORDER BY created_at ASC, phone_e164 ASC LIMIT $2`,
+        [campaignId, EXPORT_LIMIT]
+      );
+      return result.rows.map(mapRecipient);
+    });
+  },
   async listRecipients(
     tenantId: string,
     campaignId: string,
@@ -3026,14 +3043,44 @@ export const linkClickRepository = {
       );
     });
   },
+  /** Aggregate click stats for one campaign's tracked links (report + export). */
+  async campaignClickStats(
+    tenantId: string,
+    campaignId: string
+  ): Promise<{ trackedLinks: number; clickedLinks: number; totalClicks: number; uniqueClickers: number }> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<{
+        tracked_links: string;
+        clicked_links: string;
+        total_clicks: string;
+        unique_clickers: string;
+      }>(
+        `SELECT count(*)::text AS tracked_links,
+                count(*) FILTER (WHERE clicked_count > 0)::text AS clicked_links,
+                COALESCE(sum(clicked_count), 0)::text AS total_clicks,
+                count(DISTINCT contact_id) FILTER (WHERE clicked_count > 0)::text AS unique_clickers
+         FROM link_clicks WHERE campaign_id = $1`,
+        [campaignId]
+      );
+      const row = result.rows[0]!;
+      return {
+        trackedLinks: Number(row.tracked_links),
+        clickedLinks: Number(row.clicked_links),
+        totalClicks: Number(row.total_clicks),
+        uniqueClickers: Number(row.unique_clickers)
+      };
+    });
+  },
+  /**
+   * Public-redirect click increment. Runs via the record_link_click SECURITY
+   * DEFINER function (migration 025): the caller has no tenant context — the
+   * recipient clicking is not a platform user — and link_clicks is FORCE RLS,
+   * so a bare UPDATE silently matched zero rows and every tracked shortlink
+   * 404'd. The unguessable token is the capability.
+   */
   async recordClick(token: string): Promise<{ destination: string; tenantId: string } | undefined> {
     const result = await query<{ destination: string; tenant_id: string }>(
-      `UPDATE link_clicks
-       SET clicked_count = clicked_count + 1,
-           first_clicked_at = COALESCE(first_clicked_at, now()),
-           last_clicked_at = now()
-       WHERE token = $1
-       RETURNING destination, tenant_id`,
+      "SELECT destination, tenant_id FROM record_link_click($1)",
       [token]
     );
     const row = result.rows[0];
