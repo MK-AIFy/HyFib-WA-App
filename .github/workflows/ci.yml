@@ -98,3 +98,59 @@ jobs:
           severity: CRITICAL
           ignore-unfixed: true
           exit-code: "1"
+
+  # DR is only real if it is rehearsed: dump the migrated database, destroy it,
+  # restore from the dump, then run the app's own persistence suite against the
+  # restored database — proving schema, seed data, GRANTs and FORCE-RLS all
+  # survive a backup/restore cycle on every PR.
+  backup-restore-drill:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: platform
+          POSTGRES_PASSWORD: bootpw
+          POSTGRES_DB: hyfib_wa
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U platform -d hyfib_wa"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_DB: hyfib_wa
+      POSTGRES_USER: platform
+      POSTGRES_PASSWORD: bootpw
+      BACKUP_DIR: /tmp/hyfib-backups
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: corepack enable
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.12.1
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - name: Install psql client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: Apply all migrations
+        env:
+          APP_DB_USER: hyfib_app
+          APP_DB_PASSWORD: apppw
+        run: pnpm migrate
+      - name: Backup
+        run: bash scripts/backup.sh
+      - name: Destroy the database (simulated disaster)
+        run: PGPASSWORD=bootpw psql -h localhost -U platform -d postgres -c 'DROP DATABASE hyfib_wa'
+      - name: Restore from the dump
+        run: bash scripts/restore.sh "$(ls -1t "$BACKUP_DIR"/*.dump | head -1)"
+      - name: Persistence suite against the RESTORED database
+        env:
+          NODE_ENV: test
+          RUN_DB_TESTS: "1"
+          POSTGRES_APP_USER: hyfib_app
+          POSTGRES_APP_PASSWORD: apppw
+          CHANNEL_ENCRYPTION_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        run: pnpm --filter @hyfib/persistence test

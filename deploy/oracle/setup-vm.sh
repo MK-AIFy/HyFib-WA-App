@@ -140,8 +140,15 @@ fi
 log "installing systemd unit hyfib-app.service"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 install -m 644 "$SCRIPT_DIR/hyfib-app.service" /etc/systemd/system/hyfib-app.service
+
+# ── backups ───────────────────────────────────────────────────────────────────
+log "installing daily backup timer (hyfib-backup)"
+install -d -m 750 /var/backups/hyfib
+install -m 644 "$SCRIPT_DIR/hyfib-backup.service" /etc/systemd/system/hyfib-backup.service
+install -m 644 "$SCRIPT_DIR/hyfib-backup.timer" /etc/systemd/system/hyfib-backup.timer
 systemctl daemon-reload
 systemctl enable hyfib-app
+systemctl enable --now hyfib-backup.timer
 
 # ── Caddy ─────────────────────────────────────────────────────────────────────
 log "writing /etc/caddy/Caddyfile for ${DOMAIN}"
