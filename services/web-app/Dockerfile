@@ -5,11 +5,14 @@ FROM node:24-alpine AS build
 WORKDIR /app
 RUN corepack enable
 
-COPY package.json pnpm-workspace.yaml tsconfig.base.json ./
+# The full services tree is copied (not just web-app) because a frozen install
+# verifies the lockfile against every workspace project; only the built dist
+# reaches the nginx stage, so the final image is unaffected.
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml tsconfig.base.json ./
 COPY packages ./packages
-COPY services/web-app ./services/web-app
+COPY services ./services
 
-RUN pnpm install --no-frozen-lockfile
+RUN pnpm install --frozen-lockfile
 RUN pnpm --filter @hyfib/web-app... build
 
 FROM nginx:1.27-alpine
