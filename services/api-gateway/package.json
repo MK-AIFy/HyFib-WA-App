@@ -19,6 +19,7 @@
     "@hyfib/persistence": "workspace:*",
     "@hyfib/policy-engine": "workspace:*",
     "@hyfib/ratelimit": "workspace:*",
-    "@hyfib/shared-core": "workspace:*"
+    "@hyfib/shared-core": "workspace:*",
+    "qrcode-svg": "1.1.0"
   }
 }
