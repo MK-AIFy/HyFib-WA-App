@@ -2063,6 +2063,9 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     }
     await audit(tenantId, auth, { action: "api_key.revoked", resourceType: "ApiKey", resourceId: keyId, payload: {} });
     sendJson(res, 200, { status: "revoked", keyId });
+    return;
+  }
+
   // ─── Click-to-chat tools: link / QR / widget snippet (Phase D) ────────────
   if ((path === "/api/v1/tools/click-to-chat" || path === "/api/v1/tools/click-to-chat/qr") && method === "GET") {
     const q = parseQuery(req.url);
