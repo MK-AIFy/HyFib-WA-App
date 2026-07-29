@@ -1590,9 +1590,28 @@ export const conversationRepository = {
       await client.query("UPDATE conversations SET assigned_team_id = $2 WHERE id = $1", [conversationId, teamId]);
     });
   },
-  async setState(tenantId: string, conversationId: string, state: "open" | "pending" | "closed"): Promise<void> {
+  /**
+   * State transition; closing stamps closed_at/closed_by for resolution
+   * metrics (G11), reopening clears them so a later re-close re-measures.
+   */
+  async setState(
+    tenantId: string,
+    conversationId: string,
+    state: "open" | "pending" | "closed",
+    actorUserId?: string
+  ): Promise<void> {
     await withTenant(tenantId, async (client) => {
-      await client.query("UPDATE conversations SET state = $2 WHERE id = $1", [conversationId, state]);
+      if (state === "closed") {
+        await client.query(
+          "UPDATE conversations SET state = $2, closed_at = now(), closed_by_user_id = $3 WHERE id = $1",
+          [conversationId, state, actorUserId ?? null]
+        );
+      } else {
+        await client.query(
+          "UPDATE conversations SET state = $2, closed_at = NULL, closed_by_user_id = NULL WHERE id = $1",
+          [conversationId, state]
+        );
+      }
     });
   },
   /** Advances the read watermark to now(). Idempotent by construction — no counter to race. */
@@ -1756,12 +1775,14 @@ export const messageRepository = {
       payload: Record<string, unknown>;
       category?: MessageCategory;
       externalMessageId?: string;
+      /** Agent attribution for outbound conversation sends (G11). */
+      senderUserId?: string;
     }
   ): Promise<Message> {
     return withTenant(tenantId, async (client) => {
       const result = await client.query<MessageRow>(
-        `INSERT INTO messages (tenant_id, conversation_id, direction, category, external_message_id, payload, status)
-         VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
+        `INSERT INTO messages (tenant_id, conversation_id, direction, category, external_message_id, payload, status, sender_user_id)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8)
          RETURNING id, tenant_id, conversation_id, direction, category, external_message_id, payload, status, created_at`,
         [
           tenantId,
@@ -1770,7 +1791,8 @@ export const messageRepository = {
           input.category ?? null,
           input.externalMessageId ?? null,
           JSON.stringify(input.payload),
-          input.status
+          input.status,
+          input.senderUserId ?? null
         ]
       );
       await client.query("UPDATE conversations SET last_message_at = now() WHERE id = $1", [input.conversationId]);
