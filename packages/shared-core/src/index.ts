@@ -269,6 +269,9 @@ export interface AutomationSettings {
   oooEnabled: boolean;
   oooText?: string;
   oooSuppressHours: number;
+  /** Round-robin auto-assignment (G9): rotate new conversations among this team. */
+  roundRobinEnabled: boolean;
+  roundRobinTeamId?: string;
   updatedAt: string;
 }
 
