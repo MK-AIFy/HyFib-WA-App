@@ -96,6 +96,14 @@ import { filterSendableContacts, canTransition, transitionConflict, CAMPAIGN_TRA
 import { canCreateContact, canCreateOrder } from "./authorization.js";
 import { buildMediaHeaders } from "./media-headers.js";
 import { mapMediaUploadProxyResult } from "./media-upload.js";
+import {
+  META_SUBMITTABLE_CATEGORIES,
+  TEMPLATE_CATEGORIES,
+  mapTemplateAdminProxyResult,
+  validateTemplatePatch,
+  type TemplateAdminOp,
+  type TemplateAdminProxy
+} from "./template-admin.js";
 import { SseHub } from "./sse-hub.js";
 import { parseCsv, serializeContactsCsv, extractMultipartFile } from "./csv.js";
 import { resolveOrgTenant } from "./single-org.js";
@@ -443,6 +451,63 @@ async function defaultUploadMediaProxy(params: {
 }
 
 let uploadMediaProxy: UploadMediaProxy = defaultUploadMediaProxy;
+
+const TEMPLATE_ADMIN_ROUTES: Record<TemplateAdminOp["kind"], string> = {
+  submit: "/internal/v1/whatsapp/templates",
+  edit: "/internal/v1/whatsapp/templates/edit",
+  delete: "/internal/v1/whatsapp/templates/delete"
+};
+
+async function defaultTemplateAdminProxy(
+  op: TemplateAdminOp,
+  ctx: { tenantId: string; requestId: string }
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const { kind, accessToken, ...payload } = op;
+  const response = await fetch(`${config.metaAdapterUrl}${TEMPLATE_ADMIN_ROUTES[kind]}`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-tenant-id": ctx.tenantId,
+      "x-request-id": ctx.requestId,
+      "x-internal-secret": config.internalServiceSecret,
+      ...(accessToken ? { "x-access-token": accessToken } : {})
+    },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(15_000)
+  });
+  return { status: response.status, body: (await response.json()) as Record<string, unknown> };
+}
+
+let templateAdminProxy: TemplateAdminProxy = defaultTemplateAdminProxy;
+
+export type ListMetaTemplatesProxy = (params: {
+  wabaId: string;
+  accessToken?: string;
+  tenantId: string;
+  requestId: string;
+}) => Promise<{ status: number; body: Record<string, unknown> }>;
+
+async function defaultListMetaTemplatesProxy(params: {
+  wabaId: string;
+  accessToken?: string;
+  tenantId: string;
+  requestId: string;
+}): Promise<{ status: number; body: Record<string, unknown> }> {
+  const url = new URL(`${config.metaAdapterUrl}/internal/v1/whatsapp/templates`);
+  url.searchParams.set("wabaId", params.wabaId);
+  const response = await fetch(url, {
+    headers: {
+      "x-tenant-id": params.tenantId,
+      "x-request-id": params.requestId,
+      "x-internal-secret": config.internalServiceSecret,
+      ...(params.accessToken ? { "x-access-token": params.accessToken } : {})
+    },
+    signal: AbortSignal.timeout(15_000)
+  });
+  return { status: response.status, body: (await response.json()) as Record<string, unknown> };
+}
+
+let listMetaTemplatesProxy: ListMetaTemplatesProxy = defaultListMetaTemplatesProxy;
 
 const E164 = /^\+[1-9]\d{7,14}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -917,6 +982,7 @@ interface MetaTemplateItem {
   status: string;
   category?: string;
   body?: string;
+  metaTemplateId?: string;
 }
 
 async function syncTemplates(
@@ -927,22 +993,22 @@ async function syncTemplates(
   if (!channel) {
     return { status: 404, body: { error: "Channel not found" } };
   }
-  const url = new URL(`${config.metaAdapterUrl}/internal/v1/whatsapp/templates`);
-  url.searchParams.set("wabaId", channel.wabaId);
   let items: MetaTemplateItem[];
   try {
-    const response = await fetch(url, {
-      headers: {
-        "x-tenant-id": tenantId,
-        "x-request-id": randomUUID(),
-        "x-internal-secret": config.internalServiceSecret,
-        ...(channel.accessToken ? { "x-access-token": channel.accessToken } : {})
-      },
-      signal: AbortSignal.timeout(15_000)
+    // Injectable seam: HTTP fetch standalone, direct in-process call in the
+    // app-server monolith (where no meta-adapter container exists to fetch).
+    const { status: proxyStatus, body: rawBody } = await listMetaTemplatesProxy({
+      wabaId: channel.wabaId,
+      accessToken: channel.accessToken || undefined,
+      tenantId,
+      requestId: randomUUID()
     });
-    const body = (await response.json()) as { items?: MetaTemplateItem[]; error?: string; warning?: string };
-    if (!response.ok) {
-      return { status: 502, body: { error: "template_sync_failed", detail: body.error ?? "meta error" } };
+    const body = rawBody as { items?: MetaTemplateItem[]; error?: string; warning?: string };
+    if (proxyStatus < 200 || proxyStatus >= 300) {
+      return {
+        status: 502,
+        body: { error: "template_sync_failed", detail: typeof body.error === "string" ? body.error : "meta error" }
+      };
     }
     if (body.warning === "no_access_token") {
       return {
@@ -975,7 +1041,9 @@ async function syncTemplates(
       language: item.language,
       status,
       category,
-      body: item.body ?? ""
+      body: item.body ?? "",
+      metaTemplateId:
+        typeof item.metaTemplateId === "string" && item.metaTemplateId.length > 0 ? item.metaTemplateId : undefined
     });
     await eventBus.publish(
       EventTopics.TemplateStatusUpdated,
@@ -2270,7 +2338,6 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         sendJson(res, 400, { error: `name ${templateNameCheck.error}` });
         return;
       }
-      const TEMPLATE_CATEGORIES = ["marketing", "utility", "authentication", "service"] as const;
       if (!TEMPLATE_CATEGORIES.includes(payload.category as (typeof TEMPLATE_CATEGORIES)[number])) {
         sendJson(res, 400, { error: `category must be one of: ${TEMPLATE_CATEGORIES.join(", ")}` });
         return;
@@ -2302,6 +2369,277 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return;
     }
     sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+
+  // ─── Template lifecycle: submit to Meta / edit / delete (roadmap A3) ──────
+  if (path.startsWith("/api/v1/templates/") && path.endsWith("/submit") && method === "POST") {
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager"])) {
+      sendJson(res, 403, { error: "Insufficient role to submit templates" });
+      return;
+    }
+    const id = extractPathSegment(path, "/api/v1/templates/");
+    if (!id || !UUID.test(id)) {
+      sendJson(res, 400, { error: "Invalid template id" });
+      return;
+    }
+    const payload = await readJsonBody<{ channelId?: string }>(req);
+    if (!payload.channelId || !UUID.test(payload.channelId)) {
+      sendJson(res, 400, { error: "channelId is required" });
+      return;
+    }
+    const template = await templateRepository.getById(tenantId, id);
+    if (!template) {
+      sendJson(res, 404, { error: "Template not found" });
+      return;
+    }
+    if (!META_SUBMITTABLE_CATEGORIES.has(template.category)) {
+      sendJson(res, 422, {
+        error: "category_not_submittable",
+        detail: "Meta reviews marketing, utility and authentication templates only"
+      });
+      return;
+    }
+    if (template.status === "approved") {
+      sendJson(res, 409, { error: "template_already_approved" });
+      return;
+    }
+    const channel = await channelRepository.getCredentials(tenantId, payload.channelId);
+    if (!channel) {
+      sendJson(res, 404, { error: "Channel not found" });
+      return;
+    }
+    if (!channel.accessToken) {
+      sendJson(res, 422, {
+        error: "no_access_token",
+        detail: "Add a permanent WhatsApp token in Settings before submitting templates"
+      });
+      return;
+    }
+    try {
+      const { status, body } = await templateAdminProxy(
+        {
+          kind: "submit",
+          wabaId: channel.wabaId,
+          accessToken: channel.accessToken,
+          name: template.name,
+          language: template.language,
+          category: template.category,
+          bodyText: template.body
+        },
+        { tenantId, requestId: ctx.requestId }
+      );
+      const outcome = mapTemplateAdminProxyResult(status, body, "template_submit_failed");
+      if (outcome.kind !== "ok") {
+        sendJson(res, outcome.status, outcome.body);
+        return;
+      }
+      const metaTemplateId =
+        typeof outcome.body.id === "string" && outcome.body.id.length > 0 ? outcome.body.id : undefined;
+      if (!metaTemplateId) {
+        sendJson(res, 502, {
+          error: "template_submit_failed",
+          detail: "Meta accepted the submission but returned no template id"
+        });
+        return;
+      }
+      const updated = await templateRepository.markSubmitted(tenantId, id, metaTemplateId);
+      await eventBus.publish(
+        EventTopics.TemplateStatusUpdated,
+        { tenantId, templateId: id, name: template.name, language: template.language, status: "pending" },
+        tenantId
+      );
+      await audit(tenantId, auth, {
+        action: "template.submitted",
+        resourceType: "Template",
+        resourceId: id,
+        payload: { name: template.name, language: template.language, metaTemplateId }
+      });
+      sendJson(res, 200, { ...updated });
+    } catch (error) {
+      sendJson(res, 503, {
+        error: "meta_adapter_unavailable",
+        detail: error instanceof Error ? error.message : "failed"
+      });
+    }
+    return;
+  }
+
+  if (path.startsWith("/api/v1/templates/") && (method === "PATCH" || method === "DELETE")) {
+    if (!hasAnyRole(auth, ["platform_owner", "tenant_admin", "marketing_manager"])) {
+      sendJson(res, 403, { error: "Insufficient role to modify templates" });
+      return;
+    }
+    const id = extractPathSegment(path, "/api/v1/templates/");
+    if (!id || !UUID.test(id) || path !== `/api/v1/templates/${id}`) {
+      sendJson(res, 400, { error: "Invalid template id" });
+      return;
+    }
+    const template = await templateRepository.getById(tenantId, id);
+    if (!template) {
+      sendJson(res, 404, { error: "Template not found" });
+      return;
+    }
+
+    if (method === "PATCH") {
+      const raw = await readJsonBody<Record<string, unknown>>(req);
+      const patch = validateTemplatePatch(raw);
+      if (!patch.ok) {
+        sendJson(res, 400, { error: patch.error });
+        return;
+      }
+      // Submitted templates are edited on Meta FIRST; local state only changes
+      // after Meta accepts, so the two never drift apart.
+      let statusAfter: Template["status"] | undefined;
+      if (template.metaTemplateId) {
+        if (!patch.value.channelId) {
+          sendJson(res, 422, {
+            error: "channel_required",
+            detail: "channelId is required to edit a template already submitted to Meta"
+          });
+          return;
+        }
+        if (patch.value.category !== undefined && !META_SUBMITTABLE_CATEGORIES.has(patch.value.category)) {
+          sendJson(res, 422, {
+            error: "category_not_submittable",
+            detail: "Meta reviews marketing, utility and authentication templates only"
+          });
+          return;
+        }
+        const channel = await channelRepository.getCredentials(tenantId, patch.value.channelId);
+        if (!channel) {
+          sendJson(res, 404, { error: "Channel not found" });
+          return;
+        }
+        if (!channel.accessToken) {
+          sendJson(res, 422, {
+            error: "no_access_token",
+            detail: "Add a permanent WhatsApp token in Settings before editing submitted templates"
+          });
+          return;
+        }
+        try {
+          const { status, body } = await templateAdminProxy(
+            {
+              kind: "edit",
+              metaTemplateId: template.metaTemplateId,
+              accessToken: channel.accessToken,
+              category: patch.value.category,
+              bodyText: patch.value.body
+            },
+            { tenantId, requestId: ctx.requestId }
+          );
+          const outcome = mapTemplateAdminProxyResult(status, body, "template_edit_failed");
+          if (outcome.kind !== "ok") {
+            sendJson(res, outcome.status, outcome.body);
+            return;
+          }
+        } catch (error) {
+          sendJson(res, 503, {
+            error: "meta_adapter_unavailable",
+            detail: error instanceof Error ? error.message : "failed"
+          });
+          return;
+        }
+        // Meta re-reviews every accepted edit.
+        statusAfter = "pending";
+      }
+      const updated = await templateRepository.update(tenantId, id, {
+        category: patch.value.category as MessageCategory | undefined,
+        body: patch.value.body,
+        status: statusAfter
+      });
+      if (statusAfter) {
+        await eventBus.publish(
+          EventTopics.TemplateStatusUpdated,
+          { tenantId, templateId: id, name: template.name, language: template.language, status: statusAfter },
+          tenantId
+        );
+      }
+      await audit(tenantId, auth, {
+        action: "template.updated",
+        resourceType: "Template",
+        resourceId: id,
+        payload: {
+          name: template.name,
+          category: patch.value.category,
+          bodyChanged: patch.value.body !== undefined,
+          metaEdit: Boolean(template.metaTemplateId)
+        }
+      });
+      sendJson(res, 200, { ...updated });
+      return;
+    }
+
+    // DELETE — Meta first (when linked), then local; FK conflicts → 409.
+    if (template.metaTemplateId) {
+      const channelId = parseQuery(req.url).get("channelId");
+      if (!channelId || !UUID.test(channelId)) {
+        sendJson(res, 422, {
+          error: "channel_required",
+          detail: "channelId query parameter is required to delete a template already submitted to Meta"
+        });
+        return;
+      }
+      const channel = await channelRepository.getCredentials(tenantId, channelId);
+      if (!channel) {
+        sendJson(res, 404, { error: "Channel not found" });
+        return;
+      }
+      if (!channel.accessToken) {
+        sendJson(res, 422, {
+          error: "no_access_token",
+          detail: "Add a permanent WhatsApp token in Settings before deleting submitted templates"
+        });
+        return;
+      }
+      try {
+        const { status, body } = await templateAdminProxy(
+          {
+            kind: "delete",
+            wabaId: channel.wabaId,
+            accessToken: channel.accessToken,
+            name: template.name,
+            metaTemplateId: template.metaTemplateId
+          },
+          { tenantId, requestId: ctx.requestId }
+        );
+        const outcome = mapTemplateAdminProxyResult(status, body, "template_delete_failed");
+        if (outcome.kind !== "ok") {
+          sendJson(res, outcome.status, outcome.body);
+          return;
+        }
+      } catch (error) {
+        sendJson(res, 503, {
+          error: "meta_adapter_unavailable",
+          detail: error instanceof Error ? error.message : "failed"
+        });
+        return;
+      }
+    }
+    try {
+      const deleted = await templateRepository.delete(tenantId, id);
+      if (!deleted) {
+        sendJson(res, 404, { error: "Template not found" });
+        return;
+      }
+    } catch (error) {
+      if ((error as { code?: string }).code === "23503") {
+        sendJson(res, 409, {
+          error: "template_in_use",
+          detail: "One or more campaigns reference this template; delete or retire them first"
+        });
+        return;
+      }
+      throw error;
+    }
+    await audit(tenantId, auth, {
+      action: "template.deleted",
+      resourceType: "Template",
+      resourceId: id,
+      payload: { name: template.name, language: template.language, metaTemplateId: template.metaTemplateId }
+    });
+    sendJson(res, 200, { deleted: true });
     return;
   }
 
@@ -3852,6 +4190,10 @@ export interface GatewayDeps {
   proxySendTypingIndicator?: SendTypingIndicatorProxy;
   /** Direct in-process media upload (no HTTP hop to meta-adapter). */
   proxyUploadMedia?: UploadMediaProxy;
+  /** Direct in-process template submit/edit/delete (no HTTP hop to meta-adapter). */
+  proxyTemplateAdmin?: TemplateAdminProxy;
+  /** Direct in-process Meta template list for sync (no HTTP hop to meta-adapter). */
+  proxyListMetaTemplates?: ListMetaTemplatesProxy;
 }
 
 export interface GatewayModule {
@@ -3890,6 +4232,8 @@ export function createGatewayHandler(deps: GatewayDeps = {}): GatewayModule {
   // Always assign (with the default as fallback) so a later handler instance
   // created without the dep does not inherit a previous instance's injection.
   uploadMediaProxy = deps.proxyUploadMedia ?? defaultUploadMediaProxy;
+  templateAdminProxy = deps.proxyTemplateAdmin ?? defaultTemplateAdminProxy;
+  listMetaTemplatesProxy = deps.proxyListMetaTemplates ?? defaultListMetaTemplatesProxy;
   registerSseForwarding();
   return {
     handle,

@@ -319,6 +319,63 @@ export async function sendTypingIndicatorDirect(
   }
 }
 
+export interface TemplateListRequest {
+  wabaId: string;
+  accessToken?: string;
+}
+
+/**
+ * Direct in-process template list from Meta (the pull half of template sync).
+ * No token degrades to an empty list + warning so sync callers can no-op
+ * gracefully; the HTTP route and the app-server monolith both delegate here.
+ */
+export async function listTemplatesDirect(payload: TemplateListRequest, _requestId: string): Promise<MetaDispatchResult> {
+  if (!payload.wabaId) {
+    return { status: 400, body: { error: "wabaId is required" } };
+  }
+  if (!payload.accessToken && !config.whatsappAccessToken) {
+    return { status: 200, body: { items: [], warning: "no_access_token" } };
+  }
+  try {
+    const response = await graphRequest(
+      `/${payload.wabaId}/message_templates?limit=200&fields=id,name,language,status,category,components`,
+      "GET",
+      undefined,
+      payload.accessToken
+    );
+    if (!response.ok) {
+      const graphError = await parseGraphError(response);
+      return { status: 502, body: { error: "meta_templates_failed", details: graphError } };
+    }
+    const body = (await response.json()) as {
+      data?: Array<{
+        id?: string;
+        name?: string;
+        language?: string;
+        status?: string;
+        category?: string;
+        components?: unknown;
+      }>;
+    };
+    const templates: MetaTemplateSummary[] = (body.data ?? [])
+      .filter((entry) => entry.name && entry.language)
+      .map((entry) => ({
+        name: entry.name!,
+        language: entry.language!,
+        status: mapMetaTemplateStatus(entry.status),
+        category: entry.category ? entry.category.toLowerCase() : undefined,
+        body: extractTemplateBody(entry.components),
+        metaTemplateId: entry.id
+      }));
+    return { status: 200, body: { items: templates } };
+  } catch (error) {
+    return {
+      status: 503,
+      body: { error: "meta_templates_failed", details: error instanceof Error ? error.message : String(error) }
+    };
+  }
+}
+
 export interface TemplateSubmitRequest {
   wabaId: string;
   accessToken?: string;
@@ -1338,50 +1395,8 @@ export const server = createServer(async (req, res) => {
         sendJson(res, 400, { error: "wabaId is required" });
         return;
       }
-      // No token — cannot call Meta API; return empty list so callers degrade gracefully.
-      if (!accessToken) {
-        sendJson(res, 200, { items: [], warning: "no_access_token" });
-        return;
-      }
-      try {
-        const response = await graphRequest(
-          `/${wabaId}/message_templates?limit=200&fields=id,name,language,status,category,components`,
-          "GET",
-          undefined,
-          accessToken
-        );
-        if (!response.ok) {
-          const graphError = await parseGraphError(response);
-          sendJson(res, 502, { error: "meta_templates_failed", details: graphError });
-          return;
-        }
-        const body = (await response.json()) as {
-          data?: Array<{
-            id?: string;
-            name?: string;
-            language?: string;
-            status?: string;
-            category?: string;
-            components?: unknown;
-          }>;
-        };
-        const templates: MetaTemplateSummary[] = (body.data ?? [])
-          .filter((entry) => entry.name && entry.language)
-          .map((entry) => ({
-            name: entry.name!,
-            language: entry.language!,
-            status: mapMetaTemplateStatus(entry.status),
-            category: entry.category ? entry.category.toLowerCase() : undefined,
-            body: extractTemplateBody(entry.components),
-            metaTemplateId: entry.id
-          }));
-        sendJson(res, 200, { items: templates });
-      } catch (error) {
-        sendJson(res, 503, {
-          error: "meta_templates_failed",
-          details: error instanceof Error ? error.message : String(error)
-        });
-      }
+      const { status, body } = await listTemplatesDirect({ wabaId, accessToken }, ctx.requestId);
+      sendJson(res, status, body);
       return;
     }
 
