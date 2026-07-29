@@ -153,6 +153,35 @@ export function serializeContactsCsv(contacts: readonly ExportableContact[]): st
   return [header, ...lines].join("\n");
 }
 
+export interface ExportableCampaignRecipient {
+  phoneE164: string;
+  status: string;
+  error?: string;
+  skipReason?: string;
+  sentAt?: string;
+  deliveredAt?: string;
+  readAt?: string;
+  externalMessageId?: string;
+}
+
+/** Serializes a campaign's per-recipient funnel for the analytics export. */
+export function serializeCampaignRecipientsCsv(recipients: readonly ExportableCampaignRecipient[]): string {
+  const header = "phone_e164,status,error,skip_reason,sent_at,delivered_at,read_at,external_message_id";
+  const lines = recipients.map((r) =>
+    [
+      csvCell(r.phoneE164),
+      csvCell(r.status),
+      csvCell(r.error),
+      csvCell(r.skipReason),
+      csvCell(r.sentAt),
+      csvCell(r.deliveredAt),
+      csvCell(r.readAt),
+      csvCell(r.externalMessageId)
+    ].join(",")
+  );
+  return [header, ...lines].join("\n");
+}
+
 /**
  * Extracts the first file body from a multipart/form-data buffer.
  * Returns the extracted bytes, or null if the buffer is not valid multipart.

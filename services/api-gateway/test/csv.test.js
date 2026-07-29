@@ -91,3 +91,36 @@ test("consent false values", () => {
   const { rows } = parseCsv(buf(csv));
   assert.equal(rows[0].consent, false);
 });
+
+// ─── serializeCampaignRecipientsCsv (G10 campaign analytics export) ─────────
+
+test("campaign recipients csv: header + rows with all funnel fields", async () => {
+  const { serializeCampaignRecipientsCsv } = await import("../dist/csv.js");
+  const csv = serializeCampaignRecipientsCsv([
+    {
+      phoneE164: "+15551230000",
+      status: "delivered",
+      sentAt: "2026-07-29T00:00:00.000Z",
+      deliveredAt: "2026-07-29T00:00:05.000Z",
+      externalMessageId: "wamid.X1"
+    },
+    { phoneE164: "+15551230001", status: "policy_skipped", skipReason: "quiet_hours" }
+  ]);
+  const lines = csv.split("\n");
+  assert.equal(lines[0], "phone_e164,status,error,skip_reason,sent_at,delivered_at,read_at,external_message_id");
+  assert.equal(lines[1], "+15551230000,delivered,,,2026-07-29T00:00:00.000Z,2026-07-29T00:00:05.000Z,,wamid.X1");
+  assert.equal(lines[2], "+15551230001,policy_skipped,,quiet_hours,,,,");
+});
+
+test("campaign recipients csv: quotes fields containing commas and quotes", async () => {
+  const { serializeCampaignRecipientsCsv } = await import("../dist/csv.js");
+  const csv = serializeCampaignRecipientsCsv([
+    { phoneE164: "+15551230002", status: "failed", error: 'Meta said "no", try later' }
+  ]);
+  assert.equal(csv.split("\n")[1], '+15551230002,failed,"Meta said ""no"", try later",,,,,');
+});
+
+test("campaign recipients csv: empty list is just the header", async () => {
+  const { serializeCampaignRecipientsCsv } = await import("../dist/csv.js");
+  assert.equal(serializeCampaignRecipientsCsv([]).split("\n").length, 1);
+});
