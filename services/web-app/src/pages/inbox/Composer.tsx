@@ -1,5 +1,6 @@
 import { useRef, useState, type KeyboardEvent } from "react";
 import { MessageSquarePlus, Send } from "lucide-react";
+import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import {
@@ -10,17 +11,24 @@ import {
   DropdownMenuTrigger
 } from "@/components/ui/dropdown-menu";
 import { useSavedReplies, useSendMessage } from "@/hooks/use-conversations";
+import { useTypingIndicator } from "@/hooks/use-typing-indicator";
+import { AttachMenu } from "./composer/AttachMenu";
+import { sendErrorMessage } from "./composer/send-error";
 
 export function Composer({ conversationId }: { conversationId: string }) {
   const [text, setText] = useState("");
   const ref = useRef<HTMLTextAreaElement>(null);
   const send = useSendMessage(conversationId);
+  const signalTyping = useTypingIndicator(conversationId);
   const { data: saved } = useSavedReplies();
 
   function submit() {
     const value = text.trim();
     if (!value || send.isPending) return;
-    send.mutate(value, { onSuccess: () => setText("") });
+    send.mutate(
+      { kind: "text", text: value },
+      { onSuccess: () => setText(""), onError: (e) => toast.error(sendErrorMessage(e)) }
+    );
   }
 
   function onKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
@@ -32,6 +40,7 @@ export function Composer({ conversationId }: { conversationId: string }) {
 
   return (
     <div className="flex items-end gap-2 border-t border-border p-3">
+      <AttachMenu conversationId={conversationId} />
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <Button variant="ghost" size="icon" aria-label="Saved replies">
@@ -60,7 +69,10 @@ export function Composer({ conversationId }: { conversationId: string }) {
       <Textarea
         ref={ref}
         value={text}
-        onChange={(e) => setText(e.target.value)}
+        onChange={(e) => {
+          setText(e.target.value);
+          signalTyping();
+        }}
         onKeyDown={onKeyDown}
         placeholder="Type a reply… (Enter to send, Shift+Enter for newline)"
         className="max-h-28 min-h-10 flex-1 resize-none"

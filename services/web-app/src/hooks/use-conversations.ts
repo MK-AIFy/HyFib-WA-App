@@ -1,6 +1,30 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import type { Conversation, Message, SavedReply } from "@hyfib/shared-core";
+import type {
+  Conversation,
+  Message,
+  SavedReply,
+  WhatsAppContactCard,
+  WhatsAppInteractivePayload,
+  WhatsAppOutboundRequest
+} from "@hyfib/shared-core";
 import { api } from "@/lib/api";
+
+export type TemplateSendPayload = NonNullable<WhatsAppOutboundRequest["template"]>;
+export type LocationSendPayload = NonNullable<WhatsAppOutboundRequest["location"]>;
+
+/**
+ * The set of outbound message kinds the composer can send, as a discriminated
+ * union on `kind`. Built from shared-core primitives (type-only imports); the
+ * gateway's own `SendMessageRequest` is looser (all-optional), so the UI keeps
+ * this stricter shape locally. Each variant is the exact JSON body POSTed to
+ * `/api/v1/conversations/:id/messages`.
+ */
+export type SendMessageBody =
+  | { kind: "text"; text: string; previewUrl?: boolean }
+  | { kind: "template"; template: TemplateSendPayload }
+  | { kind: "interactive"; interactive: WhatsAppInteractivePayload }
+  | { kind: "location"; location: LocationSendPayload }
+  | { kind: "contacts"; contacts: WhatsAppContactCard[] };
 
 interface ListResponse<T> {
   items: T[];
@@ -88,8 +112,12 @@ export function useSavedReplies() {
 export function useSendMessage(conversationId: string) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (text: string) =>
-      api.post<Message>(`/api/v1/conversations/${conversationId}/messages`, { kind: "text", text }),
+    // The route returns 202 { status: "message_enqueued", kind } — never a
+    // Message row (the send is async through the outbox), so nothing here reads
+    // the result; the invalidations below refetch the thread once the worker
+    // has persisted the outbound row.
+    mutationFn: (body: SendMessageBody) =>
+      api.post<{ status: string; kind: string }>(`/api/v1/conversations/${conversationId}/messages`, body),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ["messages", conversationId] });
       void qc.invalidateQueries({ queryKey: ["conversations"] });
