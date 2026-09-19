@@ -1,6 +1,7 @@
 services:
   edge-proxy:
-    image: nginx:1.27-alpine
+    # nginx stable branch, not a minor-pinned tag (see services/web-app/Dockerfile).
+    image: nginx:stable-alpine
     container_name: edge-proxy
     volumes:
       - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
