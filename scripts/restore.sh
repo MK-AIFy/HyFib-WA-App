@@ -8,7 +8,10 @@
 # connected clients, and refuses to drop an existing database unless
 # RESTORE_FORCE=1, so a fat-fingered invocation cannot silently destroy prod.
 # Prints post-restore evidence (migration + tenant counts, RLS spot-check) for
-# the DR-drill log.
+# the DR-drill log, then verifies that the configured CHANNEL_ENCRYPTION_KEY can
+# decrypt the restored channel tokens (scripts/verify-channel-key.sh) and exits 3
+# if it cannot. A missing key or a role that cannot read the tokens only prints a
+# NOTE/WARNING and does not change the exit status.
 #
 # Env: POSTGRES_HOST/PORT/USER/PASSWORD as backup.sh (superuser/platform
 # credentials — restore recreates the DB and needs to run DDL + GRANTs).
@@ -63,4 +66,12 @@ log "post-restore evidence:"
 psql -d "$target" -tAc "SELECT 'migrations applied: ' || count(*) FROM schema_migrations"
 psql -d "$target" -tAc "SELECT 'tenants: ' || count(*) FROM tenants"
 psql -d "$target" -tAc "SELECT 'RLS forced on contacts: ' || relforcerowsecurity FROM pg_class WHERE relname = 'contacts'"
+
+# Channel access tokens are encrypted with CHANNEL_ENCRYPTION_KEY, which is deliberately NOT in the dump.
+# A replacement VM generates a different key, so check now that the configured key can still decrypt what
+# was just restored (exit 3 = database restored, environment not fully recovered).
+verify_status=0
+bash "$(dirname "${BASH_SOURCE[0]}")/verify-channel-key.sh" "$target" || verify_status=$?
+
 log "done"
+exit "$verify_status"
