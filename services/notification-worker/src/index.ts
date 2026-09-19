@@ -901,9 +901,23 @@ async function handleInbound(event: EventEnvelope): Promise<void> {
     });
   }
 
-  // Send a read receipt (best-effort) using the resolved channel's credentials.
-  const sendChannel = await resolveSendChannel(channel.tenantId, channel.channelId);
-  await markRead(sendChannel, inbound.messageId, channel.tenantId);
+  // Send a read receipt using the resolved channel's credentials. Strictly best-effort: it must
+  // never gate the compliance-critical steps below (STOP/START, automations, flows, auto-replies).
+  // An undecryptable channel token (CHANNEL_ENCRYPTION_KEY mismatch/rotation) or a transient
+  // credential-lookup failure used to throw out of the handler here, after the message row was
+  // recorded; the replay guard then skipped every redelivery, permanently losing the customer's
+  // STOP. Outbound sends still fail loudly on the same condition (see handleOutbound).
+  try {
+    const sendChannel = await resolveSendChannel(channel.tenantId, channel.channelId);
+    await markRead(sendChannel, inbound.messageId, channel.tenantId);
+  } catch (error) {
+    logger.error("inbound_read_receipt_failed", {
+      tenantId: channel.tenantId,
+      channelId: channel.channelId,
+      messageId: inbound.messageId,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
 
   // Honour inbound STOP/START so opt-outs are respected automatically.
   if (isOptOutKeyword(inbound.text)) {
