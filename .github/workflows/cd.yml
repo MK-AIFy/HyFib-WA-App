@@ -23,6 +23,10 @@ jobs:
   publish-images:
     runs-on: ubuntu-latest
     strategy:
+      # Publish each image independently: with the default fail-fast, one image's
+      # failure cancels the other's job mid-build (the app-server image was never
+      # published for exactly that reason).
+      fail-fast: false
       matrix:
         include:
           - name: app-server
@@ -37,11 +41,19 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # Registry references must be lowercase, but github.repository keeps the owner's
+      # casing (MK-AIFy/HyFib-WA-App). metadata-action lowercases on its own; the Trivy
+      # step used to re-derive the name from the raw value and could not parse it, so the
+      # "scan the published image" gate never ran. Derive it once and feed both.
+      - name: Lowercase image name
+        env:
+          IMAGE_NAME: ${{ matrix.name }}
+        run: echo "IMAGE=$(echo "ghcr.io/${GITHUB_REPOSITORY}/${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
       - name: Image metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}/${{ matrix.name }}
+          images: ${{ env.IMAGE }}
           tags: |
             type=sha,format=long
             type=raw,value=latest,enable={{is_default_branch}}
@@ -56,7 +68,7 @@ jobs:
       - name: Scan the PUBLISHED image (CRITICAL gate)
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ghcr.io/${{ github.repository }}/${{ matrix.name }}:sha-${{ github.sha }}
+          image-ref: ${{ env.IMAGE }}:sha-${{ github.sha }}
           severity: CRITICAL
           ignore-unfixed: true
           exit-code: "1"
