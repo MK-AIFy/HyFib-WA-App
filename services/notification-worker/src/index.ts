@@ -794,6 +794,13 @@ async function defaultEnqueueMediaFetch(
 /** Overridable via WorkerDeps (see registerWorkerConsumers) so tests can avoid touching Postgres. */
 let enqueueMediaFetch: typeof defaultEnqueueMediaFetch = defaultEnqueueMediaFetch;
 
+/**
+ * Observability only, never a decision: text that mentions stopping ("Stop, wrong number") but that the keyword
+ * matcher declined to treat as an opt-out. Deliberately loose and independent of the matcher's vocabulary; a word
+ * counts when the letters around it are not part of another word ("unstoppable" does not, "STOP_PROMOTIONS" does).
+ */
+const POSSIBLE_OPT_OUT = /(?:^|[^a-z])(?:stop|unsubscribe|opt[^a-z]*out)(?:[^a-z]|$)/i;
+
 async function handleInbound(event: EventEnvelope): Promise<void> {
   incCounter("events_consumed_total", "Events consumed from the bus.", { topic: EventTopics.WhatsAppInboundReceived });
   const inbound = event.payload as InboundEvent;
@@ -841,6 +848,21 @@ async function handleInbound(event: EventEnvelope): Promise<void> {
   }
 
   const contact = await contactRepository.findOrCreateByPhone(channel.tenantId, inbound.from);
+
+  // Opt-out/opt-in keywords are matched against what the customer typed or tapped. A shared location's text is
+  // its place name ("Bus Stop 12"), not their words.
+  const keywordText = inbound.type === "location" ? undefined : inbound.text;
+
+  // Apply an opt-out BEFORE the message row below is written. That row is the replay guard's marker: once it
+  // exists a redelivery skips this whole handler, so a STOP applied after it — or half-applied because a later
+  // step threw (the media enqueue, the second write) — was lost for good. Both writes are idempotent, so if
+  // either throws here no row exists yet and the redelivery simply runs them again.
+  const isOptOut = isOptOutKeyword(keywordText);
+  if (isOptOut) {
+    await consentRepository.revoke(channel.tenantId, contact.id, "inbound_stop");
+    await contactRepository.setOptedOut(channel.tenantId, contact.id, true);
+  }
+
   const conversation = await conversationRepository.findOrCreate(channel.tenantId, contact.id, channel.channelId);
 
   // Stamp last_inbound_at for 24h session window tracking.
@@ -902,11 +924,12 @@ async function handleInbound(event: EventEnvelope): Promise<void> {
   }
 
   // Send a read receipt using the resolved channel's credentials. Strictly best-effort: it must
-  // never gate the compliance-critical steps below (STOP/START, automations, flows, auto-replies).
+  // never gate the steps below (START, automations, flows, auto-replies).
   // An undecryptable channel token (CHANNEL_ENCRYPTION_KEY mismatch/rotation) or a transient
   // credential-lookup failure used to throw out of the handler here, after the message row was
-  // recorded; the replay guard then skipped every redelivery, permanently losing the customer's
-  // STOP. Outbound sends still fail loudly on the same condition (see handleOutbound).
+  // recorded; the replay guard then skipped every redelivery, permanently losing everything that
+  // followed, the customer's STOP included (a STOP is now applied before the row is written).
+  // Outbound sends still fail loudly on the same condition (see handleOutbound).
   try {
     const sendChannel = await resolveSendChannel(channel.tenantId, channel.channelId);
     await markRead(sendChannel, inbound.messageId, channel.tenantId);
@@ -919,10 +942,9 @@ async function handleInbound(event: EventEnvelope): Promise<void> {
     });
   }
 
-  // Honour inbound STOP/START so opt-outs are respected automatically.
-  if (isOptOutKeyword(inbound.text)) {
-    await consentRepository.revoke(channel.tenantId, contact.id, "inbound_stop");
-    await contactRepository.setOptedOut(channel.tenantId, contact.id, true);
+  // Honour inbound STOP/START so opt-outs are respected automatically. A STOP's consent/opted-out writes were
+  // applied above, before the message row; what is left is the event, the metrics and suppressing everything else.
+  if (isOptOut) {
     await eventBus.publish(
       EventTopics.ComplianceOptOutEvent,
       { tenantId: channel.tenantId, contactId: contact.id, phoneE164: contact.phoneE164, reason: "inbound_stop" },
@@ -933,11 +955,27 @@ async function handleInbound(event: EventEnvelope): Promise<void> {
     return; // Don't auto-reply after STOP.
   }
 
-  if (isOptInKeyword(inbound.text)) {
+  // START is deliberately applied here, after the replay marker, unlike STOP: if it fails the customer stays opted
+  // out and can send START again, whereas retrying an older START after a newer STOP would silently re-consent them.
+  if (isOptInKeyword(keywordText)) {
     await consentRepository.grant(channel.tenantId, contact.id, { source: "inbound_start", policyVersion: "v1" });
     await contactRepository.setOptedOut(channel.tenantId, contact.id, false);
     incCounter("contact_opt_ins_total", "Contacts opted in.", { source: "inbound_start" });
     logger.info("inbound_opt_in", { tenantId: channel.tenantId, contactId: contact.id });
+  } else if (POSSIBLE_OPT_OUT.test(keywordText ?? "")) {
+    // Not an opt-out by the matcher's rules ("Stop, wrong number") but it reads like an attempt at one. Surface it
+    // so the gap is measurable and someone can be pointed at the message. Never log the customer's text.
+    incCounter(
+      "inbound_possible_opt_outs_total",
+      "Inbound messages that mention stopping but were not treated as an opt-out.",
+      { type: inbound.type ?? "unknown" }
+    );
+    logger.info("inbound_possible_opt_out", {
+      tenantId: channel.tenantId,
+      contactId: contact.id,
+      messageId: inbound.messageId,
+      type: inbound.type
+    });
   }
 
   // Default automations (G8): welcome on first contact, out-of-office outside
