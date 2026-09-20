@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Test double for psql, used by scripts/test/*.test.mjs. Answers are canned per SQL text and driven by
+# environment variables the test sets:
+#   FAKE_PSQL_FAIL       any value -> behave like an unreachable server (exit 2)
+#   FAKE_PSQL_BYPASS     answer to the "does this role bypass RLS" query (default t)
+#   FAKE_PSQL_ROWS_FILE  file whose contents answer the whatsapp_channels token query
+if [ -n "${FAKE_PSQL_FAIL:-}" ]; then
+  echo "psql: error: connection to server failed" >&2
+  exit 2
+fi
+case "$*" in
+  *rolsuper*) printf '%s\n' "${FAKE_PSQL_BYPASS:-t}" ;;
+  *whatsapp_channels*) if [ -n "${FAKE_PSQL_ROWS_FILE:-}" ]; then cat "$FAKE_PSQL_ROWS_FILE"; fi ;;
+  *schema_migrations*) echo "migrations applied: 33" ;;
+  *tenants*) echo "tenants: 1" ;;
+  *relforcerowsecurity*) echo "RLS forced on contacts: t" ;;
+  *) ;;
+esac

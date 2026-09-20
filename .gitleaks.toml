@@ -1,0 +1,21 @@
+# gitleaks configuration (gitleaks-action reads .gitleaks.toml from the repository root).
+title = "HyFib gitleaks config"
+
+[extend]
+useDefault = true
+
+# A narrow, VALUE-based allowlist for exactly two well-known TEST-ONLY channel-encryption keys used by CI,
+# unit tests and design docs: the 16-character blocks "0123456789abcdef" and "fedcba9876543210", on their
+# own or repeated (the 64-character literals in ci.yml and the `.repeat(4)` constants in the tests). They
+# are deterministic and obviously not random, but flag as generic-api-key because of the key-like name plus
+# hex entropy. The patterns are anchored to the whole secret, so any real key that merely contains these
+# strings is still reported, and nothing else is allowlisted.
+# The singular [allowlist] form is deliberate: gitleaks 8.24.x (what gitleaks-action@v2 installs today)
+# silently ignores a top-level [[allowlists]] array. Verified against planted secrets.
+[allowlist]
+description = "Test-only CHANNEL_ENCRYPTION_KEY values (deterministic, not secret)"
+regexTarget = "secret"
+regexes = [
+  '''^(0123456789abcdef)+$''',
+  '''^(fedcba9876543210)+$'''
+]

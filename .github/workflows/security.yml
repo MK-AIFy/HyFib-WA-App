@@ -12,8 +12,13 @@ jobs:
       contents: read
       security-events: write
     steps:
+      # gitleaks-action scans the PR's commit range (<first commit>^..<head>), so it needs the full history:
+      # with the default shallow checkout it fails with "unknown revision", scans ~0 bytes and reports
+      # nothing — the secret scan silently never ran on any PR.
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4

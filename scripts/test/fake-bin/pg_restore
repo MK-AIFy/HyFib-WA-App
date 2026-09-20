@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Test double for pg_restore: always succeeds.
+exit 0

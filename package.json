@@ -12,7 +12,7 @@
     "build": "pnpm -r build",
     "typecheck": "pnpm -r build",
     "dev": "pnpm -r --parallel dev",
-    "test": "pnpm -r test",
+    "test": "pnpm -r test && node --test \"scripts/test/*.test.mjs\"",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",

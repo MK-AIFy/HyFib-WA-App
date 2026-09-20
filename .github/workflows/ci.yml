@@ -124,6 +124,9 @@ jobs:
       POSTGRES_USER: platform
       POSTGRES_PASSWORD: bootpw
       BACKUP_DIR: /tmp/hyfib-backups
+      # Test-only key. restore.sh and verify-channel-key.sh read it from the environment, so the drill
+      # also proves the restored channel tokens still decrypt; the persistence suite reuses it too.
+      CHANNEL_ENCRYPTION_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -142,17 +145,41 @@ jobs:
           APP_DB_USER: hyfib_app
           APP_DB_PASSWORD: apppw
         run: pnpm migrate
+      # One channel token encrypted with the test key, so the restore-time key check has something real to
+      # decrypt (an empty table would report "nothing to verify" and pass for ANY key).
+      - name: Seed a channel token encrypted with the test key
+        run: |
+          ENC="$(node --input-type=module -e "import('file://' + process.cwd() + '/packages/shared-core/dist/index.js').then((m) => process.stdout.write(m.encryptSecret('drill-channel-token', process.env.CHANNEL_ENCRYPTION_KEY)))")"
+          PGPASSWORD="$POSTGRES_PASSWORD" psql -h "$POSTGRES_HOST" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 -v tok="$ENC" <<'SQL'
+          INSERT INTO whatsapp_channels (tenant_id, waba_id, phone_number_id, display_phone_number, access_token_encrypted)
+          SELECT id, 'waba-drill', 'pn-drill-1', '+15550000001', :'tok' FROM tenants LIMIT 1;
+          SQL
       - name: Backup
         run: bash scripts/backup.sh
       - name: Destroy the database (simulated disaster)
         run: PGPASSWORD=bootpw psql -h localhost -U platform -d postgres -c 'DROP DATABASE hyfib_wa'
       - name: Restore from the dump
         run: bash scripts/restore.sh "$(ls -1t "$BACKUP_DIR"/*.dump | head -1)"
+      # restore.sh above already verifies the key (exit 3 on mismatch). This step additionally proves the
+      # check RAN and verified the seeded token — a silent skip would print a NOTE/WARNING and exit 0.
+      - name: Key check passes with the right key
+        run: |
+          out="$(bash scripts/verify-channel-key.sh)"
+          echo "$out"
+          echo "$out" | grep -q 'channel tokens decryptable: 1/1'
+      # ...and the negative case: a wrong key must be detected, with exactly exit status 3.
+      - name: Key check exits 3 with the wrong key
+        env:
+          CHANNEL_ENCRYPTION_KEY: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+        run: |
+          status=0
+          bash scripts/verify-channel-key.sh || status=$?
+          echo "verify-channel-key.sh exited $status"
+          test "$status" -eq 3
       - name: Persistence suite against the RESTORED database
         env:
           NODE_ENV: test
           RUN_DB_TESTS: "1"
           POSTGRES_APP_USER: hyfib_app
           POSTGRES_APP_PASSWORD: apppw
-          CHANNEL_ENCRYPTION_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         run: pnpm --filter @hyfib/persistence test
