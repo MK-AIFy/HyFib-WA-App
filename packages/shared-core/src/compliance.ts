@@ -6,11 +6,31 @@
 // only as far as they are unambiguous: "unsubscribe" counts anywhere, "cancel"/"end"/"quit" only as the whole
 // message, and "stop" only as a whole request ("please stop", "stop sending me messages"). Opt-in re-grants
 // consent, the worse error to get wrong, so it only ever matches the whole message.
+//
+// How far a word is trusted also depends on who wrote it: see KeywordSource. Text the customer typed is their
+// own wording, while a tapped button's label is the business's, so the everyday words do not count there.
 
 const OPT_OUT_ANYWHERE = new Set(["unsubscribe", "optout", "stopall"]);
 const OPT_OUT_WHOLE_MESSAGE = new Set(["cancel", "end", "quit"]);
 // Deliberately not "yes": it answers any question, so it would silently re-subscribe an opted-out customer.
 const OPT_IN_WHOLE_MESSAGE = new Set(["start", "unstop", "subscribe", "optin"]);
+// The same, minus "start": as a button label that is navigation ("Start over", "Start booking"), and consent
+// granted from a tap the customer never read as consent is the error that cannot be taken back.
+const OPT_IN_SELECTION = new Set(["unstop", "subscribe", "optin"]);
+
+export interface KeywordSource {
+  /**
+   * Where the text came from, which decides how much an everyday word is trusted.
+   *
+   * "typed" (the default) is the customer's own wording — a message body or a media caption.
+   *
+   * "selection" is wording the BUSINESS chose and the customer merely tapped: a quick-reply button's title or
+   * payload, or a list reply. "Cancel" on an appointment template cancels the appointment, so it is not an
+   * opt-out, while "Unsubscribe" or "Stop promotions" plainly is. Selections therefore match only the consent
+   * vocabulary, never the everyday words.
+   */
+  source?: "typed" | "selection";
+}
 
 // Words that pad or soften a stop request without changing what it asks ("can you please stop messaging me").
 const STOP_FILLER = new Set([
@@ -55,22 +75,23 @@ function isStopRequest(words: string[]): boolean {
 }
 
 /** True if the inbound text is an opt-out command (e.g. "STOP", "please unsubscribe me", "Stop promotions"). */
-export function isOptOutKeyword(text: string | undefined): boolean {
+export function isOptOutKeyword(text: string | undefined, { source }: KeywordSource = {}): boolean {
   if (!text) {
     return false;
   }
   const words = tokenize(text);
   return (
     words.some((word) => OPT_OUT_ANYWHERE.has(word)) ||
-    OPT_OUT_WHOLE_MESSAGE.has(words.join(" ")) ||
+    (source !== "selection" && OPT_OUT_WHOLE_MESSAGE.has(words.join(" "))) ||
     isStopRequest(words)
   );
 }
 
 /** True if the inbound text is exactly an opt-in command (e.g. "START", "subscribe"). */
-export function isOptInKeyword(text: string | undefined): boolean {
+export function isOptInKeyword(text: string | undefined, { source }: KeywordSource = {}): boolean {
   if (!text) {
     return false;
   }
-  return OPT_IN_WHOLE_MESSAGE.has(tokenize(text).join(" "));
+  const keywords = source === "selection" ? OPT_IN_SELECTION : OPT_IN_WHOLE_MESSAGE;
+  return keywords.has(tokenize(text).join(" "));
 }

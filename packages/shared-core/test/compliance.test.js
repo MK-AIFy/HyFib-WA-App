@@ -171,6 +171,60 @@ test("opt-out and opt-in keywords do not overlap", () => {
   expectEach(isOptOutKeyword, ["START", "subscribe", "unstop", "opt-in"], false);
 });
 
+// A quick-reply button's title or payload is wording the BUSINESS chose and the customer merely tapped. "Cancel"
+// on an appointment template cancels the appointment; it is not a request to stop marketing. A tap on
+// "Unsubscribe" plainly is. So a selection honours only the consent vocabulary, never the everyday words that
+// count as keywords when the customer types them unprompted.
+function expectSelection(matcher, texts, expected) {
+  for (const text of texts) {
+    assert.equal(
+      matcher(text, { source: "selection" }),
+      expected,
+      `${matcher.name}(${JSON.stringify(text)}, selection) should be ${expected}`
+    );
+  }
+}
+
+test("a tapped everyday word is not an opt-out, though the same word typed still is", () => {
+  for (const label of ["Cancel", "CANCEL", "cancel", "End", "Quit."]) {
+    assert.equal(isOptOutKeyword(label, { source: "selection" }), false, `tapping ${label} must not opt out`);
+    assert.equal(isOptOutKeyword(label), true, `but typing ${label} still must`);
+  }
+});
+
+test("a tapped opt-out button is still honoured", () => {
+  expectSelection(
+    isOptOutKeyword,
+    ["Stop", "Stop promotions", "Stop marketing messages", "Unsubscribe", "STOP_PROMOTIONS", "STOP_ALL", "OPT_OUT"],
+    true
+  );
+});
+
+test("a tapped 'Start' is flow navigation, not consent, though typing START still opts in", () => {
+  assert.equal(isOptInKeyword("Start", { source: "selection" }), false);
+  assert.equal(isOptInKeyword("START", { source: "selection" }), false);
+  assert.equal(isOptInKeyword("Start"), true, "typing START is still an opt-in");
+});
+
+test("a tapped subscribe button still grants consent", () => {
+  expectSelection(isOptInKeyword, ["Subscribe", "Unstop", "Opt in", "OPTIN"], true);
+});
+
+test("ordinary button labels are neither an opt-out nor an opt-in", () => {
+  const labels = ["Yes", "No", "Cancel appointment", "End chat", "Start over", "Track my order", "Talk to an agent"];
+  expectSelection(isOptOutKeyword, labels, false);
+  expectSelection(isOptInKeyword, labels, false);
+});
+
+test("omitting the source matches passing 'typed' (callers that pass nothing are unaffected)", () => {
+  const corpus = ["STOP", "cancel", "end", "quit", "please stop", "unsubscribe", "Can you cancel my order?"];
+  const optIn = ["START", "start", "subscribe", "unstop", "yes", "when does it start"];
+  for (const text of [...corpus, ...optIn]) {
+    assert.equal(isOptOutKeyword(text), isOptOutKeyword(text, { source: "typed" }), `opt-out: ${text}`);
+    assert.equal(isOptInKeyword(text), isOptInKeyword(text, { source: "typed" }), `opt-in: ${text}`);
+  }
+});
+
 test("treats blank and symbol-only input as no keyword", () => {
   for (const matcher of [isOptOutKeyword, isOptInKeyword]) {
     expectEach(matcher, ["   ", "...", "!!!", "🛑"], false);
