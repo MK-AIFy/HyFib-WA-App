@@ -853,11 +853,16 @@ async function handleInbound(event: EventEnvelope): Promise<void> {
   // its place name ("Bus Stop 12"), not their words.
   const keywordText = inbound.type === "location" ? undefined : inbound.text;
 
+  // A button or list reply is a label the BUSINESS wrote and the customer merely tapped, so the everyday words do
+  // not count there: "Cancel" on an appointment template cancels the appointment and "Start over" restarts a flow.
+  // Only the plain consent vocabulary ("Unsubscribe", "Stop promotions") is honoured from a tap. See KeywordSource.
+  const keywordSource = inbound.type === "button" || inbound.type === "interactive" ? "selection" : "typed";
+
   // Apply an opt-out BEFORE the message row below is written. That row is the replay guard's marker: once it
   // exists a redelivery skips this whole handler, so a STOP applied after it — or half-applied because a later
   // step threw (the media enqueue, the second write) — was lost for good. Both writes are idempotent, so if
   // either throws here no row exists yet and the redelivery simply runs them again.
-  const isOptOut = isOptOutKeyword(keywordText);
+  const isOptOut = isOptOutKeyword(keywordText, { source: keywordSource });
   if (isOptOut) {
     await consentRepository.revoke(channel.tenantId, contact.id, "inbound_stop");
     await contactRepository.setOptedOut(channel.tenantId, contact.id, true);
@@ -957,7 +962,7 @@ async function handleInbound(event: EventEnvelope): Promise<void> {
 
   // START is deliberately applied here, after the replay marker, unlike STOP: if it fails the customer stays opted
   // out and can send START again, whereas retrying an older START after a newer STOP would silently re-consent them.
-  if (isOptInKeyword(keywordText)) {
+  if (isOptInKeyword(keywordText, { source: keywordSource })) {
     await consentRepository.grant(channel.tenantId, contact.id, { source: "inbound_start", policyVersion: "v1" });
     await contactRepository.setOptedOut(channel.tenantId, contact.id, false);
     incCounter("contact_opt_ins_total", "Contacts opted in.", { source: "inbound_start" });
