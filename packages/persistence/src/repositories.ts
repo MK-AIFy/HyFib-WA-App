@@ -2177,19 +2177,31 @@ export const conversationRepository = {
     });
   },
   /**
-   * Last inbound timestamp for a contact on ONE channel — the scope WhatsApp's 24h session window actually
-   * has, and therefore the one to use when deciding whether a send is allowed.
+   * Last inbound timestamp for a contact on the BUSINESS PHONE NUMBER behind `channelId` — the scope
+   * WhatsApp's 24h session window actually has, and therefore the one to use when deciding whether a send is
+   * allowed.
    *
-   * Conversations are keyed on (contact_id, channel_id) by findOrCreate, so this is normally a single row;
-   * the ORDER BY makes the answer deterministic if a duplicate ever appears (no unique constraint enforces it).
+   * Keyed on phone_number_id rather than the channel row, because one phone number can have several rows:
+   * whatsapp_channels has no uniqueness on phone_number_id and channelRepository.create does not check for
+   * duplicates, so re-registering a number after deactivating it leaves the old row in place. Inbound and
+   * outbound then disagree about which row is "the" channel — resolve_channel_by_phone_number_id takes the
+   * OLDEST row and ignores is_active, while firstActive takes the oldest ACTIVE one — so conversations pile
+   * up on one row while sends go out on another. Filtering by channel_id alone reported no window for a
+   * number that plainly has one, blocking a legitimate send.
+   *
+   * channel_type is matched too: phone_number_id holds the Page ID for messenger/instagram rows, a different
+   * identifier space, and those must never be treated as the same number.
    */
   async lastInboundAtForChannel(tenantId: string, contactId: string, channelId: string): Promise<Date | undefined> {
     return withTenant(tenantId, async (client) => {
       const result = await client.query<{ last_inbound_at: Date | null }>(
-        `SELECT last_inbound_at FROM conversations
-          WHERE contact_id = $1 AND channel_id = $2
-          ORDER BY last_inbound_at DESC NULLS LAST
-          LIMIT 1`,
+        `SELECT MAX(c.last_inbound_at) AS last_inbound_at
+           FROM conversations c
+           JOIN whatsapp_channels ch ON ch.id = c.channel_id
+           JOIN whatsapp_channels target ON target.id = $2
+          WHERE c.contact_id = $1
+            AND ch.phone_number_id = target.phone_number_id
+            AND ch.channel_type = target.channel_type`,
         [contactId, channelId]
       );
       return result.rows[0]?.last_inbound_at ?? undefined;
