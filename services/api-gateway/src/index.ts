@@ -1223,9 +1223,14 @@ async function sendConversationMessage(
   // Meta accepts a free-form message only inside the 24h customer-service window. The send is asynchronous,
   // so without this the route answered 202 "message_enqueued", the outbox dispatched later, and Meta rejected
   // it out of sight of the agent who typed it. Refuse it here instead, while there is still someone to tell.
-  // Only fetched for the kinds that need it, so a template send costs no extra query.
+  // The window belongs to THIS conversation, not to the contact: it is scoped to the business phone number
+  // the customer messaged, and the send below goes out over conversation.channelId. A contact-wide lookup
+  // (MAX across their conversations) would let a recent inbound on one channel authorise a free-form send on
+  // another the customer has never written to — reopening the same silent rejection from the other side.
+  // conversationRepository.getById already returned this row, so scoping it correctly also costs one query
+  // fewer than asking the contact.
   if (requiresSessionWindow(kind)) {
-    const lastInboundAt = await conversationRepository.lastInboundAt(tenantId, contact.id);
+    const lastInboundAt = conversation.lastInboundAt ? new Date(conversation.lastInboundAt) : undefined;
     const sessionWindow = evaluateSessionWindow({ kind, lastInboundAt });
     if (!sessionWindow.allowed) {
       incCounter("outbound_blocked_total", "Outbound sends refused before dispatch.", { reason: "session_window" });

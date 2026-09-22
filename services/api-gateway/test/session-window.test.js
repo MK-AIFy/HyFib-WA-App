@@ -90,6 +90,15 @@ test("a last-inbound timestamp in the future is treated as inside the window", (
   assert.equal(decision.allowed, true);
 });
 
+test("an unparseable last-inbound timestamp is refused, not waved through", () => {
+  // The caller passes the conversation's own last_inbound_at, which crosses the repository boundary as an ISO
+  // string. A malformed one becomes an Invalid Date, and every comparison against NaN is false — so without
+  // this guard a broken timestamp would read as "inside the window" and re-open the silent-failure path.
+  const decision = evaluateSessionWindow({ kind: "text", lastInboundAt: new Date("not-a-date"), now: NOW });
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.lastInboundAt, undefined, "an unusable timestamp must not be echoed back as fact");
+});
+
 test("an unknown kind is treated as free-form, not waved through", () => {
   // Validation rejects unknown kinds before this point; if a new kind is ever added, it must default to
   // needing the window rather than silently bypassing it.

@@ -40,8 +40,13 @@ export function evaluateSessionWindow(params: {
   lastInboundAt?: Date;
   now?: number;
 }): SessionWindowDecision {
-  const { kind, lastInboundAt } = params;
+  const { kind } = params;
   const now = params.now ?? Date.now();
+  // The caller reads this off a conversation row, where it crosses the repository boundary as an ISO string.
+  // An unparseable one yields an Invalid Date, and every comparison against NaN is false — so it has to be
+  // rejected here rather than falling through as "not expired", which is how it would otherwise read.
+  const lastInboundAt =
+    params.lastInboundAt && !Number.isNaN(params.lastInboundAt.getTime()) ? params.lastInboundAt : undefined;
   const lastInboundIso = lastInboundAt ? lastInboundAt.toISOString() : undefined;
 
   if (!requiresSessionWindow(kind)) {
