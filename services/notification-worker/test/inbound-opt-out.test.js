@@ -294,6 +294,107 @@ test("handleInbound: a 'Stop promotions' quick-reply tap is honoured as an opt-o
   }
 });
 
+// A button title or list-reply label is wording the BUSINESS chose and the customer merely tapped. "Cancel" on an
+// appointment template cancels the appointment, and "Start over" restarts a flow; neither is a consent decision.
+// The flow engine matches branches by exact button title, so these labels are ordinary navigation.
+test("handleInbound: tapping a 'Cancel' button cancels the appointment, it does not opt the customer out", async () => {
+  const h = harness();
+  try {
+    const { error } = await deliver(h, {
+      type: "button",
+      text: "Cancel",
+      button: { text: "Cancel", payload: "CANCEL_APPOINTMENT" }
+    });
+
+    assert.equal(error, undefined);
+    assert.deepEqual(h.calls.revoke, [], "a tapped Cancel must not revoke consent");
+    assert.deepEqual(h.calls.setOptedOut, []);
+    assert.equal(h.bus.published.some(isOptOutEvent), false);
+    assert.equal(h.calls.autoReplyList, 1, "the tap must carry on to the rest of the handler");
+  } finally {
+    h.restore();
+  }
+});
+
+test("handleInbound: tapping an 'End chat' list reply does not opt the customer out", async () => {
+  const h = harness();
+  try {
+    const { error } = await deliver(h, {
+      type: "interactive",
+      text: "End chat",
+      interactive: { kind: "list_reply", id: "end", title: "End chat" }
+    });
+
+    assert.equal(error, undefined);
+    assert.deepEqual(h.calls.revoke, []);
+    assert.deepEqual(h.calls.setOptedOut, []);
+  } finally {
+    h.restore();
+  }
+});
+
+test("handleInbound: typing the same everyday word the customer chose themselves still opts them out", async () => {
+  const h = harness();
+  try {
+    const { error } = await deliver(h, { text: "cancel" });
+
+    assert.equal(error, undefined);
+    assert.deepEqual(h.calls.revoke, [["t-1", "contact-1", "inbound_stop"]]);
+    assert.equal(h.state.optedOut, true);
+  } finally {
+    h.restore();
+  }
+});
+
+test("handleInbound: tapping 'Start over' is flow navigation, not a re-consent", async () => {
+  const h = harness();
+  try {
+    const { error } = await deliver(h, {
+      type: "button",
+      text: "Start over",
+      button: { text: "Start over", payload: "RESTART" }
+    });
+
+    assert.equal(error, undefined);
+    assert.deepEqual(h.calls.grant, [], "a tapped Start must not grant consent");
+    assert.deepEqual(h.calls.setOptedOut, []);
+  } finally {
+    h.restore();
+  }
+});
+
+test("handleInbound: tapping a bare 'Start' button is navigation too, though typing START still opts in", async () => {
+  const h = harness();
+  try {
+    const tapped = await deliver(h, { type: "button", text: "Start", button: { text: "Start", payload: "START" } });
+    assert.equal(tapped.error, undefined);
+    assert.deepEqual(h.calls.grant, [], "a tapped Start must not grant consent");
+
+    const typed = await deliver(h, { text: "START" });
+    assert.equal(typed.error, undefined);
+    assert.deepEqual(h.calls.grant, [["t-1", "contact-1", { source: "inbound_start", policyVersion: "v1" }]]);
+  } finally {
+    h.restore();
+  }
+});
+
+test("handleInbound: tapping a 'Subscribe' button still grants consent", async () => {
+  const h = harness();
+  try {
+    const { error } = await deliver(h, {
+      type: "interactive",
+      text: "Subscribe",
+      interactive: { kind: "button_reply", id: "sub", title: "Subscribe" }
+    });
+
+    assert.equal(error, undefined);
+    assert.deepEqual(h.calls.grant, [["t-1", "contact-1", { source: "inbound_start", policyVersion: "v1" }]]);
+    assert.deepEqual(h.calls.setOptedOut, [["t-1", "contact-1", false]]);
+  } finally {
+    h.restore();
+  }
+});
+
 test("handleInbound: an ordinary sentence containing an opt-out word does not opt the customer out", async () => {
   const h = harness();
   try {
