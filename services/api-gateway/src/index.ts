@@ -134,6 +134,7 @@ import { validateFlowDefinition } from "@hyfib/shared-core";
 import { resolveOrgTenant } from "./single-org.js";
 import { runOutboxRelayOnce } from "./outbox-relay.js";
 import { classifyRoute, API_RATE_LIMITS } from "./rate-limit.js";
+import { requiresSessionWindow, evaluateSessionWindow } from "./session-window.js";
 import {
   SESSION_COOKIE,
   parseCookies,
@@ -1217,6 +1218,32 @@ async function sendConversationMessage(
       return { status: 400, body: { error: validated.error } };
     }
     interactive = validated.value;
+  }
+
+  // Meta accepts a free-form message only inside the 24h customer-service window. The send is asynchronous,
+  // so without this the route answered 202 "message_enqueued", the outbox dispatched later, and Meta rejected
+  // it out of sight of the agent who typed it. Refuse it here instead, while there is still someone to tell.
+  // Only fetched for the kinds that need it, so a template send costs no extra query.
+  if (requiresSessionWindow(kind)) {
+    const lastInboundAt = await conversationRepository.lastInboundAt(tenantId, contact.id);
+    const sessionWindow = evaluateSessionWindow({ kind, lastInboundAt });
+    if (!sessionWindow.allowed) {
+      incCounter("outbound_blocked_total", "Outbound sends refused before dispatch.", { reason: "session_window" });
+      logger.info("outbound_blocked_session_window", {
+        tenantId,
+        conversationId,
+        kind,
+        lastInboundAt: sessionWindow.lastInboundAt
+      });
+      return {
+        status: 422,
+        body: {
+          error: "outside_session_window",
+          reason: sessionWindow.reason,
+          lastInboundAt: sessionWindow.lastInboundAt
+        }
+      };
+    }
   }
 
   await withTenant(tenantId, async (client) => {

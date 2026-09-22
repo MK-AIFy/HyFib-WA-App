@@ -342,7 +342,11 @@ export const openApiSpec = {
         parameters: [idParam("conversationId", "Conversation id")],
         responses: {
           "202": { description: "Enqueued on the durable outbox" },
-          "422": { description: "Contact opted out or payload invalid" }
+          "422": {
+            description:
+              "Contact opted out, payload invalid, or outside the 24h session window " +
+              "(error: outside_session_window — send a template instead)"
+          }
         }
       }
     },
