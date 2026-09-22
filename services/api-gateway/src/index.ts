@@ -287,7 +287,14 @@ const config = loadConfig();
 const logger = new Logger("api-gateway", config.logLevel as "debug" | "info" | "warn" | "error");
 const authenticator = createAuthenticator(config);
 let eventBus = createEventBus(config);
-const webhookIdempotency = new RedisIdempotencyStore(getRedisClient(config), 24 * 60 * 60);
+/** The claim/release pair the inbound webhook route needs; injectable so tests can drive it without Redis. */
+export interface WebhookIdempotencyStore {
+  isDuplicate(key: string): Promise<boolean>;
+  release(key: string): Promise<void>;
+}
+
+let webhookIdempotency: WebhookIdempotencyStore = new RedisIdempotencyStore(getRedisClient(config), 24 * 60 * 60);
+let resolveWebhookChannel = resolveChannelByPhoneNumberId;
 
 // Internal proxy to the webhook-ingestor. Injectable so the modular monolith
 // swaps in a direct in-process call instead of HTTP (Phase 3).
@@ -1732,11 +1739,6 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 401, { error: "Invalid webhook signature" });
       return;
     }
-    const signatureKey = `webhook:${normalizedSignature}`;
-    if (await webhookIdempotency.isDuplicate(signatureKey)) {
-      sendJson(res, 200, { status: "duplicate_ignored" });
-      return;
-    }
     // Reject unknown phone_number_id early to avoid silent drops downstream
     let parsedWebhookBody: Record<string, unknown> | undefined;
     try {
@@ -1752,13 +1754,35 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         | undefined;
       const phoneNumberIdStr = phoneNumberId?.phone_number_id as string | undefined;
       if (phoneNumberIdStr) {
-        const resolved = await resolveChannelByPhoneNumberId(phoneNumberIdStr);
+        // A DB outage here must NOT look like a rejected delivery: answer 502 so Meta retries. Because the
+        // idempotency key is not claimed until after this check, that retry is a fresh claim, not a duplicate.
+        let resolved: Awaited<ReturnType<typeof resolveChannelByPhoneNumberId>>;
+        try {
+          resolved = await resolveWebhookChannel(phoneNumberIdStr);
+        } catch (error) {
+          logger.error("webhook_channel_resolution_failed", {
+            requestId: ctx.requestId,
+            phoneNumberId: phoneNumberIdStr,
+            error: error instanceof Error ? error.message : String(error)
+          });
+          sendJson(res, 502, { error: "webhook_processing_unavailable" });
+          return;
+        }
         if (!resolved) {
           logger.warn("webhook_unknown_phone_number_id", { phoneNumberId: phoneNumberIdStr });
           sendJson(res, 200, { status: "channel_not_found" }); // always 200 to Meta
           return;
         }
       }
+    }
+    // Claim the delivery only once every check that can reject or fail it has passed. Claiming earlier left the
+    // key behind on those paths — for 24h — so Meta's retry of the very same delivery was swallowed as a
+    // duplicate and the messages in it were lost: on a channel that was not resolvable yet (the resolver also
+    // caches the negative result), and, worse, on a DB outage, where the throw escaped the release below entirely.
+    const signatureKey = `webhook:${normalizedSignature}`;
+    if (await webhookIdempotency.isDuplicate(signatureKey)) {
+      sendJson(res, 200, { status: "duplicate_ignored" });
+      return;
     }
     try {
       // Two call paths land here, and only one of them throws:
@@ -5288,6 +5312,10 @@ export interface GatewayDeps {
   proxyTemplateAdmin?: TemplateAdminProxy;
   /** Direct in-process Meta template list for sync (no HTTP hop to meta-adapter). */
   proxyListMetaTemplates?: ListMetaTemplatesProxy;
+  /** Inbound-webhook delivery dedupe. Defaults to the Redis-backed store; injected by tests. */
+  webhookIdempotencyStore?: WebhookIdempotencyStore;
+  /** Resolves a webhook's phone_number_id to a channel. Defaults to the persistence lookup; injected by tests. */
+  resolveWebhookChannel?: typeof resolveChannelByPhoneNumberId;
 }
 
 export interface GatewayModule {
@@ -5329,6 +5357,10 @@ export function createGatewayHandler(deps: GatewayDeps = {}): GatewayModule {
   uploadMediaProxy = deps.proxyUploadMedia ?? defaultUploadMediaProxy;
   templateAdminProxy = deps.proxyTemplateAdmin ?? defaultTemplateAdminProxy;
   listMetaTemplatesProxy = deps.proxyListMetaTemplates ?? defaultListMetaTemplatesProxy;
+  if (deps.webhookIdempotencyStore) {
+    webhookIdempotency = deps.webhookIdempotencyStore;
+  }
+  resolveWebhookChannel = deps.resolveWebhookChannel ?? resolveChannelByPhoneNumberId;
   registerSseForwarding();
   return {
     handle,
