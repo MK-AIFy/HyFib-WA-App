@@ -2160,12 +2160,37 @@ export const conversationRepository = {
       ]);
     });
   },
-  /** Returns the timestamp of the last inbound message for a contact across all channels (for 24h window check). */
+  /**
+   * Last inbound timestamp for a contact ACROSS ALL CHANNELS.
+   *
+   * Not the scope of WhatsApp's 24h window: that window belongs to the business phone number the customer
+   * messaged, so authorising a send on one channel with an inbound from another lets Meta reject it
+   * asynchronously. Use lastInboundAtForChannel when the answer decides whether a specific send may go out.
+   */
   async lastInboundAt(tenantId: string, contactId: string): Promise<Date | undefined> {
     return withTenant(tenantId, async (client) => {
       const result = await client.query<{ last_inbound_at: Date | null }>(
         "SELECT MAX(last_inbound_at) AS last_inbound_at FROM conversations WHERE contact_id = $1",
         [contactId]
+      );
+      return result.rows[0]?.last_inbound_at ?? undefined;
+    });
+  },
+  /**
+   * Last inbound timestamp for a contact on ONE channel — the scope WhatsApp's 24h session window actually
+   * has, and therefore the one to use when deciding whether a send is allowed.
+   *
+   * Conversations are keyed on (contact_id, channel_id) by findOrCreate, so this is normally a single row;
+   * the ORDER BY makes the answer deterministic if a duplicate ever appears (no unique constraint enforces it).
+   */
+  async lastInboundAtForChannel(tenantId: string, contactId: string, channelId: string): Promise<Date | undefined> {
+    return withTenant(tenantId, async (client) => {
+      const result = await client.query<{ last_inbound_at: Date | null }>(
+        `SELECT last_inbound_at FROM conversations
+          WHERE contact_id = $1 AND channel_id = $2
+          ORDER BY last_inbound_at DESC NULLS LAST
+          LIMIT 1`,
+        [contactId, channelId]
       );
       return result.rows[0]?.last_inbound_at ?? undefined;
     });
