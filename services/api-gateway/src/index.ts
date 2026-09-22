@@ -134,7 +134,7 @@ import { validateFlowDefinition } from "@hyfib/shared-core";
 import { resolveOrgTenant } from "./single-org.js";
 import { runOutboxRelayOnce } from "./outbox-relay.js";
 import { classifyRoute, API_RATE_LIMITS } from "./rate-limit.js";
-import { requiresSessionWindow, evaluateSessionWindow } from "./session-window.js";
+import { requiresSessionWindow, evaluateSessionWindow, SESSION_WINDOW_MS } from "./session-window.js";
 import {
   SESSION_COOKIE,
   parseCookies,
@@ -879,12 +879,23 @@ async function dispatchCampaign(
     };
   }
 
+  // Resolved before the policy check rather than after it: the 24h window is scoped to the channel the send
+  // goes out on, so it cannot be evaluated without knowing which channel that is. The only visible effect of
+  // the move is that a tenant with no active channel now gets its 409 before a policy 422.
+  const channel = await channelRepository.firstActive(tenantId);
+  if (!channel) {
+    return { status: 409, body: { error: "No active WhatsApp channel configured for tenant" } };
+  }
+
   const isOptedOut = knownContact.optedOut;
   const hasActiveConsent = await consentRepository.hasActiveConsent(tenantId, knownContact.id);
 
-  // Determine 24h window from last inbound message timestamp.
-  const lastInboundAt = await conversationRepository.lastInboundAt(tenantId, knownContact.id);
-  const isInside24hWindow = lastInboundAt ? Date.now() - lastInboundAt.getTime() < 24 * 60 * 60 * 1000 : false;
+  // The 24h window belongs to the business phone number the customer messaged, so it is read for THIS channel.
+  // The contact-wide MAX this replaced reported a window from any channel, which let an unapproved template
+  // through on a channel the customer had never written to — Meta then rejects it asynchronously, which is the
+  // silent failure the policy check exists to prevent.
+  const lastInboundAt = await conversationRepository.lastInboundAtForChannel(tenantId, knownContact.id, channel.id);
+  const isInside24hWindow = lastInboundAt ? Date.now() - lastInboundAt.getTime() < SESSION_WINDOW_MS : false;
 
   // Compute current local hour from contact timezone (fallback UTC).
   const tz = knownContact.timezone ?? "UTC";
@@ -913,11 +924,6 @@ async function dispatchCampaign(
 
   if (!policy.allowed) {
     return { status: 422, body: { error: "campaign_blocked_by_policy", reason: policy.reason } };
-  }
-
-  const channel = await channelRepository.firstActive(tenantId);
-  if (!channel) {
-    return { status: 409, body: { error: "No active WhatsApp channel configured for tenant" } };
   }
 
   await withTenant(tenantId, async (client) => {
