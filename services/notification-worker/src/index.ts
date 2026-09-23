@@ -1308,7 +1308,8 @@ async function runNewMessageAutomation(
  * PSID as "psid:<id>" in the phone field, and the page id routes via the same
  * resolver as WhatsApp phone-number ids. Keyword auto-replies reuse the
  * standard matcher + durable outbox; the outbound path routes them to the
- * social send edge by channel type.
+ * social send edge by channel type. Inbound STOP/START are honoured as
+ * handleInbound honours them, on the same side of the replay marker.
  */
 async function handleSocialInbound(event: EventEnvelope): Promise<void> {
   incCounter("events_consumed_total", "Events consumed from the bus.", { topic: EventTopics.SocialInboundReceived });
@@ -1329,6 +1330,23 @@ async function handleSocialInbound(event: EventEnvelope): Promise<void> {
     }
   }
   const contact = await contactRepository.findOrCreateByPhone(channel.tenantId, `psid:${inbound.senderId}`);
+
+  // Social text is always the customer's own typing: the ingestor forwards only message.text (quick-reply payloads
+  // are dropped, postbacks skipped) and the social send edge never offers buttons, so there is no business-written
+  // label to discount the way handleInbound does for a tapped WhatsApp button. See KeywordSource.
+  const keywordSource = "typed";
+  // Social series carry a channel label; the WhatsApp series keep their original label set unchanged.
+  const channelLabel = inbound.channelType ?? "unknown";
+
+  // Apply an opt-out BEFORE the message row below is written, as handleInbound does: that row is the replay guard's
+  // marker, so a STOP applied after it, or half-applied because a later step threw, would be skipped by every
+  // redelivery. Both writes are idempotent, so a redelivery after a failure here simply runs them again.
+  const isOptOut = isOptOutKeyword(inbound.text, { source: keywordSource });
+  if (isOptOut) {
+    await consentRepository.revoke(channel.tenantId, contact.id, "inbound_stop");
+    await contactRepository.setOptedOut(channel.tenantId, contact.id, true);
+  }
+
   const conversation = await conversationRepository.findOrCreate(channel.tenantId, contact.id, channel.channelId);
   await conversationRepository.touchInbound(channel.tenantId, conversation.id);
   await messageRepository.create(channel.tenantId, {
@@ -1343,6 +1361,52 @@ async function handleSocialInbound(event: EventEnvelope): Promise<void> {
     channelType: inbound.channelType,
     messageId: inbound.messageId
   });
+
+  // A STOP's consent/opted-out writes were applied above, before the message row; what is left is the event, the
+  // metrics and suppressing the auto-reply.
+  if (isOptOut) {
+    await eventBus.publish(
+      EventTopics.ComplianceOptOutEvent,
+      { tenantId: channel.tenantId, contactId: contact.id, phoneE164: contact.phoneE164, reason: "inbound_stop" },
+      channel.tenantId
+    );
+    incCounter("contact_opt_outs_total", "Contacts opted out.", { source: "inbound_stop", channel: channelLabel });
+    logger.info("inbound_opt_out", {
+      tenantId: channel.tenantId,
+      contactId: contact.id,
+      channelType: inbound.channelType
+    });
+    return; // Don't auto-reply after STOP.
+  }
+
+  // START is deliberately applied after the replay marker, for the reason handleInbound gives: a failed START leaves
+  // the customer opted out to send it again, whereas retrying an older START after a newer STOP would re-opt them in.
+  // Unlike handleInbound it only lifts the opt-out and grants no consent: consent_records are WhatsApp-scoped in
+  // persistence (grant writes channel='whatsapp'), and WhatsApp marketing consent must not be inferred from a
+  // Messenger/Instagram message. Recording a social consent needs a channel-aware grant, a separate persistence change.
+  if (isOptInKeyword(inbound.text, { source: keywordSource })) {
+    await contactRepository.setOptedOut(channel.tenantId, contact.id, false);
+    incCounter("contact_opt_ins_total", "Contacts opted in.", { source: "inbound_start", channel: channelLabel });
+    logger.info("inbound_opt_in", {
+      tenantId: channel.tenantId,
+      contactId: contact.id,
+      channelType: inbound.channelType
+    });
+  } else if (POSSIBLE_OPT_OUT.test(inbound.text ?? "")) {
+    // Declined by the matcher but reads like an attempt at an opt-out; see handleInbound. Never log the text.
+    incCounter(
+      "inbound_possible_opt_outs_total",
+      "Inbound messages that mention stopping but were not treated as an opt-out.",
+      { type: "text", channel: channelLabel }
+    );
+    logger.info("inbound_possible_opt_out", {
+      tenantId: channel.tenantId,
+      contactId: contact.id,
+      messageId: inbound.messageId,
+      type: "text",
+      channelType: inbound.channelType
+    });
+  }
 
   if (inbound.text) {
     const rules = await autoReplyRuleRepository.listEnabled(channel.tenantId);
