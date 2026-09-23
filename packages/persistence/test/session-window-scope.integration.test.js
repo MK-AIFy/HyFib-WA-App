@@ -1,6 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { tenantRepository, channelRepository, contactRepository, conversationRepository } from "../dist/index.js";
+import {
+  tenantRepository,
+  channelRepository,
+  contactRepository,
+  conversationRepository,
+  closePool
+} from "../dist/index.js";
 
 /**
  * WhatsApp's 24h session window belongs to the business phone number the customer messaged, not to the
@@ -173,4 +179,10 @@ test("RLS: another tenant cannot read this tenant's window", { skip }, async () 
 
   const leaked = await conversationRepository.lastInboundAtForChannel(other.id, f.contact.id, f.channelA.id);
   assert.equal(leaked, undefined, "the query must be tenant-isolated like every other conversation read");
+});
+
+test.after(async () => {
+  if (!skip) {
+    await closePool();
+  }
 });
