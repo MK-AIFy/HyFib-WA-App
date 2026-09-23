@@ -84,4 +84,16 @@ describe("api client", () => {
     expect(localStorage.getItem("hf_tname")).toBeNull();
     clearSession();
   });
+
+  it("getBlob clears the session and notifies the unauthorized handler on 401", async () => {
+    writeSession({ tenantId: "t1", tenantName: "Acme", role: "tenant_admin" });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(401, { error: "Not authenticated" })));
+    const handler = vi.fn();
+    setUnauthorizedHandler(handler);
+
+    await expect(api.getBlob("/api/v1/contacts/export")).rejects.toMatchObject({ status: 401 });
+
+    expect(handler).toHaveBeenCalledOnce();
+    expect(localStorage.getItem("hf_tname")).toBeNull();
+  });
 });
