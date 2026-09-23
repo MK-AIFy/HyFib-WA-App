@@ -154,6 +154,10 @@ export const openApiSpec = {
         responses: {
           ...ok("Session created; token doubles as the Bearer credential"),
           "401": { description: "Invalid credentials" },
+          "403": {
+            description:
+              "Correct credentials, but the account is not active (suspended, disabled or invited) or the organization is suspended"
+          },
           "429": { description: "Rate limited" }
         }
       }

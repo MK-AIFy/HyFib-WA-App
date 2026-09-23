@@ -33,6 +33,10 @@ export function canCreateOrder(auth: AuthContext): boolean {
 //  3. An admin may manage (re-role, suspend, reset the password of) only a user
 //     whose every role it could itself have granted, so a tenant_admin cannot
 //     touch a platform_owner.
+//  4. Nobody changes their own status. A suspended admin whose credential still
+//     works must not be able to reactivate itself, and an admin who suspends
+//     itself locks itself out; either way it takes a second admin.
+//  5. Only an active account signs in or keeps a session (authorizeAccountStatus).
 
 /** resolveAuth gives an API-key caller the subject `apikey:<key id>`; nothing else marks one. */
 export const API_KEY_SUBJECT_PREFIX = "apikey:";
@@ -60,6 +64,15 @@ const API_KEY_FORBIDDEN: AccessDecision = {
     "API keys cannot create users, change a user's roles, status or password, or mint API keys; " +
     "sign in as an administrator to do this."
 };
+
+/**
+ * Whether two user ids name the same user. A UUID is the same id in either letter case (Postgres compares uuid
+ * values, and the routes accept either spelling), so every "is this the caller?" check goes through here; a
+ * case-sensitive comparison lets an upper-cased id in a path slip past a rule meant for the caller's own account.
+ */
+export function isSameUserId(a: string, b: string): boolean {
+  return a.toLowerCase() === b.toLowerCase();
+}
 
 /**
  * True for a caller authenticated by API key. Any other caller whose subject happens to carry the
@@ -140,15 +153,28 @@ function authorizeManage(auth: AuthContext, target: ManagedUser): AccessDecision
   return ALLOWED;
 }
 
-/** PATCH /users/:id. `roles` is the requested new role set, or undefined for a status-only change. */
+const CANNOT_CHANGE_OWN_STATUS: AccessDecision = {
+  ok: false,
+  error: "cannot_change_own_status",
+  detail: "Another administrator must change your account's status."
+};
+
+/**
+ * PATCH /users/:id. `roles` is the requested new role set, or undefined for a status-only change; `status` is the
+ * requested new status, or undefined when the status is not being changed.
+ */
 export function authorizeUserUpdate(
   auth: AuthContext,
   target: ManagedUser,
-  roles: readonly string[] | undefined
+  roles: readonly string[] | undefined,
+  status?: string
 ): AccessDecision {
   const gate = authorizeIdentityAdmin(auth);
   if (!gate.ok) {
     return gate;
+  }
+  if (status !== undefined && isSameUserId(auth.subject, target.id)) {
+    return CANNOT_CHANGE_OWN_STATUS;
   }
   const manage = authorizeManage(auth, target);
   if (!manage.ok) {
@@ -162,7 +188,7 @@ export function authorizePasswordSet(auth: AuthContext, target: ManagedUser): Ac
   if (isApiKeyCaller(auth)) {
     return API_KEY_FORBIDDEN;
   }
-  if (auth.subject === target.id) {
+  if (isSameUserId(auth.subject, target.id)) {
     return ALLOWED;
   }
   if (!hasAnyRole(auth, USER_ADMIN_ROLES)) {
@@ -170,4 +196,26 @@ export function authorizePasswordSet(auth: AuthContext, target: ManagedUser): Ac
     return { ok: false, error: "Can only change your own password" };
   }
   return authorizeManage(auth, target);
+}
+
+// ─── Account status ───────────────────────────────────────────────────────────
+// users.status is active, invited, suspended or disabled (the set PATCH /users/:id accepts). Only an active account
+// may sign in or authenticate with a session it already holds; every other value, one this code does not know
+// included, is refused, so a new status fails closed.
+
+/** The one status that signs in and keeps a session. */
+export const ACTIVE_ACCOUNT_STATUS = "active";
+
+// `error` is what the login page shows. "Account is suspended" is the wording /auth/login has always returned.
+const INACTIVE_ACCOUNT_MESSAGES: ReadonlyMap<string | undefined, string> = new Map([
+  ["suspended", "Account is suspended"],
+  ["disabled", "Account is disabled"]
+]);
+
+/** Whether an account in `status` may sign in or use a session. A user that was not found (undefined) may not. */
+export function authorizeAccountStatus(status: string | undefined): AccessDecision {
+  if (status === ACTIVE_ACCOUNT_STATUS) {
+    return ALLOWED;
+  }
+  return { ok: false, error: INACTIVE_ACCOUNT_MESSAGES.get(status) ?? "Account is not active" };
 }
