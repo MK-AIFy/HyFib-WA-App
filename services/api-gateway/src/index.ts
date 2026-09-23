@@ -92,6 +92,7 @@ import {
   parseListQuery,
   boundedText,
   parseOptionalIsoDate,
+  parseStatusCallbackUrl,
   clampInt,
   validateInteractivePayload,
   validateCampaignBody,
@@ -2594,8 +2595,19 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         sendJson(res, 400, { error: "statusCallbackSecret must be at most 128 characters" });
         return;
       }
+      // SSRF: the worker POSTs to this URL on every message event.
+      const callbackUrl = parseStatusCallbackUrl(payload.statusCallbackUrl);
+      if (!callbackUrl.ok) {
+        logger.warn("whatsapp_settings_callback_url_rejected", {
+          tenantId,
+          actor: auth.subject,
+          reason: callbackUrl.error
+        });
+        sendJson(res, 400, { error: callbackUrl.error });
+        return;
+      }
       const settings = await whatsappSettingsRepository.upsert(tenantId, {
-        statusCallbackUrl: payload.statusCallbackUrl?.trim() || undefined,
+        statusCallbackUrl: callbackUrl.value,
         statusCallbackSecret: payload.statusCallbackSecret?.trim() || undefined,
         graphVersion: payload.graphVersion?.trim() || config.whatsappGraphVersion,
         retryMaxAttempts: clampInt(payload.retryMaxAttempts, 1, 10, config.whatsappDefaultRetryMaxAttempts),
