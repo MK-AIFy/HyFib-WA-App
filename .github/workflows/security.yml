@@ -1,7 +1,10 @@
 name: Security Checks
 
 on:
+  # Only pull requests into main (i.e. develop -> main): feature PRs into develop deliberately run no checks.
+  # gitleaks scans the whole PR range, so the develop -> main PR still covers every commit it brings in.
   pull_request:
+    branches: ["main", "master"]
   schedule:
     - cron: "0 2 * * 1"
 

@@ -1,9 +1,14 @@
 name: CI
 
 on:
+  # Development happens on develop, which deliberately runs no CI: the full suite runs when develop is merged
+  # into main — on the pull request into main, and on the resulting push to main. Feature PRs into develop and
+  # pushes to develop trigger nothing; run it by hand with workflow_dispatch if a branch needs it early.
   push:
-    branches: ["main", "master", "develop", "feature/**", "claude/**"]
+    branches: ["main", "master"]
   pull_request:
+    branches: ["main", "master"]
+  workflow_dispatch:
 
 jobs:
   build-test:
