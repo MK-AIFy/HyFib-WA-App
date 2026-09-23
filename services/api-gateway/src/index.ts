@@ -148,6 +148,7 @@ import { validateFlowDefinition } from "@hyfib/shared-core";
 import { resolveOrgTenant } from "./single-org.js";
 import { runOutboxRelayOnce } from "./outbox-relay.js";
 import { classifyRoute, API_RATE_LIMITS } from "./rate-limit.js";
+import { AUTH_UNAVAILABLE_RETRY_AFTER_SECONDS, classifyAuthFailure, summarizeAuthFailure } from "./auth-failure.js";
 import { requiresSessionWindow, evaluateSessionWindow, SESSION_WINDOW_MS } from "./session-window.js";
 import {
   SESSION_COOKIE,
@@ -801,7 +802,45 @@ async function resolveSessionToken(rawToken: string): Promise<AuthContext | unde
  */
 const sessionKeyByRequest = new WeakMap<IncomingMessage, string>();
 
-async function resolveAuth(req: IncomingMessage): Promise<AuthContext> {
+/** Which credential was being checked, for the log line and metric of an auth-store outage. Never the credential. */
+type AuthKind = "none" | "api_key" | "bearer_session" | "cookie_session" | "jwt" | "session" | "password";
+
+/** Filled in by resolveAuth as it goes, so a caller handling its error knows which lookup failed. */
+interface AuthAttempt {
+  kind: AuthKind;
+}
+
+/**
+ * Answers 503 auth_unavailable (with Retry-After) for a store the gateway checks credentials against that it could
+ * not reach: the credential may be perfectly good, so the client should retry rather than sign in again. Logged at
+ * error and counted. Only the kind of credential is logged, never the credential. No cookie is set or cleared —
+ * only a genuine refusal may clear a session cookie — so any Set-Cookie staged before the failure is dropped.
+ */
+function sendAuthUnavailable(
+  res: ServerResponse,
+  request: { requestId: string; method: string; path: string },
+  authKind: AuthKind,
+  error: unknown
+): void {
+  const failure = summarizeAuthFailure(error);
+  logger.error("auth_backend_unavailable", {
+    requestId: request.requestId,
+    method: request.method,
+    path: request.path,
+    authKind,
+    errorName: failure.name,
+    errorCode: failure.code,
+    error: failure.message
+  });
+  incCounter("auth_backend_unavailable_total", "Requests refused 503 because the auth store could not be reached.", {
+    kind: authKind
+  });
+  res.removeHeader("Set-Cookie");
+  res.setHeader("Retry-After", String(AUTH_UNAVAILABLE_RETRY_AFTER_SECONDS));
+  sendJson(res, 503, { error: "auth_unavailable", retryAfterSeconds: AUTH_UNAVAILABLE_RETRY_AFTER_SECONDS });
+}
+
+async function resolveAuth(req: IncomingMessage, attempt: AuthAttempt = { kind: "none" }): Promise<AuthContext> {
   const authHeader = req.headers["authorization"];
 
   // 0. Public API key (Phase D): "Bearer hyfib_…". The key's bound roles
@@ -809,6 +848,7 @@ async function resolveAuth(req: IncomingMessage): Promise<AuthContext> {
   // unchanged. An unknown or revoked key fails HARD — it must never fall
   // through to weaker auth paths.
   if (authHeader?.startsWith("Bearer hyfib_") && orgTenantId) {
+    attempt.kind = "api_key";
     const apiKey = await apiKeyRepository.findActiveByHash(orgTenantId, hashApiKey(authHeader.slice(7)));
     if (!apiKey) {
       throw new AuthError("Invalid or revoked API key", 401);
@@ -824,6 +864,7 @@ async function resolveAuth(req: IncomingMessage): Promise<AuthContext> {
   // 1. Bearer session token (works in all modes) — takes precedence over the cookie.
   if (authHeader?.startsWith("Bearer ")) {
     const bearerToken = authHeader.slice(7);
+    attempt.kind = "bearer_session";
     const authCtx = await resolveSessionToken(bearerToken);
     if (authCtx) {
       sessionKeyByRequest.set(req, tokenHash(bearerToken));
@@ -834,6 +875,7 @@ async function resolveAuth(req: IncomingMessage): Promise<AuthContext> {
   // 2. HttpOnly session cookie (browser clients that have switched off Bearer).
   const cookieToken = parseCookies(cookieHeaderOf(req))[SESSION_COOKIE];
   if (cookieToken) {
+    attempt.kind = "cookie_session";
     const authCtx = await resolveSessionToken(cookieToken);
     if (authCtx) {
       sessionKeyByRequest.set(req, tokenHash(cookieToken));
@@ -842,6 +884,7 @@ async function resolveAuth(req: IncomingMessage): Promise<AuthContext> {
   }
 
   if (config.authEnabled) {
+    attempt.kind = "jwt";
     return authenticator.authenticate(authHeader);
   }
 
@@ -2273,54 +2316,65 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 429, { error: "Too many login attempts. Try again later." });
       return;
     }
-    const found = await userRepository.findByEmailForAuth(body.email);
-    if (!found || !found.passwordHash) {
-      sendJson(res, 401, { error: "Invalid email or password" });
-      return;
-    }
-    const valid = await verifyPassword(body.password, found.passwordHash);
-    if (!valid) {
-      sendJson(res, 401, { error: "Invalid email or password" });
-      return;
-    }
-    // Every status but active is refused. Checked only once the password is proven, so a caller without it cannot
-    // learn that the account exists or what state it is in.
-    const account = authorizeAccountStatus(found.status);
-    if (!account.ok) {
-      logger.warn("login_refused_inactive_account", {
-        tenantId: found.tenantId,
-        userId: found.id,
-        status: found.status
-      });
-      sendJson(res, 403, { error: account.error });
-      return;
-    }
-    const tenant = await tenantRepository.getById(found.tenantId);
-    if (tenant?.status === "suspended") {
-      sendJson(res, 403, { error: "Organization account is suspended" });
-      return;
-    }
-    const rawToken = randomUUID() + randomUUID();
-    await sessionRepository.create({
-      userId: found.id,
-      tenantId: found.tenantId,
-      tokenHash: tokenHash(rawToken),
-      ttlSeconds: SESSION_TTL
-    });
-    setSessionCookie(res, rawToken, req);
-    logger.info("user_login", { tenantId: found.tenantId, userId: found.id, email: body.email });
-    sendJson(res, 200, {
-      token: rawToken,
-      user: {
-        id: found.id,
-        email: found.email,
-        displayName: found.displayName,
-        roles: found.roles,
-        tenantId: found.tenantId,
-        tenant
+    try {
+      const found = await userRepository.findByEmailForAuth(body.email);
+      if (!found || !found.passwordHash) {
+        sendJson(res, 401, { error: "Invalid email or password" });
+        return;
       }
-    });
-    return;
+      const valid = await verifyPassword(body.password, found.passwordHash);
+      if (!valid) {
+        sendJson(res, 401, { error: "Invalid email or password" });
+        return;
+      }
+      // Every status but active is refused. Checked only once the password is proven, so a caller without it cannot
+      // learn that the account exists or what state it is in.
+      const account = authorizeAccountStatus(found.status);
+      if (!account.ok) {
+        logger.warn("login_refused_inactive_account", {
+          tenantId: found.tenantId,
+          userId: found.id,
+          status: found.status
+        });
+        sendJson(res, 403, { error: account.error });
+        return;
+      }
+      const tenant = await tenantRepository.getById(found.tenantId);
+      if (tenant?.status === "suspended") {
+        sendJson(res, 403, { error: "Organization account is suspended" });
+        return;
+      }
+      const rawToken = randomUUID() + randomUUID();
+      await sessionRepository.create({
+        userId: found.id,
+        tenantId: found.tenantId,
+        tokenHash: tokenHash(rawToken),
+        ttlSeconds: SESSION_TTL
+      });
+      setSessionCookie(res, rawToken, req);
+      logger.info("user_login", { tenantId: found.tenantId, userId: found.id, email: body.email });
+      sendJson(res, 200, {
+        token: rawToken,
+        user: {
+          id: found.id,
+          email: found.email,
+          displayName: found.displayName,
+          roles: found.roles,
+          tenantId: found.tenantId,
+          tenant
+        }
+      });
+      return;
+    } catch (error) {
+      // An account or session store that could not be reached is not a wrong password: 503, not 401. The account
+      // lookup fails the same way whether or not the account exists, so this reveals nothing about it; a later
+      // failure comes only after the password is proven. Anything else propagates exactly as before.
+      if (classifyAuthFailure(error) !== "unavailable") {
+        throw error;
+      }
+      sendAuthUnavailable(res, { requestId: ctx.requestId, method, path }, "password", error);
+      return;
+    }
   }
 
   if (path === "/auth/logout" && method === "POST") {
@@ -2358,67 +2412,99 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     // token (e.g. from before Task 18's cookie migration) 401'd callers who
     // had a perfectly valid cookie session. Fall through to the cookie only
     // when the bearer is present but doesn't resolve to a live session.
-    const authHeader = req.headers["authorization"];
-    const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : undefined;
-    const cookieToken = parseCookies(cookieHeaderOf(req))[SESSION_COOKIE];
+    try {
+      const authHeader = req.headers["authorization"];
+      const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : undefined;
+      const cookieToken = parseCookies(cookieHeaderOf(req))[SESSION_COOKIE];
 
-    let rawToken = bearerToken;
-    let session = rawToken ? await sessionRepository.findByToken(tokenHash(rawToken)) : undefined;
-    if (!session && cookieToken && cookieToken !== bearerToken) {
-      rawToken = cookieToken;
-      session = await sessionRepository.findByToken(tokenHash(rawToken));
-    }
-    if (!rawToken) {
-      sendJson(res, 401, { error: "Not authenticated" });
-      return;
-    }
-    if (!session) {
-      sendJson(res, 401, { error: "Session expired or invalid" });
-      return;
-    }
-    const u = await userRepository.getById(session.tenantId, session.userId);
-    if (!u) {
-      sendJson(res, 401, { error: "User not found" });
-      return;
-    }
-    // Same rule as every other route (resolveSessionToken): a session of a user who is not active is not signed in.
-    const refusal = await refuseInactiveSession(tokenHash(rawToken), session, u);
-    if (refusal) {
-      // The refused session came from the cookie: drop the cookie too, as logout does, so the browser stops sending
-      // a credential that no longer works.
-      if (cookieToken !== undefined && cookieToken === rawToken) {
-        clearSessionCookie(res, req);
+      let rawToken = bearerToken;
+      let session = rawToken ? await sessionRepository.findByToken(tokenHash(rawToken)) : undefined;
+      if (!session && cookieToken && cookieToken !== bearerToken) {
+        rawToken = cookieToken;
+        session = await sessionRepository.findByToken(tokenHash(rawToken));
       }
-      sendJson(res, 401, { error: refusal.error });
+      if (!rawToken) {
+        sendJson(res, 401, { error: "Not authenticated" });
+        return;
+      }
+      if (!session) {
+        sendJson(res, 401, { error: "Session expired or invalid" });
+        return;
+      }
+      const u = await userRepository.getById(session.tenantId, session.userId);
+      if (!u) {
+        sendJson(res, 401, { error: "User not found" });
+        return;
+      }
+      // Same rule as every other route (resolveSessionToken): a session of a user who is not active is not signed in.
+      const refusal = await refuseInactiveSession(tokenHash(rawToken), session, u);
+      if (refusal) {
+        // The refused session came from the cookie: drop the cookie too, as logout does, so the browser stops sending
+        // a credential that no longer works.
+        if (cookieToken !== undefined && cookieToken === rawToken) {
+          clearSessionCookie(res, req);
+        }
+        sendJson(res, 401, { error: refusal.error });
+        return;
+      }
+      const tenant = await tenantRepository.getById(session.tenantId);
+      // Silent upgrade: an existing localStorage/Bearer session gets an
+      // HttpOnly cookie issued the first time it hits /auth/me without one
+      // already present. Cookie-authenticated calls (bearerToken absent, or a
+      // stale bearer that fell through to a cookie above) never re-set —
+      // `!cookieToken` is false in both those cases, so nothing changed for
+      // them.
+      if (bearerToken && !cookieToken) {
+        setSessionCookie(res, bearerToken, req);
+      }
+      sendJson(res, 200, {
+        id: u.id,
+        email: u.email,
+        displayName: u.displayName,
+        roles: u.roles,
+        status: u.status,
+        tenantId: session.tenantId,
+        tenant
+      });
+      return;
+    } catch (error) {
+      // A session store that could not be reached says nothing about the session: 503 (the client retries), and the
+      // cookie is neither cleared nor revoked. Anything else propagates exactly as before.
+      if (classifyAuthFailure(error) !== "unavailable") {
+        throw error;
+      }
+      sendAuthUnavailable(res, { requestId: ctx.requestId, method, path }, "session", error);
       return;
     }
-    const tenant = await tenantRepository.getById(session.tenantId);
-    // Silent upgrade: an existing localStorage/Bearer session gets an
-    // HttpOnly cookie issued the first time it hits /auth/me without one
-    // already present. Cookie-authenticated calls (bearerToken absent, or a
-    // stale bearer that fell through to a cookie above) never re-set —
-    // `!cookieToken` is false in both those cases, so nothing changed for
-    // them.
-    if (bearerToken && !cookieToken) {
-      setSessionCookie(res, bearerToken, req);
-    }
-    sendJson(res, 200, {
-      id: u.id,
-      email: u.email,
-      displayName: u.displayName,
-      roles: u.roles,
-      status: u.status,
-      tenantId: session.tenantId,
-      tenant
-    });
-    return;
   }
 
   // ─── JWT / header auth ────────────────────────────────────────────────────
   let auth: AuthContext;
+  const authAttempt: AuthAttempt = { kind: "none" };
   try {
-    auth = await resolveAuth(req);
+    auth = await resolveAuth(req, authAttempt);
   } catch (error) {
+    // A store the credential is checked against that could not be reached is not a refused credential: 503, so the
+    // client retries instead of signing its user out. It is still a refusal: the request is not authenticated, and
+    // resolveAuth threw before any other credential or the dev-header fallback was tried.
+    if (classifyAuthFailure(error) === "unavailable") {
+      sendAuthUnavailable(res, { requestId: ctx.requestId, method, path }, authAttempt.kind, error);
+      return;
+    }
+    if (!(error instanceof AuthError)) {
+      // Not a deliberate refusal and not a recognised outage: answered 401 as it always was, and logged, so an
+      // outage shape missing from auth-failure.ts shows up instead of silently signing users out.
+      const failure = summarizeAuthFailure(error);
+      logger.warn("auth_failure_unclassified", {
+        requestId: ctx.requestId,
+        method,
+        path,
+        authKind: authAttempt.kind,
+        errorName: failure.name,
+        errorCode: failure.code,
+        error: failure.message
+      });
+    }
     const status = error instanceof AuthError ? error.status : 401;
     sendJson(res, status, { error: "unauthenticated", detail: error instanceof Error ? error.message : "auth failed" });
     return;
