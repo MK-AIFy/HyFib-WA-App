@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { tenantRepository, channelRepository, resolveChannelByPhoneNumberId } from "../dist/index.js";
+import { tenantRepository, channelRepository, resolveChannelByPhoneNumberId, closePool } from "../dist/index.js";
 
 /**
  * Which channel row an inbound webhook is attributed to.
@@ -91,4 +91,10 @@ test("with two active rows for one number the oldest still wins, as before", { s
 test("an unknown phone number resolves to nothing", { skip }, async () => {
   const resolved = await resolveChannelByPhoneNumberId(uniquePhoneNumberId("absent"));
   assert.equal(resolved, undefined);
+});
+
+test.after(async () => {
+  if (!skip) {
+    await closePool();
+  }
 });
