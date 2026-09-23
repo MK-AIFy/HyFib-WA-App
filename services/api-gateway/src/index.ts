@@ -101,7 +101,17 @@ import {
   validateContactsPayload
 } from "./validation.js";
 import { filterSendableContacts, canTransition, transitionConflict, CAMPAIGN_TRANSITIONS } from "./campaign.js";
-import { canCreateContact, canCreateOrder } from "./authorization.js";
+import {
+  API_KEY_SUBJECT_PREFIX,
+  authorizeHumanCaller,
+  authorizeIdentityAdmin,
+  authorizePasswordSet,
+  authorizeRoleGrant,
+  authorizeUserUpdate,
+  canCreateContact,
+  canCreateOrder,
+  type AccessDecision
+} from "./authorization.js";
 import { buildMediaHeaders } from "./media-headers.js";
 import { mapMediaUploadProxyResult } from "./media-upload.js";
 import {
@@ -744,7 +754,12 @@ async function resolveAuth(req: IncomingMessage): Promise<AuthContext> {
     if (!apiKey) {
       throw new AuthError("Invalid or revoked API key", 401);
     }
-    return { subject: `apikey:${apiKey.id}`, tenantId: orgTenantId, roles: normalizeRoles(apiKey.roles) };
+    // The subject prefix is what isApiKeyCaller keys on to keep API keys out of user management.
+    return {
+      subject: `${API_KEY_SUBJECT_PREFIX}${apiKey.id}`,
+      tenantId: orgTenantId,
+      roles: normalizeRoles(apiKey.roles)
+    };
   }
 
   // 1. Bearer session token (works in all modes) — takes precedence over the cookie.
@@ -792,6 +807,21 @@ async function audit(
       error: error instanceof Error ? error.message : String(error)
     });
   }
+}
+
+/**
+ * Sends the 403 for a refused user or credential change (see authorization.ts). Logged at warn: an
+ * API key or a tenant_admin reaching for platform_owner power is exactly what should stand out.
+ */
+function refuseIdentityChange(
+  res: ServerResponse,
+  auth: AuthContext,
+  tenantId: string,
+  path: string,
+  decision: Extract<AccessDecision, { ok: false }>
+): void {
+  logger.warn("identity_change_refused", { tenantId, subject: auth.subject, path, error: decision.error });
+  sendJson(res, 403, decision.detail ? { error: decision.error, detail: decision.detail } : { error: decision.error });
 }
 
 /**
@@ -2120,6 +2150,12 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return;
     }
     if (method === "POST") {
+      // A key minted by a key outlives the revocation of the key that minted it.
+      const gate = authorizeIdentityAdmin(auth);
+      if (!gate.ok) {
+        refuseIdentityChange(res, auth, tenantId, path, gate);
+        return;
+      }
       const body = await readJsonBody<{ name?: string; roles?: unknown }>(req);
       const nameCheck = boundedText(body.name, 120);
       if (!nameCheck.ok) {
@@ -2249,6 +2285,12 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         sendJson(res, 403, { error: "Only platform_owner/tenant_admin can create users" });
         return;
       }
+      // The response carries the new user's tempPassword: a human credential an API key must not mint.
+      const gate = authorizeIdentityAdmin(auth);
+      if (!gate.ok) {
+        refuseIdentityChange(res, auth, tenantId, path, gate);
+        return;
+      }
       const payload = await readJsonBody<CreateUserRequest>(req);
       if (!payload.email?.trim() || !payload.displayName?.trim() || !payload.roles?.length) {
         sendJson(res, 400, { error: "email, displayName, and roles are required" });
@@ -2266,6 +2308,11 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       const invalidRoles = payload.roles.filter((r: unknown) => !VALID_ROLE_NAMES.includes(r as string));
       if (invalidRoles.length > 0) {
         sendJson(res, 400, { error: `Invalid roles: ${invalidRoles.join(", ")}` });
+        return;
+      }
+      const grant = authorizeRoleGrant(auth, payload.roles);
+      if (!grant.ok) {
+        refuseIdentityChange(res, auth, tenantId, path, grant);
         return;
       }
       const existingUser = await userRepository.findByEmailForAuth(emailTrimmed);
@@ -2295,7 +2342,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
 
-  // POST /api/v1/users/:id/set-password — user sets their own password
+  // POST /api/v1/users/:id/set-password — a user sets their own password, or
+  // an admin resets the password of a user it could manage (never by API key)
   if (path.match(/^\/api\/v1\/users\/[^/]+\/set-password$/) && method === "POST") {
     const userId = extractPathSegment(path, "/api/v1/users/");
     if (!userId || !UUID.test(userId)) {
@@ -2306,6 +2354,27 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 403, { error: "Can only change your own password" });
       return;
     }
+    // An API key is refused before the lookup, as on POST /users and PATCH
+    // /users/:id, so its answer never depends on the database and does not
+    // reveal whether the id exists.
+    const callerGate = authorizeHumanCaller(auth);
+    if (!callerGate.ok) {
+      refuseIdentityChange(res, auth, tenantId, path, callerGate);
+      return;
+    }
+    // The target's roles decide whether an admin may reset it; the lookup is
+    // tenant-scoped, so a foreign or unknown id stops here instead of a
+    // silent no-op update followed by an unscoped session wipe.
+    const target = await userRepository.getById(tenantId, userId);
+    if (!target) {
+      sendJson(res, 404, { error: "User not found" });
+      return;
+    }
+    const decision = authorizePasswordSet(auth, target);
+    if (!decision.ok) {
+      refuseIdentityChange(res, auth, tenantId, path, decision);
+      return;
+    }
     const body = await readJsonBody<{ password: string }>(req);
     if (!body.password || body.password.length < 8) {
       sendJson(res, 400, { error: "Password must be at least 8 characters" });
@@ -2313,6 +2382,12 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     }
     await userRepository.updatePassword(tenantId, userId, await hashPassword(body.password));
     await sessionRepository.deleteAllForUser(userId);
+    await audit(tenantId, auth, {
+      action: userId === auth.subject ? "user.password_changed" : "user.password_reset",
+      resourceType: "User",
+      resourceId: userId,
+      payload: {}
+    });
     sendJson(res, 200, { status: "password_updated" });
     return;
   }
@@ -2321,6 +2396,11 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   if (path.match(/^\/api\/v1\/users\/[^/]+$/) && method === "PATCH") {
     if (!hasAnyRole(auth, ["platform_owner", "tenant_admin"])) {
       sendJson(res, 403, { error: "Insufficient role" });
+      return;
+    }
+    const gate = authorizeIdentityAdmin(auth);
+    if (!gate.ok) {
+      refuseIdentityChange(res, auth, tenantId, path, gate);
       return;
     }
     const userId = extractPathSegment(path, "/api/v1/users/");
@@ -2343,6 +2423,12 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     const target = await userRepository.getById(tenantId, userId);
     if (!target) {
       sendJson(res, 404, { error: "User not found" });
+      return;
+    }
+    // Before any write: a tenant_admin can neither touch a platform_owner nor make one.
+    const decision = authorizeUserUpdate(auth, target, patch.value.roles);
+    if (!decision.ok) {
+      refuseIdentityChange(res, auth, tenantId, path, decision);
       return;
     }
     if (patch.value.status) {
