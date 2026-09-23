@@ -103,6 +103,7 @@ import {
 import { filterSendableContacts, canTransition, transitionConflict, CAMPAIGN_TRANSITIONS } from "./campaign.js";
 import {
   API_KEY_SUBJECT_PREFIX,
+  authorizeAccountStatus,
   authorizeHumanCaller,
   authorizeIdentityAdmin,
   authorizePasswordSet,
@@ -110,6 +111,7 @@ import {
   authorizeUserUpdate,
   canCreateContact,
   canCreateOrder,
+  isSameUserId,
   type AccessDecision
 } from "./authorization.js";
 import { buildMediaHeaders } from "./media-headers.js";
@@ -731,16 +733,72 @@ function cookieHeaderOf(req: IncomingMessage): string | undefined {
 
 // ─── Auth resolution: Bearer token (session) → cookie (session) → Keycloak → dev fallback
 
-/** Resolves an opaque session token (Bearer or cookie) to an AuthContext, or undefined if unknown/expired. */
+/**
+ * Refuses a live session whose user is not active (suspended, disabled, invited, or not found). Setting a user's
+ * status revokes its sessions (PATCH /users/:id); this catches sessions that predate that revocation or race it, and
+ * deletes a refused session so that reactivating its user later does not bring it back. The delete is best-effort
+ * and only for a user that was found: the refusal never depends on it, and a tenant-scoped lookup that misses is
+ * not proof the session is dead (deleting a user cascades to its sessions anyway). Returns the refusal, if any.
+ */
+async function refuseInactiveSession(
+  hash: string,
+  session: { userId: string; tenantId: string },
+  user: User | undefined
+): Promise<Extract<AccessDecision, { ok: false }> | undefined> {
+  const account = authorizeAccountStatus(user?.status);
+  if (account.ok) {
+    return undefined;
+  }
+  logger.warn("session_refused_inactive_user", {
+    tenantId: session.tenantId,
+    userId: session.userId,
+    status: user?.status ?? "not_found"
+  });
+  // The user is out, so are its event streams on this instance: the status may have been changed through another
+  // instance, whose revocation could not reach the streams held here.
+  endUserStreams(session.tenantId, session.userId, "session_refused_inactive_user");
+  if (user) {
+    try {
+      await sessionRepository.deleteByToken(hash);
+    } catch (error) {
+      logger.error("inactive_session_revoke_failed", {
+        tenantId: session.tenantId,
+        userId: session.userId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+  return account;
+}
+
+/**
+ * Resolves an opaque session token (Bearer or cookie) to an AuthContext, or undefined if unknown/expired. Throws a
+ * 401 AuthError for a live session whose user is not active.
+ */
 async function resolveSessionToken(rawToken: string): Promise<AuthContext | undefined> {
-  const session = await sessionRepository.findByToken(tokenHash(rawToken));
+  const hash = tokenHash(rawToken);
+  const session = await sessionRepository.findByToken(hash);
   if (!session) return undefined;
   // Must resolve roles through a tenant-scoped read: users has FORCE RLS,
   // so a bare pool query silently returns zero rows (empty roles → 403s).
   const user = await userRepository.getById(session.tenantId, session.userId);
+  // The status arrives on the row already read for the roles, so checking it costs no query. A refused session
+  // throws rather than returning undefined: like a revoked API key, it must never fall through to the cookie,
+  // Keycloak or dev-header paths and be answered as some other caller.
+  const refusal = await refuseInactiveSession(hash, session, user);
+  if (refusal) {
+    throw new AuthError(refusal.error, 401);
+  }
   const roles = normalizeRoles(user?.roles ?? []);
   return { subject: session.userId, tenantId: session.tenantId, roles };
 }
+
+/**
+ * The token hash of the session a request authenticated with, for requests resolveAuth answered from a session
+ * (Bearer or cookie) and for no other. It tells an identity write that its caller is a users row whose status can
+ * be re-checked, and tags an event stream with the session that opened it so a logout can end that stream.
+ */
+const sessionKeyByRequest = new WeakMap<IncomingMessage, string>();
 
 async function resolveAuth(req: IncomingMessage): Promise<AuthContext> {
   const authHeader = req.headers["authorization"];
@@ -764,15 +822,22 @@ async function resolveAuth(req: IncomingMessage): Promise<AuthContext> {
 
   // 1. Bearer session token (works in all modes) — takes precedence over the cookie.
   if (authHeader?.startsWith("Bearer ")) {
-    const authCtx = await resolveSessionToken(authHeader.slice(7));
-    if (authCtx) return authCtx;
+    const bearerToken = authHeader.slice(7);
+    const authCtx = await resolveSessionToken(bearerToken);
+    if (authCtx) {
+      sessionKeyByRequest.set(req, tokenHash(bearerToken));
+      return authCtx;
+    }
   }
 
   // 2. HttpOnly session cookie (browser clients that have switched off Bearer).
   const cookieToken = parseCookies(cookieHeaderOf(req))[SESSION_COOKIE];
   if (cookieToken) {
     const authCtx = await resolveSessionToken(cookieToken);
-    if (authCtx) return authCtx;
+    if (authCtx) {
+      sessionKeyByRequest.set(req, tokenHash(cookieToken));
+      return authCtx;
+    }
   }
 
   if (config.authEnabled) {
@@ -822,6 +887,115 @@ function refuseIdentityChange(
 ): void {
   logger.warn("identity_change_refused", { tenantId, subject: auth.subject, path, error: decision.error });
   sendJson(res, 403, decision.detail ? { error: decision.error, detail: decision.detail } : { error: decision.error });
+}
+
+/**
+ * Re-reads a session caller's account immediately before an identity write, and answers 401 (returning true) if it
+ * is no longer active. These routes authenticate when the headers arrive and read the body afterwards, so without
+ * this a request stalled in between completes for an admin suspended meanwhile. One tenant-scoped read, on routes
+ * that are rarely called. Only a session caller is re-checked: its subject is a users.id, which a Keycloak or
+ * dev-header subject need not be, and neither of those was checked against users.status to begin with.
+ */
+async function refuseDeactivatedCaller(
+  req: IncomingMessage,
+  res: ServerResponse,
+  auth: AuthContext,
+  tenantId: string,
+  path: string
+): Promise<boolean> {
+  const sessionKey = sessionKeyByRequest.get(req);
+  if (!sessionKey) {
+    return false;
+  }
+  const caller = await userRepository.getById(tenantId, auth.subject);
+  const refusal = await refuseInactiveSession(sessionKey, { userId: auth.subject, tenantId }, caller);
+  if (!refusal) {
+    return false;
+  }
+  logger.warn("identity_write_refused_inactive_caller", { tenantId, subject: auth.subject, path });
+  // The shape resolveAuth's refusal has, since that is the refusal this one completes.
+  sendJson(res, 401, { error: "unauthenticated", detail: refusal.error });
+  return true;
+}
+
+/**
+ * Ends every session and event stream `userId` holds. A failed delete is logged and reported (false), never thrown:
+ * the caller has already written the change that makes it necessary, and every request's own status check still
+ * keeps an inactive user out of whatever sessions survive.
+ *
+ * Sessions go first, then streams. A user whose password was just set is still active, so the status check does not
+ * stop a reconnect: ending the streams first would let one reconnect, in the gap, on a session about to be deleted
+ * and keep a fresh stream until the lifetime cap. The streams end even if the delete fails.
+ */
+async function revokeUserSessions(
+  tenantId: string,
+  userId: string,
+  auth: AuthContext,
+  status: string,
+  reason: string
+): Promise<boolean> {
+  let revoked = true;
+  try {
+    await sessionRepository.deleteAllForUser(userId);
+  } catch (error) {
+    revoked = false;
+    logger.error("user_sessions_revoke_failed", {
+      tenantId,
+      userId,
+      status,
+      reason,
+      subject: auth.subject,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+  endUserStreams(tenantId, userId, reason);
+  if (revoked) {
+    logger.info("user_sessions_revoked", { tenantId, userId, status, reason, subject: auth.subject });
+  }
+  return revoked;
+}
+
+/** An API key as PATCH /users/:id reports it: enough to find and revoke it, never its secret or hash. */
+interface KeyCreatedByUser {
+  id: string;
+  name: string;
+  prefix: string;
+  createdAt: string;
+}
+
+/**
+ * The tenant's unrevoked API keys that `userId` created. Taking a user out does not revoke them (a key is its own
+ * credential, and revoking one is a deliberate act), so the suspending admin is shown them instead, and a warning
+ * is logged when there are any. Undefined when the keys could not be listed: the status change stands regardless.
+ */
+async function activeKeysCreatedBy(
+  tenantId: string,
+  userId: string,
+  status: string
+): Promise<KeyCreatedByUser[] | undefined> {
+  let keys: KeyCreatedByUser[];
+  try {
+    keys = (await apiKeyRepository.list(tenantId))
+      .filter((key) => !key.revokedAt && key.createdBy !== undefined && isSameUserId(key.createdBy, userId))
+      .map((key) => ({ id: key.id, name: key.name, prefix: key.keyPrefix, createdAt: key.createdAt }));
+  } catch (error) {
+    logger.error("user_keys_lookup_failed", {
+      tenantId,
+      userId,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return undefined;
+  }
+  if (keys.length > 0) {
+    logger.warn("user_suspended_with_active_keys", {
+      tenantId,
+      userId,
+      status,
+      count: keys.length,
+      keyIds: keys.map((key) => key.id)
+    });
+  }
+  return keys;
 }
 
 /**
@@ -1646,8 +1820,30 @@ class LruCache<K, V> {
   }
 }
 
-const sseHub = new SseHub();
+const sseHub = new SseHub({
+  // The lifetime cap is how a revocation made on another instance reaches streams held here; log it like the rest.
+  onExpired: (count) => logger.info("sse_streams_closed", { reason: "lifetime_cap", count })
+});
 const sseTenantByPhoneNumberId = new LruCache<string, string>(1_000);
+
+/**
+ * Ends the event streams `userId` opened on this instance. A stream is authorised only at connect, so whatever
+ * takes a user's sessions away must take its streams too; streams on other instances end at the hub's lifetime cap.
+ */
+function endUserStreams(tenantId: string, userId: string, reason: string): void {
+  const count = sseHub.closeUserStreams(userId);
+  if (count > 0) {
+    logger.info("sse_streams_closed", { tenantId, userId, reason, count });
+  }
+}
+
+/** Ends the event streams opened with one session (identified by its token hash) on this instance. */
+function endSessionStreams(sessionKey: string, reason: string): void {
+  const count = sseHub.closeSessionStreams(sessionKey);
+  if (count > 0) {
+    logger.info("sse_streams_closed", { reason, count });
+  }
+}
 
 async function forwardEventToSse(event: EventEnvelope): Promise<void> {
   if (!sseHub.hasClients()) return;
@@ -1957,13 +2153,21 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 401, { error: "Invalid email or password" });
       return;
     }
-    if (found.status === "suspended") {
-      sendJson(res, 403, { error: "Account is suspended" });
-      return;
-    }
     const valid = await verifyPassword(body.password, found.passwordHash);
     if (!valid) {
       sendJson(res, 401, { error: "Invalid email or password" });
+      return;
+    }
+    // Every status but active is refused. Checked only once the password is proven, so a caller without it cannot
+    // learn that the account exists or what state it is in.
+    const account = authorizeAccountStatus(found.status);
+    if (!account.ok) {
+      logger.warn("login_refused_inactive_account", {
+        tenantId: found.tenantId,
+        userId: found.id,
+        status: found.status
+      });
+      sendJson(res, 403, { error: account.error });
       return;
     }
     const tenant = await tenantRepository.getById(found.tenantId);
@@ -2007,11 +2211,14 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     const authHeader = req.headers["authorization"];
     const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : undefined;
     const cookieToken = parseCookies(cookieHeaderOf(req))[SESSION_COOKIE];
+    // Each revoked session's event streams end with it; a stream of the user's other sessions stays open.
     if (bearerToken) {
       await sessionRepository.deleteByToken(tokenHash(bearerToken));
+      endSessionStreams(tokenHash(bearerToken), "logout");
     }
     if (cookieToken && cookieToken !== bearerToken) {
       await sessionRepository.deleteByToken(tokenHash(cookieToken));
+      endSessionStreams(tokenHash(cookieToken), "logout");
     }
     clearSessionCookie(res, req);
     sendJson(res, 200, { status: "logged_out" });
@@ -2047,6 +2254,17 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     const u = await userRepository.getById(session.tenantId, session.userId);
     if (!u) {
       sendJson(res, 401, { error: "User not found" });
+      return;
+    }
+    // Same rule as every other route (resolveSessionToken): a session of a user who is not active is not signed in.
+    const refusal = await refuseInactiveSession(tokenHash(rawToken), session, u);
+    if (refusal) {
+      // The refused session came from the cookie: drop the cookie too, as logout does, so the browser stops sending
+      // a credential that no longer works.
+      if (cookieToken !== undefined && cookieToken === rawToken) {
+        clearSessionCookie(res, req);
+      }
+      sendJson(res, 401, { error: refusal.error });
       return;
     }
     const tenant = await tenantRepository.getById(session.tenantId);
@@ -2132,7 +2350,12 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     res.setHeader("X-Accel-Buffering", "no");
     res.flushHeaders();
     res.write(": connected\n\n");
-    const clientId = sseHub.addClient(tenantId, res);
+    // Authorised here, once; the hub ends the stream when its user's or session's credential is revoked, and after
+    // its lifetime cap in any case (the web-app reconnects, and the reconnect is authorised afresh).
+    const clientId = sseHub.addClient(tenantId, res, {
+      userId: auth.subject,
+      sessionKey: sessionKeyByRequest.get(req)
+    });
     incCounter("sse_clients_connected_total", "SSE clients connected.", { service: "api-gateway" });
     req.on("close", () => sseHub.removeClient(tenantId, clientId));
     return;
@@ -2173,6 +2396,9 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       );
       if (invalid.length > 0) {
         sendJson(res, 400, { error: `Unknown or disallowed roles: ${invalid.join(", ")}` });
+        return;
+      }
+      if (await refuseDeactivatedCaller(req, res, auth, tenantId, path)) {
         return;
       }
       const { key, record } = await apiKeyRepository.create(tenantId, {
@@ -2320,6 +2546,9 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         sendJson(res, 409, { error: "A user with this email already exists" });
         return;
       }
+      if (await refuseDeactivatedCaller(req, res, auth, tenantId, path)) {
+        return;
+      }
       // Generate a temp password the admin must share with the invitee
       const tempPassword = randomBytes(8).toString("hex");
       const pwHash = await hashPassword(tempPassword);
@@ -2345,12 +2574,14 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   // POST /api/v1/users/:id/set-password — a user sets their own password, or
   // an admin resets the password of a user it could manage (never by API key)
   if (path.match(/^\/api\/v1\/users\/[^/]+\/set-password$/) && method === "POST") {
-    const userId = extractPathSegment(path, "/api/v1/users/");
-    if (!userId || !UUID.test(userId)) {
+    const rawUserId = extractPathSegment(path, "/api/v1/users/");
+    if (!rawUserId || !UUID.test(rawUserId)) {
       sendJson(res, 400, { error: "Invalid user id" });
       return;
     }
-    if (auth.subject !== userId && !hasAnyRole(auth, ["platform_owner", "tenant_admin"])) {
+    // UUID accepts either letter case; one canonical spelling for every comparison, write and audit row below.
+    const userId = rawUserId.toLowerCase();
+    if (!isSameUserId(auth.subject, userId) && !hasAnyRole(auth, ["platform_owner", "tenant_admin"])) {
       sendJson(res, 403, { error: "Can only change your own password" });
       return;
     }
@@ -2380,13 +2611,17 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 400, { error: "Password must be at least 8 characters" });
       return;
     }
+    if (await refuseDeactivatedCaller(req, res, auth, tenantId, path)) {
+      return;
+    }
     await userRepository.updatePassword(tenantId, userId, await hashPassword(body.password));
-    await sessionRepository.deleteAllForUser(userId);
+    // A failed session delete must not turn a password that WAS changed into a 500 with no audit row.
+    const sessionsRevoked = await revokeUserSessions(tenantId, userId, auth, target.status, "password_set");
     await audit(tenantId, auth, {
-      action: userId === auth.subject ? "user.password_changed" : "user.password_reset",
+      action: isSameUserId(auth.subject, userId) ? "user.password_changed" : "user.password_reset",
       resourceType: "User",
       resourceId: userId,
-      payload: {}
+      payload: { sessionsRevoked }
     });
     sendJson(res, 200, { status: "password_updated" });
     return;
@@ -2403,11 +2638,13 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       refuseIdentityChange(res, auth, tenantId, path, gate);
       return;
     }
-    const userId = extractPathSegment(path, "/api/v1/users/");
-    if (!userId || !UUID.test(userId)) {
+    const rawUserId = extractPathSegment(path, "/api/v1/users/");
+    if (!rawUserId || !UUID.test(rawUserId)) {
       sendJson(res, 400, { error: "Invalid user id" });
       return;
     }
+    // UUID accepts either letter case; one canonical spelling for every comparison, write and audit row below.
+    const userId = rawUserId.toLowerCase();
     const body = await readJsonBody<Record<string, unknown>>(req);
     const patch = validateUserPatch(body, VALID_ROLE_SET);
     if (!patch.ok) {
@@ -2416,7 +2653,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     }
     // Editing your own roles is how an admin locks themselves (or everyone)
     // out; require a second admin for role changes to self.
-    if (patch.value.roles && userId === auth.subject) {
+    if (patch.value.roles && isSameUserId(auth.subject, userId)) {
       sendJson(res, 403, { error: "cannot_change_own_roles" });
       return;
     }
@@ -2425,14 +2662,36 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 404, { error: "User not found" });
       return;
     }
-    // Before any write: a tenant_admin can neither touch a platform_owner nor make one.
-    const decision = authorizeUserUpdate(auth, target, patch.value.roles);
+    // Before any write: a tenant_admin can neither touch a platform_owner nor make one, and nobody changes their
+    // own status.
+    const decision = authorizeUserUpdate(auth, target, patch.value.roles, patch.value.status);
     if (!decision.ok) {
       refuseIdentityChange(res, auth, tenantId, path, decision);
       return;
     }
-    if (patch.value.status) {
-      await userRepository.updateStatus(tenantId, userId, patch.value.status);
+    if (await refuseDeactivatedCaller(req, res, auth, tenantId, path)) {
+      return;
+    }
+    // Suspension is revocation: any status but active ends every session (and event stream) the user holds, now
+    // rather than at the session TTL. resolveSessionToken refuses such a user's sessions on every request as well,
+    // so a request that raced this one, or a revocation that failed after the status write, does not leave the user
+    // signed in. Reactivation revokes too: a session from before the suspension that was never presented since, one
+    // a failed revocation left behind, or one from a login that raced the suspension would otherwise come back.
+    let sessionsRevoked = false;
+    let keysCreatedByUser: KeyCreatedByUser[] | undefined;
+    const status = patch.value.status;
+    if (status !== undefined) {
+      const takesOut = !authorizeAccountStatus(status).ok;
+      if (!takesOut && !authorizeAccountStatus(target.status).ok) {
+        // Before the write: while the user is still inactive nobody can sign in as it, so everything this deletes
+        // is a leftover, and no session made after the reactivation is caught.
+        sessionsRevoked = await revokeUserSessions(tenantId, userId, auth, status, "user_reactivated");
+      }
+      await userRepository.updateStatus(tenantId, userId, status);
+      if (takesOut) {
+        sessionsRevoked = await revokeUserSessions(tenantId, userId, auth, status, "user_deactivated");
+        keysCreatedByUser = await activeKeysCreatedBy(tenantId, userId, status);
+      }
     }
     let updated = patch.value.status ? { ...target, status: patch.value.status as User["status"] } : target;
     if (patch.value.roles) {
@@ -2445,9 +2704,11 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       action: "user.updated",
       resourceType: "User",
       resourceId: userId,
-      payload: { status: patch.value.status, roles: patch.value.roles }
+      payload: { status: patch.value.status, roles: patch.value.roles, sessionsRevoked }
     });
-    sendJson(res, 200, { ...updated });
+    // keysCreatedByUser only when the user was taken out (and its keys could be listed): the admin decides what to
+    // revoke. Every other response keeps the shape it had.
+    sendJson(res, 200, keysCreatedByUser ? { ...updated, keysCreatedByUser } : { ...updated });
     return;
   }
 

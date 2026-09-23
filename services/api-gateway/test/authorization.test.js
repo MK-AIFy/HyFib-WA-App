@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  authorizeAccountStatus,
   authorizeHumanCaller,
   authorizeIdentityAdmin,
   authorizePasswordSet,
@@ -206,4 +207,87 @@ test("the API-key gate a route runs before any lookup refuses every key and pass
 
 test("a non-admin cannot set someone else's password", () => {
   assertDenied(authorizePasswordSet(session("analyst"), agentUser), "Can only change your own password");
+});
+
+// ─── Own status and account status ────────────────────────────────────────────
+
+test("nobody changes their own status: a suspended admin cannot reactivate itself, an active one cannot suspend itself", () => {
+  const self = { id: SELF_ID, roles: ["tenant_admin"] };
+  for (const status of ["active", "suspended", "disabled", "invited"]) {
+    const decision = authorizeUserUpdate(session("tenant_admin"), self, undefined, status);
+    assertDenied(decision, "cannot_change_own_status", `tenant_admin setting own status to ${status}`);
+    assert.match(decision.detail, /another administrator/i);
+  }
+  // Holding every role changes nothing: a platform_owner cannot change its own status either.
+  assertDenied(
+    authorizeUserUpdate(session("platform_owner"), { id: SELF_ID, roles: ["platform_owner"] }, undefined, "active"),
+    "cannot_change_own_status"
+  );
+});
+
+test("the own-status rule leaves changing someone else's status, and a roles-only change, as they were", () => {
+  for (const status of ["active", "suspended", "disabled", "invited"]) {
+    assert.deepEqual(authorizeUserUpdate(session("tenant_admin"), agentUser, undefined, status), { ok: true }, status);
+    assert.deepEqual(
+      authorizeUserUpdate(session("platform_owner"), ownerUser, undefined, status),
+      { ok: true },
+      status
+    );
+  }
+  // A tenant_admin still cannot touch a platform_owner, whatever the status it asks for.
+  assertDenied(authorizeUserUpdate(session("tenant_admin"), ownerUser, undefined, "active"), "user_not_manageable");
+  // Status not requested: the three-argument form behaves exactly as before.
+  assert.deepEqual(authorizeUserUpdate(session("tenant_admin"), agentUser, ["analyst"], undefined), { ok: true });
+});
+
+test("an API key is refused as a key before the own-status rule is consulted", () => {
+  const keySelf = { id: "apikey:22222222-2222-4222-8222-222222222222", roles: ["tenant_admin"] };
+  assertDenied(authorizeUserUpdate(apiKey("tenant_admin"), keySelf, undefined, "active"), "api_key_forbidden");
+});
+
+test("only an active account may sign in or keep a session", () => {
+  assert.deepEqual(authorizeAccountStatus("active"), { ok: true });
+});
+
+test("suspended, disabled and invited accounts are refused, each with the message login shows", () => {
+  // "Account is suspended" is the wording /auth/login has always returned; keep it for existing clients.
+  assertDenied(authorizeAccountStatus("suspended"), "Account is suspended");
+  assertDenied(authorizeAccountStatus("disabled"), "Account is disabled");
+  assertDenied(authorizeAccountStatus("invited"), "Account is not active");
+});
+
+test("an unknown, differently-cased or missing status fails closed", () => {
+  // "constructor" and "__proto__" guard the message lookup against inherited object keys.
+  for (const status of [undefined, "", "Active", " active", "pending", "deleted", "constructor", "__proto__"]) {
+    assertDenied(authorizeAccountStatus(status), "Account is not active", `status ${JSON.stringify(status)}`);
+  }
+});
+
+// ─── Self is self, however the id is spelled ──────────────────────────────────
+// A UUID is the same id in upper or lower case (Postgres compares uuid values, and the routes accept either), so
+// every "is this the caller?" check must ignore case, or an upper-cased id in the path slips past it.
+
+const LETTERED_ID = "abcdefab-cdef-4abc-8def-abcdefabcdef";
+
+test("the own-status rule recognises the caller's id in any letter case", () => {
+  const shoutingAdmin = { subject: LETTERED_ID.toUpperCase(), tenantId: "tenant-1", roles: ["tenant_admin"] };
+  assertDenied(
+    authorizeUserUpdate(shoutingAdmin, { id: LETTERED_ID, roles: ["tenant_admin"] }, undefined, "active"),
+    "cannot_change_own_status"
+  );
+  const quietAdmin = { subject: LETTERED_ID, tenantId: "tenant-1", roles: ["tenant_admin"] };
+  assertDenied(
+    authorizeUserUpdate(quietAdmin, { id: LETTERED_ID.toUpperCase(), roles: ["tenant_admin"] }, undefined, "suspended"),
+    "cannot_change_own_status"
+  );
+});
+
+test("setting your own password is recognised as your own in any letter case", () => {
+  const shoutingAgent = { subject: LETTERED_ID.toUpperCase(), tenantId: "tenant-1", roles: ["support_agent"] };
+  assert.deepEqual(authorizePasswordSet(shoutingAgent, { id: LETTERED_ID, roles: ["support_agent"] }), { ok: true });
+  // Someone else's id is still someone else's, whatever its case.
+  assertDenied(
+    authorizePasswordSet(shoutingAgent, { id: agentUser.id.toUpperCase(), roles: ["support_agent"] }),
+    "Can only change your own password"
+  );
 });
