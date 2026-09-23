@@ -1446,9 +1446,18 @@ async function notifyCustomerWebhook(
       { type, occurredAt: new Date().toISOString(), data }
     );
     incCounter("customer_webhooks_total", "Outbound customer webhooks.", {
-      result: result.ok ? "delivered" : "failed"
+      result: result.ok ? "delivered" : result.blocked ? "blocked" : "failed"
     });
-    if (!result.ok) {
+    if (result.blocked) {
+      // SSRF guard refused the destination. Log the host only: the path/query
+      // may carry a receiver token, and the signing secret is never logged.
+      logger.warn("customer_webhook_blocked", {
+        tenantId,
+        type,
+        host: URL.canParse(url) ? new URL(url).host : undefined,
+        reason: result.error
+      });
+    } else if (!result.ok) {
       logger.warn("customer_webhook_failed", { tenantId, type, status: result.status });
     }
   } catch (error) {
