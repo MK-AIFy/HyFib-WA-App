@@ -227,6 +227,7 @@ test("handleInbound: a stored metadata-IP callback URL is refused, logged withou
   assert.equal(entry.type, "message.inbound");
   assert.equal(entry.host, "169.254.169.254");
   assert.match(entry.reason, /private|reserved/);
+  assert.match(entry.hint, /cannot be allowlisted/, "metadata is the hard floor: no allowlist entry can help");
 
   assert.doesNotMatch(outcome.raw, /whsec_TOPSECRET/, "the signing secret must never be logged");
   assert.doesNotMatch(outcome.raw, /security-credentials|token=abc123/, "the URL path/query must not be logged");
@@ -253,6 +254,7 @@ test("handleInbound: a stored callback host that resolves to a private address i
   assert.ok(entry);
   assert.equal(entry.host, "hooks.tenant-controlled.example");
   assert.match(entry.reason, /10\.20\.30\.40/);
+  assert.match(entry.hint, /OUTBOUND_WEBHOOK_ALLOWLIST/, "the operator is told an address entry could allow it");
   assert.doesNotMatch(outcome.raw, /whsec_TOPSECRET/);
 });
 

@@ -71,7 +71,7 @@ import { matchAutoReply } from "./autoreply.js";
 import { evaluateAutomationRules } from "./automation.js";
 import { decideDefaultAutomation } from "./default-automations.js";
 import { processMediaFetch } from "./media.js";
-import { deliverCustomerWebhook } from "./customer-webhook.js";
+import { customerWebhookBlockHint, deliverCustomerWebhook } from "./customer-webhook.js";
 
 const config = loadConfig();
 const logger = new Logger("notification-worker", config.logLevel as "debug" | "info" | "warn" | "error");
@@ -1505,9 +1505,12 @@ async function notifyCustomerWebhook(
     if (!url) {
       return;
     }
+    // Same operator allowlist as the gateway's save-time check, so both agree.
     const result = await deliverCustomerWebhook(
       { url, secret: settings.statusCallbackSecret },
-      { type, occurredAt: new Date().toISOString(), data }
+      { type, occurredAt: new Date().toISOString(), data },
+      undefined,
+      { allowlist: config.outboundWebhookAllowlist }
     );
     incCounter("customer_webhooks_total", "Outbound customer webhooks.", {
       result: result.ok ? "delivered" : result.blocked ? "blocked" : "failed"
@@ -1515,11 +1518,13 @@ async function notifyCustomerWebhook(
     if (result.blocked) {
       // SSRF guard refused the destination. Log the host only: the path/query
       // may carry a receiver token, and the signing secret is never logged.
+      // The hint tells the operator whether OUTBOUND_WEBHOOK_ALLOWLIST can help.
       logger.warn("customer_webhook_blocked", {
         tenantId,
         type,
         host: URL.canParse(url) ? new URL(url).host : undefined,
-        reason: result.error
+        reason: result.error,
+        hint: customerWebhookBlockHint(result.remedy)
       });
     } else if (!result.ok) {
       logger.warn("customer_webhook_failed", { tenantId, type, status: result.status });
