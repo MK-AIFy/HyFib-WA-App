@@ -1,4 +1,4 @@
-import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
+import { createRemoteJWKSet, jwtVerify, type JWTPayload, type JWTVerifyGetKey } from "jose";
 import type { PlatformConfig } from "@hyfib/config";
 import type { Role } from "@hyfib/shared-core";
 
@@ -40,6 +40,46 @@ export class AuthError extends Error {
   }
 }
 
+/**
+ * The credential could not be checked, as opposed to being refused: verification reached no verdict on the token
+ * because something it depends on failed — most often the identity provider's signing keys (JWKS) could not be
+ * fetched: connection refused, timed out, an error status, a response that is not a key set. The same token may be
+ * accepted once that recovers, so this is deliberately not an AuthError, which callers answer with 401 and clients
+ * take as "sign in again". `cause` is the underlying error, for a caller that classifies it further (the gateway
+ * answers 503 only for outage shapes it recognises).
+ */
+export class AuthUnavailableError extends Error {
+  constructor(message: string, options: { cause: unknown }) {
+    super(message, options);
+    this.name = "AuthUnavailableError";
+  }
+}
+
+/**
+ * jose's codes for a verdict on the token itself: expired, badly signed, for another issuer or audience, malformed,
+ * signed under a key id the realm does not publish, or with an algorithm this deployment does not accept. Only these
+ * are refusals (AuthError); anything else thrown while verifying means no verdict was reached.
+ */
+const TOKEN_VERDICT_CODES: ReadonlySet<string> = new Set([
+  "ERR_JWT_EXPIRED",
+  "ERR_JWT_CLAIM_VALIDATION_FAILED",
+  "ERR_JWS_SIGNATURE_VERIFICATION_FAILED",
+  "ERR_JWS_INVALID",
+  "ERR_JWT_INVALID",
+  "ERR_JWK_INVALID",
+  "ERR_JWKS_NO_MATCHING_KEY",
+  "ERR_JWKS_MULTIPLE_MATCHING_KEYS",
+  "ERR_JOSE_ALG_NOT_ALLOWED",
+  "ERR_JOSE_NOT_SUPPORTED",
+  "ERR_JWE_INVALID",
+  "ERR_JWE_DECRYPTION_FAILED"
+]);
+
+function isTokenVerdict(error: unknown): boolean {
+  const code = typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
+  return typeof code === "string" && TOKEN_VERDICT_CODES.has(code);
+}
+
 interface KeycloakClaims extends JWTPayload {
   tenant_id?: string;
   email?: string;
@@ -75,13 +115,24 @@ export interface Authenticator {
   authenticate(authorizationHeader: string | string[] | undefined): Promise<AuthContext>;
 }
 
+export interface AuthenticatorOptions {
+  /**
+   * Resolves the key a token was signed with. Defaults to the realm's remote JWKS (`config.keycloak.jwksUri`); tests
+   * inject one to exercise failures that are slow to provoke over the network, such as a fetch timeout.
+   */
+  keySet?: JWTVerifyGetKey;
+}
+
 /**
  * Builds an authenticator that validates Keycloak-issued JWTs against the
  * realm's published JWKS. Signature, issuer, audience and expiry are all
  * enforced by `jwtVerify`; there is no header-based trust fallback.
+ *
+ * A refused token throws AuthError (401). A token that could not be checked,
+ * because the JWKS could not be fetched, throws AuthUnavailableError instead.
  */
-export function createAuthenticator(config: PlatformConfig): Authenticator {
-  const jwks = createRemoteJWKSet(new URL(config.keycloak.jwksUri));
+export function createAuthenticator(config: PlatformConfig, options: AuthenticatorOptions = {}): Authenticator {
+  const jwks: JWTVerifyGetKey = options.keySet ?? createRemoteJWKSet(new URL(config.keycloak.jwksUri));
 
   return {
     async authenticate(authorizationHeader): Promise<AuthContext> {
@@ -102,7 +153,11 @@ export function createAuthenticator(config: PlatformConfig): Authenticator {
         });
         payload = verified.payload;
       } catch (error) {
-        throw new AuthError(`Invalid token: ${error instanceof Error ? error.message : "verification failed"}`);
+        const detail = error instanceof Error ? error.message : "verification failed";
+        if (isTokenVerdict(error)) {
+          throw new AuthError(`Invalid token: ${detail}`);
+        }
+        throw new AuthUnavailableError(`Token could not be verified: ${detail}`, { cause: error });
       }
 
       if (!payload.sub) {
