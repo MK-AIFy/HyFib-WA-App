@@ -68,6 +68,7 @@ import {
   verifyWebhookToken,
   EventTopics,
   evaluateAutomationRules,
+  type ApiKey,
   type AutomationActionConfig,
   type AutomationActionType,
   type AutomationConditions,
@@ -919,6 +920,33 @@ async function refuseDeactivatedCaller(
 }
 
 /**
+ * The same caller re-check as refuseDeactivatedCaller, made AFTER a write instead of before it and without answering:
+ * true when a session caller's account stopped being active while the write ran, so the caller can undo what it just
+ * created. Scoped the same way (session callers only). A failed lookup is not treated as deactivation — the check
+ * before the write already passed, and this one only closes a race.
+ */
+async function callerDeactivatedDuringWrite(
+  req: IncomingMessage,
+  auth: AuthContext,
+  tenantId: string
+): Promise<boolean> {
+  if (!sessionKeyByRequest.get(req)) {
+    return false;
+  }
+  try {
+    const caller = await userRepository.getById(tenantId, auth.subject);
+    return !authorizeAccountStatus(caller?.status).ok;
+  } catch (error) {
+    logger.error("caller_recheck_failed", {
+      tenantId,
+      subject: auth.subject,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return false;
+  }
+}
+
+/**
  * Ends every session and event stream `userId` holds. A failed delete is logged and reported (false), never thrown:
  * the caller has already written the change that makes it necessary, and every request's own status check still
  * keeps an inactive user out of whatever sessions survive.
@@ -963,21 +991,19 @@ interface KeyCreatedByUser {
   createdAt: string;
 }
 
+function describeKey(key: ApiKey): KeyCreatedByUser {
+  return { id: key.id, name: key.name, prefix: key.keyPrefix, createdAt: key.createdAt };
+}
+
 /**
- * The tenant's unrevoked API keys that `userId` created. Taking a user out does not revoke them (a key is its own
- * credential, and revoking one is a deliberate act), so the suspending admin is shown them instead, and a warning
- * is logged when there are any. Undefined when the keys could not be listed: the status change stands regardless.
+ * The tenant's unrevoked API keys that `userId` created. Undefined when they could not be listed (logged at error):
+ * the status change that asked stands regardless.
  */
-async function activeKeysCreatedBy(
-  tenantId: string,
-  userId: string,
-  status: string
-): Promise<KeyCreatedByUser[] | undefined> {
-  let keys: KeyCreatedByUser[];
+async function findActiveKeysCreatedBy(tenantId: string, userId: string): Promise<ApiKey[] | undefined> {
   try {
-    keys = (await apiKeyRepository.list(tenantId))
-      .filter((key) => !key.revokedAt && key.createdBy !== undefined && isSameUserId(key.createdBy, userId))
-      .map((key) => ({ id: key.id, name: key.name, prefix: key.keyPrefix, createdAt: key.createdAt }));
+    return (await apiKeyRepository.list(tenantId)).filter(
+      (key) => !key.revokedAt && key.createdBy !== undefined && isSameUserId(key.createdBy, userId)
+    );
   } catch (error) {
     logger.error("user_keys_lookup_failed", {
       tenantId,
@@ -986,6 +1012,23 @@ async function activeKeysCreatedBy(
     });
     return undefined;
   }
+}
+
+/**
+ * The keys `userId` created, for a PATCH that takes the user out with keepApiKeys: true (a live customer
+ * integration, say): nothing is revoked, the suspending admin is shown them instead, and a warning is logged when
+ * there are any. Undefined when the keys could not be listed.
+ */
+async function activeKeysCreatedBy(
+  tenantId: string,
+  userId: string,
+  status: string
+): Promise<KeyCreatedByUser[] | undefined> {
+  const found = await findActiveKeysCreatedBy(tenantId, userId);
+  if (!found) {
+    return undefined;
+  }
+  const keys = found.map(describeKey);
   if (keys.length > 0) {
     logger.warn("user_suspended_with_active_keys", {
       tenantId,
@@ -996,6 +1039,76 @@ async function activeKeysCreatedBy(
     });
   }
   return keys;
+}
+
+/** What taking a user out did to the API keys it created: `notRevoked` are the ones still live. */
+interface KeyRevocation {
+  revoked: KeyCreatedByUser[];
+  notRevoked: KeyCreatedByUser[];
+}
+
+/**
+ * Revokes every unrevoked API key `userId` created, with the repository call DELETE /api-keys/:id uses, audits each
+ * as that route does, and ends the event streams each key opened on this instance. The default for a PATCH that
+ * takes a user out: whoever is being cut off may have copied a key they made.
+ *
+ * Never throws, since the status change that asked for this is already written. A key whose revoke fails is logged
+ * at error and reported in notRevoked, for the admin to revoke by hand; one that turns out to be revoked already (a
+ * concurrent DELETE, which audited it) is in neither list. Undefined when the keys could not be listed at all.
+ */
+async function revokeKeysCreatedBy(
+  tenantId: string,
+  userId: string,
+  auth: AuthContext,
+  status: string
+): Promise<KeyRevocation | undefined> {
+  const keys = await findActiveKeysCreatedBy(tenantId, userId);
+  if (!keys) {
+    return undefined;
+  }
+  const revocation: KeyRevocation = { revoked: [], notRevoked: [] };
+  for (const key of keys) {
+    let revokedNow: boolean;
+    try {
+      revokedNow = await apiKeyRepository.revoke(tenantId, key.id);
+    } catch (error) {
+      revocation.notRevoked.push(describeKey(key));
+      logger.error("user_api_key_revoke_failed", {
+        tenantId,
+        userId,
+        keyId: key.id,
+        status,
+        subject: auth.subject,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      continue;
+    }
+    // Either way the key no longer authenticates, so whatever it has streaming here goes too.
+    endApiKeyStreams(tenantId, key.id, "api_key_revoked");
+    if (!revokedNow) {
+      logger.info("user_api_key_already_revoked", { tenantId, userId, keyId: key.id, subject: auth.subject });
+      continue;
+    }
+    revocation.revoked.push(describeKey(key));
+    await audit(tenantId, auth, {
+      action: "api_key.revoked",
+      resourceType: "ApiKey",
+      resourceId: key.id,
+      payload: { reason: "user_deactivated", userId, status }
+    });
+  }
+  if (revocation.revoked.length > 0) {
+    // warn, not info: an integration running on one of these keys now fails, and this is where to find out why.
+    logger.warn("user_suspended_api_keys_revoked", {
+      tenantId,
+      userId,
+      status,
+      count: revocation.revoked.length,
+      keyIds: revocation.revoked.map((key) => key.id),
+      subject: auth.subject
+    });
+  }
+  return revocation;
 }
 
 /**
@@ -1837,6 +1950,18 @@ function endUserStreams(tenantId: string, userId: string, reason: string): void 
   }
 }
 
+/**
+ * Ends the event streams an API key opened on this instance (the hub records a key's stream under the key's subject,
+ * as resolveAuth spells it). Like a session's, a key's stream is authorised only at connect, so revoking the key must
+ * end it; streams on other instances end at the hub's lifetime cap.
+ */
+function endApiKeyStreams(tenantId: string, keyId: string, reason: string): void {
+  const count = sseHub.closeUserStreams(`${API_KEY_SUBJECT_PREFIX}${keyId}`);
+  if (count > 0) {
+    logger.info("sse_streams_closed", { tenantId, keyId, reason, count });
+  }
+}
+
 /** Ends the event streams opened with one session (identified by its token hash) on this instance. */
 function endSessionStreams(sessionKey: string, reason: string): void {
   const count = sseHub.closeSessionStreams(sessionKey);
@@ -2412,6 +2537,35 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         resourceId: record.id,
         payload: { name: record.name, roles: record.roles, keyPrefix: record.keyPrefix }
       });
+      // Re-checked AFTER the insert as well: a suspension that wrote the status between the check above and this
+      // insert listed the creator's keys before this one existed, so it could not revoke it. Revoke it here and never
+      // show the secret — without the secret the key is unusable, so even a failed revoke leaks nothing.
+      if (await callerDeactivatedDuringWrite(req, auth, tenantId)) {
+        let revoked = false;
+        try {
+          revoked = await apiKeyRepository.revoke(tenantId, record.id);
+        } catch (error) {
+          logger.error("api_key_revoke_failed", {
+            tenantId,
+            keyId: record.id,
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
+        await audit(tenantId, auth, {
+          action: "api_key.revoked",
+          resourceType: "ApiKey",
+          resourceId: record.id,
+          payload: { reason: "caller_deactivated", revoked }
+        });
+        logger.warn("api_key_revoked_caller_deactivated", {
+          tenantId,
+          keyId: record.id,
+          subject: auth.subject,
+          revoked
+        });
+        sendJson(res, 401, { error: "unauthenticated", detail: "Account is not active" });
+        return;
+      }
       sendJson(res, 201, {
         key,
         note: "Store this key now — it is shown exactly once and only its hash is retained.",
@@ -2438,6 +2592,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 404, { error: "API key not found or already revoked" });
       return;
     }
+    endApiKeyStreams(tenantId, keyId, "api_key_revoked");
     await audit(tenantId, auth, { action: "api_key.revoked", resourceType: "ApiKey", resourceId: keyId, payload: {} });
     sendJson(res, 200, { status: "revoked", keyId });
     return;
@@ -2677,8 +2832,14 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     // so a request that raced this one, or a revocation that failed after the status write, does not leave the user
     // signed in. Reactivation revokes too: a session from before the suspension that was never presented since, one
     // a failed revocation left behind, or one from a login that raced the suspension would otherwise come back.
+    //
+    // The API keys the user created go too, unless the admin sends keepApiKeys: true (validateUserPatch accepts it
+    // only with a status that takes the user out). Reactivation never restores a revoked key: the user, back, mints
+    // new ones.
     let sessionsRevoked = false;
-    let keysCreatedByUser: KeyCreatedByUser[] | undefined;
+    // What the response and the audit row say about the user's keys; empty unless the patch took the user out.
+    let keyReport: Record<string, unknown> = {};
+    let keyAudit: Record<string, unknown> = {};
     const status = patch.value.status;
     if (status !== undefined) {
       const takesOut = !authorizeAccountStatus(status).ok;
@@ -2690,7 +2851,28 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       await userRepository.updateStatus(tenantId, userId, status);
       if (takesOut) {
         sessionsRevoked = await revokeUserSessions(tenantId, userId, auth, status, "user_deactivated");
-        keysCreatedByUser = await activeKeysCreatedBy(tenantId, userId, status);
+        if (patch.value.keepApiKeys) {
+          const kept = await activeKeysCreatedBy(tenantId, userId, status);
+          keyReport = kept ? { keysCreatedByUser: kept } : {};
+          // The response keeps its shape, but the audit row must tell "listed, kept these" from "could not list".
+          keyAudit = {
+            keepApiKeys: true,
+            ...(kept ? { apiKeysKept: kept.map((key) => key.id) } : { apiKeysLookupFailed: true })
+          };
+        } else {
+          const revocation = await revokeKeysCreatedBy(tenantId, userId, auth, status);
+          if (revocation) {
+            keyReport = { apiKeysRevoked: revocation.revoked, apiKeysNotRevoked: revocation.notRevoked };
+            keyAudit = {
+              apiKeysRevoked: revocation.revoked.map((key) => key.id),
+              apiKeysNotRevoked: revocation.notRevoked.map((key) => key.id)
+            };
+          } else {
+            // Not listed, so none revoked: say so rather than answer an empty list that reads as "had none".
+            keyReport = { apiKeysLookupFailed: true };
+            keyAudit = { apiKeysLookupFailed: true };
+          }
+        }
       }
     }
     let updated = patch.value.status ? { ...target, status: patch.value.status as User["status"] } : target;
@@ -2704,11 +2886,12 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       action: "user.updated",
       resourceType: "User",
       resourceId: userId,
-      payload: { status: patch.value.status, roles: patch.value.roles, sessionsRevoked }
+      payload: { status: patch.value.status, roles: patch.value.roles, sessionsRevoked, ...keyAudit }
     });
-    // keysCreatedByUser only when the user was taken out (and its keys could be listed): the admin decides what to
-    // revoke. Every other response keeps the shape it had.
-    sendJson(res, 200, keysCreatedByUser ? { ...updated, keysCreatedByUser } : { ...updated });
+    // Key fields only when the user was taken out: apiKeysRevoked and apiKeysNotRevoked (or apiKeysLookupFailed) by
+    // default, keysCreatedByUser with keepApiKeys: true. Keys appear as id, name, prefix and createdAt, never a
+    // secret or hash. Every other response keeps the shape it had.
+    sendJson(res, 200, { ...updated, ...keyReport });
     return;
   }
 

@@ -14,11 +14,19 @@ import { createServer, request as httpRequest } from "node:http";
  * 127.0.0.1:1 BEFORE the gateway, and with it the config, is imported: a call that slipped past the stubs fails
  * instead of touching someone else's database.
  */
+const TENANT_ID = "88888888-8888-4888-8888-888888888888";
+
 process.env.AUTH_ENABLED = "false";
 process.env.REDIS_HOST = "127.0.0.1";
 process.env.REDIS_PORT = "1";
 process.env.POSTGRES_HOST = "127.0.0.1";
 process.env.POSTGRES_PORT = "1";
+// The org an API key authenticates in, once before() below has run the gateway's boot-time resolution. No org
+// rename and no admin bootstrap, so that resolution reads only the stubbed tenant lookups.
+process.env.ORG_TENANT_ID = TENANT_ID;
+delete process.env.ORG_NAME;
+delete process.env.BOOTSTRAP_ADMIN_EMAIL;
+delete process.env.BOOTSTRAP_ADMIN_PASSWORD;
 
 const { createGatewayHandler } = await import("../dist/index.js");
 const { getRedisClient } = await import("@hyfib/ratelimit");
@@ -32,7 +40,6 @@ const {
   userRepository
 } = await import("@hyfib/persistence");
 
-const TENANT_ID = "88888888-8888-4888-8888-888888888888";
 const ADMIN_ID = "99999999-9999-4999-8999-999999999999";
 const PEER_ADMIN_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const AGENT_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
@@ -85,6 +92,31 @@ function openSession(userId) {
 }
 
 const sessionsOf = (userId) => [...sessions.values()].filter((session) => session.userId === userId);
+
+/**
+ * An API key row, as apiKeyRepository.list returns it plus the hash findActiveByHash matches on (so a response that
+ * passed a row through would leak it). Returns the row and the raw key a client would hold.
+ */
+function seedKey(createdBy, name, extra = {}) {
+  const raw = `hyfib_${randomBytes(24).toString("hex")}`;
+  const key = {
+    id: randomUUID(),
+    tenantId: TENANT_ID,
+    name,
+    keyPrefix: raw.slice(0, 14),
+    roles: ["tenant_admin"],
+    createdBy,
+    createdAt: new Date(apiKeys.length * 1_000).toISOString(),
+    keyHash: tokenHash(raw),
+    ...extra
+  };
+  apiKeys.push(key);
+  return { key, raw };
+}
+
+const keyById = (id) => apiKeys.find((key) => key.id === id);
+/** How PATCH /users/:id reports a key: id, name, prefix and createdAt, nothing else. */
+const reported = (key) => ({ id: key.id, name: key.name, prefix: key.keyPrefix, createdAt: key.createdAt });
 
 const originals = [];
 function stub(repository, method, implementation) {
@@ -157,10 +189,23 @@ function installStubs() {
     };
   });
   stub(apiKeyRepository, "list", async () => apiKeys.map((key) => ({ ...key })));
+  // As the real UPDATE … WHERE revoked_at IS NULL: true only for a key of this tenant that was still active.
   stub(apiKeyRepository, "revoke", async (tenantId, id) => {
     calls.apiKeyRevoke.push(id);
+    const key = keyById(id);
+    if (!key || key.tenantId !== tenantId || key.revokedAt) {
+      return false;
+    }
+    key.revokedAt = new Date().toISOString();
     return true;
   });
+  stub(apiKeyRepository, "findActiveByHash", async (tenantId, keyHash) => {
+    const key = apiKeys.find(
+      (candidate) => candidate.keyHash === keyHash && candidate.tenantId === tenantId && !candidate.revokedAt
+    );
+    return key ? { ...key } : undefined;
+  });
+  stub(tenantRepository, "getUserCount", async () => users.size);
   stub(tenantRepository, "getById", async (id) => ({
     id,
     name: "Test Org",
@@ -179,6 +224,7 @@ function installStubs() {
 
 let server;
 let base;
+let gateway;
 
 before(async () => {
   // The rate limiters share this lazily-connecting client. Ending it before any request runs means its INCR is
@@ -188,7 +234,11 @@ before(async () => {
   assert.equal(redis.status, "end", "the rate limiter's Redis client must be closed before any request is sent");
 
   installStubs();
-  const gateway = createGatewayHandler({ eventBus: stubBus });
+  gateway = createGatewayHandler({ eventBus: stubBus });
+  // The boot-time org resolution, without which no API key authenticates (resolveAuth checks keys in that org). A
+  // request whose session is gone now falls through to a dev-header identity in this org, which has no roles
+  // unless the test sends x-role, so it is still refused (403 no_roles_assigned) rather than served.
+  await gateway.bootstrapPlatformAdmin();
   server = createServer((req, res) => {
     gateway.handle(req, res).catch(() => {
       if (!res.headersSent) {
@@ -483,13 +533,17 @@ test("setting a user's status to anything but active revokes every session it ho
 test("setting an already-active user to active, and changing only roles, leave its sessions alone", async () => {
   const adminToken = openSession(PEER_ADMIN_ID);
   openSession(AGENT_ID);
+  seedKey(AGENT_ID, "agent's integration");
 
   const reactivate = await send("PATCH", `/api/v1/users/${AGENT_ID}`, bearer(adminToken), { status: "active" });
   assertStatus(reactivate, 200, "tenant_admin setting an active agent to active");
   assert.equal(reactivate.body.keysCreatedByUser, undefined, "keys are listed only when a user is taken out");
+  assert.equal(reactivate.body.apiKeysRevoked, undefined, "keys are revoked only when a user is taken out");
   const reRole = await send("PATCH", `/api/v1/users/${AGENT_ID}`, bearer(adminToken), { roles: ["analyst"] });
   assertStatus(reRole, 200, "tenant_admin changing an agent's roles");
+  assert.equal(reRole.body.apiKeysRevoked, undefined);
 
+  assert.deepEqual(calls.apiKeyRevoke, [], "the agent's API key is left alone");
   assert.deepEqual(calls.sessionDeleteAllForUser, []);
   assert.equal(sessionsOf(AGENT_ID).length, 1);
 });
@@ -675,10 +729,316 @@ test("a session refused for an inactive user ends that user's streams on this in
 });
 
 // ─── The API keys a suspended admin leaves behind ─────────────────────────────
-// A key outlives its creator's suspension by design (revoking it is a deliberate act), so the suspending admin is
-// shown the keys that user created instead of having them revoked behind its back.
+// Taking a user out revokes the API keys it created, since the person may have copied one; the suspending admin
+// can keep them instead (keepApiKeys: true, a live customer integration say), and is then shown them.
 
-test("taking a user out lists the active API keys it created, without revoking any or showing a secret", async () => {
+test("by default, taking a user out revokes exactly the active API keys it created, and reports them without a secret", async () => {
+  const adminToken = openSession(PEER_ADMIN_ID);
+  for (const [index, status] of NOT_ACTIVE.entries()) {
+    users.get(ADMIN_ID).status = "active";
+    apiKeys.length = 0;
+    calls.apiKeyRevoke.length = 0;
+    calls.audit.length = 0;
+    const zapier = seedKey(ADMIN_ID, "zapier").key;
+    const crm = seedKey(ADMIN_ID, "crm sync").key;
+    const alreadyRevoked = seedKey(ADMIN_ID, "already revoked", { revokedAt: new Date(0).toISOString() }).key;
+    const colleagues = seedKey(PEER_ADMIN_ID, "a colleague's").key;
+    const unknownCreator = seedKey(undefined, "creator unknown").key;
+    // keepApiKeys: false is the default spelled out; absent and false behave the same.
+    const body = index === 0 ? { status, keepApiKeys: false } : { status };
+
+    let res;
+    const logs = await captureLogs(async () => {
+      res = await send("PATCH", `/api/v1/users/${ADMIN_ID}`, bearer(adminToken), body);
+    });
+    assertStatus(res, 200, `tenant_admin setting a tenant_admin to ${status}`);
+    assert.equal(res.body.status, status);
+    assert.deepEqual(
+      res.body.apiKeysRevoked,
+      [reported(zapier), reported(crm)],
+      `${status}: exactly the user's active keys are reported revoked, as id, name, prefix and createdAt`
+    );
+    assert.deepEqual(res.body.apiKeysNotRevoked, [], `${status}: none failed`);
+    assert.equal(res.body.keysCreatedByUser, undefined, `${status}: nothing is left for the admin to decide`);
+    const text = JSON.stringify(res.body);
+    for (const key of apiKeys) {
+      assert.equal(text.includes(key.keyHash), false, `${status}: no key hash leaks`);
+    }
+    assert.equal(/hyfib_[0-9a-f]{15,}/.test(text), false, `${status}: no raw key leaks, only the 14-char prefix`);
+
+    assert.deepEqual(calls.apiKeyRevoke.sort(), [zapier.id, crm.id].sort(), `${status}: only those are revoked`);
+    assert.ok(keyById(zapier.id).revokedAt && keyById(crm.id).revokedAt, `${status}: both are revoked`);
+    assert.equal(keyById(alreadyRevoked.id).revokedAt, new Date(0).toISOString(), `${status}: untouched`);
+    assert.equal(keyById(colleagues.id).revokedAt, undefined, `${status}: another user's key stays active`);
+    assert.equal(keyById(unknownCreator.id).revokedAt, undefined, `${status}: a key of unknown creator stays active`);
+
+    const row = calls.audit.at(-1);
+    assert.equal(row.action, "user.updated");
+    assert.deepEqual(row.payload.apiKeysRevoked?.sort(), [zapier.id, crm.id].sort(), `${status}: audited`);
+    assert.deepEqual(row.payload.apiKeysNotRevoked, []);
+    assert.equal(row.payload.sessionsRevoked, true, `${status}: the sessions are still revoked as well`);
+    const keyRows = calls.audit.filter((event) => event.action === "api_key.revoked");
+    assert.deepEqual(
+      keyRows.map((event) => event.resourceId).sort(),
+      [zapier.id, crm.id].sort(),
+      `${status}: each key's revocation is audited on the key too, as DELETE /api-keys/:id does`
+    );
+    assert.equal(keyRows[0].payload.userId, ADMIN_ID);
+
+    const info = logs.find((line) => line.message === "user_suspended_api_keys_revoked");
+    assert.equal(info?.level, "warn", `${status}: the revocation is logged`);
+    assert.equal(info.tenantId, TENANT_ID);
+    assert.equal(info.userId, ADMIN_ID);
+    assert.equal(info.count, 2);
+    assert.equal(info.subject, PEER_ADMIN_ID);
+    assert.equal(
+      logs.some((line) => line.message === "user_suspended_with_active_keys"),
+      false,
+      `${status}: no leftover-keys warning, nothing is left over`
+    );
+  }
+
+  // A user with no keys: empty lists, no revocation log.
+  let res;
+  const logs = await captureLogs(async () => {
+    res = await send("PATCH", `/api/v1/users/${AGENT_ID}`, bearer(adminToken), { status: "suspended" });
+  });
+  assertStatus(res, 200, "suspending an agent with no keys");
+  assert.deepEqual(res.body.apiKeysRevoked, []);
+  assert.deepEqual(res.body.apiKeysNotRevoked, []);
+  assert.equal(
+    logs.some((line) => line.message === "user_suspended_api_keys_revoked"),
+    false
+  );
+});
+
+test("keepApiKeys must be a boolean, and only goes with a status that takes the user out: 400 before any write", async () => {
+  const adminToken = openSession(PEER_ADMIN_ID);
+  const agentToken = openSession(AGENT_ID);
+  const agentKey = seedKey(AGENT_ID, "agent's integration").key;
+  for (const body of [
+    { status: "suspended", keepApiKeys: "true" },
+    { status: "suspended", keepApiKeys: 1 },
+    { status: "suspended", keepApiKeys: null },
+    { status: "disabled", keepApiKeys: {} },
+    { status: "active", keepApiKeys: true },
+    { roles: ["analyst"], keepApiKeys: true }
+  ]) {
+    const res = await send("PATCH", `/api/v1/users/${AGENT_ID}`, bearer(adminToken), body);
+    assertStatus(res, 400, `PATCH ${JSON.stringify(body)}`);
+    assert.match(res.body.error, /^keepApiKeys /, `PATCH ${JSON.stringify(body)} names the field`);
+  }
+  assert.deepEqual(calls.userUpdateStatus, [], "no status was written");
+  assert.deepEqual(calls.userUpdateRoles, [], "no roles were written");
+  assert.deepEqual(calls.sessionDeleteAllForUser, [], "no session was revoked");
+  assert.deepEqual(calls.apiKeyRevoke, [], "no key was revoked");
+  assert.deepEqual(calls.audit, [], "nothing was audited");
+  assert.equal(users.get(AGENT_ID).status, "active");
+  assert.equal(keyById(agentKey.id).revokedAt, undefined);
+  assertStatus(await send("GET", "/api/v1/teams", bearer(agentToken)), 200, "the agent is still signed in");
+});
+
+test("if revoking one key fails, the suspension is still answered 200 and audited, and that key is reported as not revoked", async () => {
+  const adminToken = openSession(PEER_ADMIN_ID);
+  const failing = seedKey(AGENT_ID, "flaky").key;
+  const fine = seedKey(AGENT_ID, "fine").key;
+  const revoke = apiKeyRepository.revoke;
+  apiKeyRepository.revoke = async (tenantId, id) => {
+    if (id === failing.id) {
+      calls.apiKeyRevoke.push(id);
+      throw new Error("connection reset");
+    }
+    return revoke(tenantId, id);
+  };
+  let res;
+  let logs;
+  try {
+    logs = await captureLogs(async () => {
+      res = await send("PATCH", `/api/v1/users/${AGENT_ID}`, bearer(adminToken), { status: "suspended" });
+    });
+  } finally {
+    apiKeyRepository.revoke = revoke;
+  }
+
+  assertStatus(res, 200, "suspension with a key whose revocation failed");
+  assert.equal(res.body.status, "suspended");
+  assert.equal(users.get(AGENT_ID).status, "suspended", "the status change stands");
+  assert.deepEqual(res.body.apiKeysRevoked, [reported(fine)]);
+  assert.deepEqual(res.body.apiKeysNotRevoked, [reported(failing)], "the admin is told which key is still live");
+  assert.equal(keyById(failing.id).revokedAt, undefined);
+  assert.ok(keyById(fine.id).revokedAt, "the other key is revoked regardless");
+
+  const row = calls.audit.at(-1);
+  assert.equal(row?.action, "user.updated", "the change is audited");
+  assert.deepEqual(row.payload.apiKeysRevoked, [fine.id]);
+  assert.deepEqual(row.payload.apiKeysNotRevoked, [failing.id]);
+  assert.equal(row.payload.sessionsRevoked, true);
+  const failure = logs.find((line) => line.message === "user_api_key_revoke_failed");
+  assert.equal(failure?.level, "error");
+  assert.equal(failure.keyId, failing.id);
+  assert.equal(failure.userId, AGENT_ID);
+  assert.equal(failure.error, "connection reset");
+  assert.equal(logs.find((line) => line.message === "user_suspended_api_keys_revoked")?.count, 1);
+});
+
+test("a key revoked by someone else between the lookup and the revoke is reported in neither list", async () => {
+  const adminToken = openSession(PEER_ADMIN_ID);
+  const raced = seedKey(AGENT_ID, "raced", { revokedAt: new Date(0).toISOString() }).key;
+  const live = seedKey(AGENT_ID, "live").key;
+  // The lookup still sees the raced key as active, as it would if a DELETE landed right after it.
+  const list = apiKeyRepository.list;
+  apiKeyRepository.list = async (tenantId) => (await list(tenantId)).map((key) => ({ ...key, revokedAt: undefined }));
+  let res;
+  let logs;
+  try {
+    logs = await captureLogs(async () => {
+      res = await send("PATCH", `/api/v1/users/${AGENT_ID}`, bearer(adminToken), { status: "suspended" });
+    });
+  } finally {
+    apiKeyRepository.list = list;
+  }
+  assertStatus(res, 200, "suspension racing a DELETE of one key");
+  assert.deepEqual(res.body.apiKeysRevoked, [reported(live)], "only the key this request revoked");
+  assert.deepEqual(res.body.apiKeysNotRevoked, [], "the raced key is not live, so it is not reported as such");
+  assert.deepEqual(
+    calls.audit.filter((event) => event.action === "api_key.revoked").map((event) => event.resourceId),
+    [live.id],
+    "the raced key's revocation was audited by whoever made it"
+  );
+  const note = logs.find((line) => line.message === "user_api_key_already_revoked");
+  assert.equal(note?.level, "info");
+  assert.equal(note.keyId, raced.id);
+});
+
+test("if the user's keys cannot be listed, the suspension is still answered 200 and audited, and says so", async () => {
+  const adminToken = openSession(PEER_ADMIN_ID);
+  const list = apiKeyRepository.list;
+  apiKeyRepository.list = async () => {
+    throw new Error("connection reset");
+  };
+  let res;
+  let logs;
+  try {
+    logs = await captureLogs(async () => {
+      res = await send("PATCH", `/api/v1/users/${AGENT_ID}`, bearer(adminToken), { status: "disabled" });
+    });
+  } finally {
+    apiKeyRepository.list = list;
+  }
+  assertStatus(res, 200, "suspension whose key lookup failed");
+  assert.equal(users.get(AGENT_ID).status, "disabled");
+  assert.equal(res.body.apiKeysLookupFailed, true, "the admin is told the keys were not checked");
+  assert.equal(res.body.apiKeysRevoked, undefined, "no list is claimed");
+  const row = calls.audit.at(-1);
+  assert.equal(row?.action, "user.updated");
+  assert.equal(row.payload.apiKeysLookupFailed, true);
+  assert.equal(logs.find((line) => line.message === "user_keys_lookup_failed")?.level, "error");
+});
+
+test("with keepApiKeys: true, a failed key lookup is still recorded in the audit row", async () => {
+  // The response keeps the keep path's shape, but the audit must tell "looked and kept none" from "could not look".
+  const adminToken = openSession(PEER_ADMIN_ID);
+  const list = apiKeyRepository.list;
+  apiKeyRepository.list = async () => {
+    throw new Error("connection reset");
+  };
+  let res;
+  try {
+    res = await send("PATCH", `/api/v1/users/${AGENT_ID}`, bearer(adminToken), {
+      status: "suspended",
+      keepApiKeys: true
+    });
+  } finally {
+    apiKeyRepository.list = list;
+  }
+  assertStatus(res, 200, "suspension keeping keys whose lookup failed");
+  const row = calls.audit.at(-1);
+  assert.equal(row?.action, "user.updated");
+  assert.equal(row.payload.keepApiKeys, true);
+  assert.equal(row.payload.apiKeysLookupFailed, true, "the audit row says the keys could not be listed");
+});
+
+test("keepApiKeys: false is a harmless no-op on a patch that does not take the user out", async () => {
+  // false is the default and asks for nothing, so a client that always sends the boolean (a checkbox) must not get a
+  // 400 on a roles edit or a reactivation.
+  const adminToken = openSession(PEER_ADMIN_ID);
+  const roles = await send("PATCH", `/api/v1/users/${AGENT_ID}`, bearer(adminToken), {
+    roles: ["analyst"],
+    keepApiKeys: false
+  });
+  assertStatus(roles, 200, "a roles-only patch with keepApiKeys: false");
+  users.get(AGENT_ID).status = "suspended";
+  const reactivate = await send("PATCH", `/api/v1/users/${AGENT_ID}`, bearer(adminToken), {
+    status: "active",
+    keepApiKeys: false
+  });
+  assertStatus(reactivate, 200, "a reactivation with keepApiKeys: false");
+  assert.equal(users.get(AGENT_ID).status, "active");
+});
+
+test("an API key minted while its creator is being suspended is revoked at once and never shown", async () => {
+  // The race the suspension alone cannot close: the creator's POST passes its active re-check, the suspension writes
+  // the status and lists the creator's keys, and only then does the POST's INSERT commit — so the list never saw the
+  // new key. Simulated deterministically by suspending the creator inside the create call.
+  const adminToken = openSession(ADMIN_ID);
+  const create = apiKeyRepository.create;
+  let minted;
+  apiKeyRepository.create = async (tenantId, input) => {
+    users.get(ADMIN_ID).status = "suspended";
+    minted = await create(tenantId, input);
+    apiKeys.push({ ...minted.record, createdBy: input.createdBy, revokedAt: undefined });
+    return minted;
+  };
+  let res;
+  let logs;
+  try {
+    logs = await captureLogs(async () => {
+      res = await send("POST", "/api/v1/api-keys", bearer(adminToken), { name: "late key", roles: ["analyst"] });
+    });
+  } finally {
+    apiKeyRepository.create = create;
+  }
+  assertStatus(res, 401, "a key minted by a creator suspended mid-request");
+  assert.equal(res.body.key, undefined, "the secret is never shown");
+  assert.equal(JSON.stringify(res.body).includes(minted.key), false, "the secret appears nowhere in the response");
+  assert.deepEqual(calls.apiKeyRevoke, [minted.record.id], "the new key is revoked");
+  assert.ok(keyById(minted.record.id).revokedAt, "and stays revoked");
+  const revoked = calls.audit.find((event) => event.action === "api_key.revoked");
+  assert.equal(revoked?.resourceId, minted.record.id, "the revocation is audited");
+  assert.equal(revoked.payload.reason, "caller_deactivated");
+  assert.equal(logs.find((line) => line.message === "api_key_revoked_caller_deactivated")?.level, "warn");
+});
+
+test("reactivating a user does not restore the API keys its suspension revoked", async () => {
+  const adminToken = openSession(PEER_ADMIN_ID);
+  for (const status of NOT_ACTIVE) {
+    users.get(AGENT_ID).status = "active";
+    const key = seedKey(AGENT_ID, `revoked on ${status}`).key;
+    assertStatus(
+      await send("PATCH", `/api/v1/users/${AGENT_ID}`, bearer(adminToken), { status }),
+      200,
+      `taking the agent out (${status})`
+    );
+    const revokedAt = keyById(key.id).revokedAt;
+    assert.ok(revokedAt, `${status}: the key was revoked`);
+
+    const res = await send("PATCH", `/api/v1/users/${AGENT_ID}`, bearer(adminToken), { status: "active" });
+    assertStatus(res, 200, `reactivating a ${status} agent`);
+    assert.equal(keyById(key.id).revokedAt, revokedAt, `${status} → active: the key stays revoked`);
+    assert.equal(res.body.apiKeysRevoked, undefined);
+    assert.equal(res.body.keysCreatedByUser, undefined);
+  }
+  // There is no way to ask for them back: keepApiKeys is refused on reactivation.
+  users.get(AGENT_ID).status = "suspended";
+  const res = await send("PATCH", `/api/v1/users/${AGENT_ID}`, bearer(adminToken), {
+    status: "active",
+    keepApiKeys: true
+  });
+  assertStatus(res, 400, "reactivating with keepApiKeys: true");
+  assert.ok(apiKeys.every((key) => key.revokedAt));
+});
+
+test("with keepApiKeys: true, taking a user out lists the active API keys it created, without revoking any or showing a secret", async () => {
   const adminToken = openSession(PEER_ADMIN_ID);
   const createdAt = new Date(0).toISOString();
   const theirs = {
@@ -703,7 +1063,7 @@ test("taking a user out lists the active API keys it created, without revoking a
     users.get(ADMIN_ID).status = "active";
     let res;
     const logs = await captureLogs(async () => {
-      res = await send("PATCH", `/api/v1/users/${ADMIN_ID}`, bearer(adminToken), { status });
+      res = await send("PATCH", `/api/v1/users/${ADMIN_ID}`, bearer(adminToken), { status, keepApiKeys: true });
     });
     assertStatus(res, 200, `tenant_admin setting a tenant_admin to ${status}`);
     assert.deepEqual(
@@ -712,17 +1072,29 @@ test("taking a user out lists the active API keys it created, without revoking a
       `${status}: exactly the user's active keys, as id, name, prefix and createdAt`
     );
     assert.equal(JSON.stringify(res.body).includes("never-in-a-response"), false, "no key hash leaks");
+    assert.equal(res.body.apiKeysRevoked, undefined, `${status}: nothing is reported revoked`);
     const warning = logs.find((line) => line.message === "user_suspended_with_active_keys");
     assert.equal(warning?.level, "warn", `${status}: the leftover keys are logged`);
     assert.equal(warning?.userId, ADMIN_ID);
     assert.equal(warning?.count, 1);
+    const row = calls.audit.at(-1);
+    assert.equal(row.payload.keepApiKeys, true, `${status}: the decision to keep them is audited`);
+    assert.deepEqual(row.payload.apiKeysKept, [theirs.id]);
+    assert.equal(row.payload.sessionsRevoked, true, `${status}: the sessions are revoked all the same`);
   }
-  assert.deepEqual(calls.apiKeyRevoke, [], "no key is revoked automatically");
+  assert.deepEqual(calls.apiKeyRevoke, [], "no key is revoked");
+  assert.equal(
+    calls.audit.some((event) => event.action === "api_key.revoked"),
+    false
+  );
 
   // A user with no keys gets an empty list and no warning.
   let res;
   const logs = await captureLogs(async () => {
-    res = await send("PATCH", `/api/v1/users/${AGENT_ID}`, bearer(adminToken), { status: "suspended" });
+    res = await send("PATCH", `/api/v1/users/${AGENT_ID}`, bearer(adminToken), {
+      status: "suspended",
+      keepApiKeys: true
+    });
   });
   assertStatus(res, 200, "suspending an agent with no keys");
   assert.deepEqual(res.body.keysCreatedByUser, []);
@@ -730,6 +1102,12 @@ test("taking a user out lists the active API keys it created, without revoking a
     logs.some((line) => line.message === "user_suspended_with_active_keys"),
     false
   );
+
+  // Kept means kept for that change only: a later status change without the flag revokes them like any other.
+  const later = await send("PATCH", `/api/v1/users/${ADMIN_ID}`, bearer(adminToken), { status: "disabled" });
+  assertStatus(later, 200, "disabling the admin, still out, without keepApiKeys");
+  assert.deepEqual(later.body.apiKeysRevoked, [{ id: theirs.id, name: "zapier", prefix: "hyfib_1a2b3c4d", createdAt }]);
+  assert.deepEqual(calls.apiKeyRevoke, [theirs.id]);
 });
 
 // ─── Suspended while the request body is still arriving ───────────────────────
@@ -905,4 +1283,75 @@ test("/auth/me clears the session cookie when it refuses the cookie's session fo
   const viaBearer = await send("GET", "/auth/me", bearer(openSession(AGENT_ID)));
   assertStatus(viaBearer, 401, "suspended user's /auth/me by Bearer");
   assert.equal(viaBearer.setCookie, null);
+});
+
+// ─── A revoked key is a dead key, streams included ─────────────────────────────
+// Driven with real keys through resolveAuth's API-key path, which checks each presented key against the store.
+
+test("a key revoked by its creator's suspension no longer authenticates, and the event streams it opened end", async () => {
+  const adminToken = openSession(PEER_ADMIN_ID);
+  const theirs = seedKey(ADMIN_ID, "zapier");
+  const colleagues = seedKey(PEER_ADMIN_ID, "a colleague's");
+  // Control: both keys work, so a refusal below is the revocation and nothing else.
+  assertStatus(await send("GET", "/api/v1/teams", bearer(theirs.raw)), 200, "the admin's key before");
+  assertStatus(await send("GET", "/api/v1/teams", bearer(colleagues.raw)), 200, "the colleague's key before");
+  const theirStream = await openStream(bearer(theirs.raw));
+  const colleagueStream = await openStream(bearer(colleagues.raw));
+
+  const res = await send("PATCH", `/api/v1/users/${ADMIN_ID}`, bearer(adminToken), { status: "suspended" });
+  assertStatus(res, 200, "suspending the admin");
+  assert.deepEqual(res.body.apiKeysRevoked, [reported(theirs.key)]);
+
+  const refused = await send("GET", "/api/v1/teams", bearer(theirs.raw));
+  assertStatus(refused, 401, "the suspended admin's key on an ordinary route");
+  assert.equal(refused.body.detail, "Invalid or revoked API key");
+  await theirStream.waitEnded("the revoked key's event stream ends");
+
+  assertStatus(await send("GET", "/api/v1/teams", bearer(colleagues.raw)), 200, "the colleague's key after");
+  await pause(20);
+  assert.equal(colleagueStream.isEnded(), false, "the colleague's stream stays open");
+});
+
+test("with keepApiKeys: true the suspended user's key keeps working", async () => {
+  const adminToken = openSession(PEER_ADMIN_ID);
+  const theirs = seedKey(ADMIN_ID, "live customer integration");
+  const stream = await openStream(bearer(theirs.raw));
+
+  const res = await send("PATCH", `/api/v1/users/${ADMIN_ID}`, bearer(adminToken), {
+    status: "suspended",
+    keepApiKeys: true
+  });
+  assertStatus(res, 200, "suspending the admin, keeping its keys");
+  assert.deepEqual(res.body.keysCreatedByUser, [reported(theirs.key)]);
+  assertStatus(await send("GET", "/api/v1/teams", bearer(theirs.raw)), 200, "the kept key after the suspension");
+  await pause(20);
+  assert.equal(stream.isEnded(), false, "the kept key's stream stays open");
+});
+
+test("DELETE /api/v1/api-keys/:id ends the event streams the key opened, as well as refusing the key", async () => {
+  const adminToken = openSession(PEER_ADMIN_ID);
+  const doomed = seedKey(PEER_ADMIN_ID, "doomed");
+  const other = seedKey(PEER_ADMIN_ID, "other");
+  const doomedStream = await openStream(bearer(doomed.raw));
+  const otherStream = await openStream(bearer(other.raw));
+
+  const res = await send("DELETE", `/api/v1/api-keys/${doomed.key.id}`, bearer(adminToken));
+  assertStatus(res, 200, "revoking a key");
+  assertStatus(await send("GET", "/api/v1/teams", bearer(doomed.raw)), 401, "the revoked key");
+  await doomedStream.waitEnded("the revoked key's event stream ends");
+  await pause(20);
+  assert.equal(otherStream.isEnded(), false, "another key's stream stays open");
+});
+
+test("an API key cannot use PATCH /users/:id to suspend anyone, so it cannot revoke keys that way either", async () => {
+  const key = seedKey(PEER_ADMIN_ID, "tenant_admin key");
+  const targetsKey = seedKey(ADMIN_ID, "target's key").key;
+  for (const body of [{ status: "suspended" }, { status: "suspended", keepApiKeys: true }]) {
+    const res = await send("PATCH", `/api/v1/users/${ADMIN_ID}`, bearer(key.raw), body);
+    assertStatus(res, 403, `PATCH ${JSON.stringify(body)} by API key`);
+    assert.equal(res.body.error, "api_key_forbidden");
+  }
+  assert.equal(users.get(ADMIN_ID).status, "active");
+  assert.deepEqual(calls.apiKeyRevoke, []);
+  assert.equal(keyById(targetsKey.id).revokedAt, undefined);
 });

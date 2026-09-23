@@ -122,3 +122,38 @@ test("user patch: status enum + roles allowlist + dedupe", () => {
   assert.equal(validateUserPatch({ roles: ["root"] }, valid).ok, false);
   assert.equal(validateUserPatch({}, valid).ok, false);
 });
+
+test("user patch: keepApiKeys is a boolean, accepted only with a status that takes the user out", () => {
+  const valid = new Set(["tenant_admin", "analyst"]);
+  for (const status of ["suspended", "disabled", "invited"]) {
+    for (const keepApiKeys of [true, false]) {
+      const ok = validateUserPatch({ status, keepApiKeys }, valid);
+      assert.equal(ok.ok, true, `${status} with keepApiKeys ${keepApiKeys}`);
+      assert.deepEqual(ok.value, { status, keepApiKeys });
+    }
+  }
+  // Absent stays absent, so a patch without it keeps exactly the shape it had.
+  assert.deepEqual(validateUserPatch({ status: "suspended" }, valid).value, { status: "suspended" });
+
+  for (const keepApiKeys of ["true", 1, 0, null, {}, []]) {
+    const refused = validateUserPatch({ status: "suspended", keepApiKeys }, valid);
+    assert.equal(refused.ok, false, `keepApiKeys ${JSON.stringify(keepApiKeys)} is refused`);
+    assert.equal(refused.error, "keepApiKeys must be a boolean");
+  }
+
+  // keepApiKeys: true is rejected, not ignored, where it would do nothing: reactivating never restores a revoked
+  // key, and a patch that keeps the user's status never touches its keys.
+  for (const patch of [
+    { status: "active", keepApiKeys: true },
+    { roles: ["analyst"], keepApiKeys: true }
+  ]) {
+    const refused = validateUserPatch(patch, valid);
+    assert.equal(refused.ok, false, `${JSON.stringify(patch)} is refused`);
+    assert.match(refused.error, /^keepApiKeys applies only when status is one of: invited, suspended, disabled/);
+  }
+  // keepApiKeys: false asks for nothing (it is the default), so it is accepted everywhere as a no-op and not copied
+  // into the value — a client that always sends the boolean (e.g. a checkbox) must not get a 400 on reactivation.
+  assert.deepEqual(validateUserPatch({ status: "active", keepApiKeys: false }, valid).value, { status: "active" });
+  assert.deepEqual(validateUserPatch({ roles: ["analyst"], keepApiKeys: false }, valid).value, { roles: ["analyst"] });
+  assert.equal(validateUserPatch({ keepApiKeys: true }, valid).error, "at least one of status or roles is required");
+});
