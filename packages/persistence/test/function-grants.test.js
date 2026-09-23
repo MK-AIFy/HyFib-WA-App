@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { query } from "../dist/index.js";
+import { query, closePool } from "../dist/index.js";
 
 /**
  * Every SECURITY DEFINER function runs with the privileges of its owner — the bootstrap superuser that runs
@@ -145,4 +145,10 @@ test("the replay-guard lookup uses its index rather than scanning messages", { s
     /idx_messages_external_message_id/,
     `findByExternalId must not sequentially scan messages; plan was: ${rendered}`
   );
+});
+
+test.after(async () => {
+  if (!skip) {
+    await closePool();
+  }
 });
