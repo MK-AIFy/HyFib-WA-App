@@ -72,3 +72,69 @@ for (const [url, reason] of REJECTED) {
     assert.doesNotMatch(result.error, /hunter2/, "credentials must not be echoed back");
   });
 }
+
+// ─── Operator allowlist (OUTBOUND_WEBHOOK_ALLOWLIST) ────────────────────────
+//
+// The route passes config.outboundWebhookAllowlist — the same allowlist the worker applies at delivery time — so a
+// receiver the operator listed can be saved, and the save-time and delivery-time decisions agree.
+
+const ALLOWLIST = Object.freeze({ hosts: ["hooks.corp"], hostSuffixes: ["branch.lan"], cidrs: ["10.1.2.0/24"] });
+
+test("with an operator allowlist, a listed internal host or address is accepted and stored as supplied", () => {
+  for (const url of ["http://hooks.corp:8443/hyfib?x=1", "https://printer.branch.lan/cb", "http://10.1.2.3/hyfib"]) {
+    assert.deepEqual(parseStatusCallbackUrl(`  ${url} `, ALLOWLIST), { ok: true, value: url }, url);
+    assert.equal(parseStatusCallbackUrl(url).ok, false, `${url} must still be refused without the allowlist`);
+  }
+});
+
+const STILL_REJECTED = [
+  ["http://other.corp/", ALLOWLIST, /internal/],
+  ["http://a.hooks.corp/", ALLOWLIST, /internal/],
+  ["http://branch.lan/", ALLOWLIST, /internal/],
+  ["http://10.1.3.1/", ALLOWLIST, /private|reserved/],
+  ["http://[::ffff:10.1.2.3]/", ALLOWLIST, /private|reserved/],
+  ["http://169.254.169.254/latest/meta-data/", { cidrs: ["0.0.0.0/0", "::/0"] }, /private|reserved/],
+  ["http://[fe80::1]/", { cidrs: ["0.0.0.0/0", "::/0"] }, /private|reserved/],
+  ["http://127.0.0.1:15672/", { cidrs: ["0.0.0.0/0", "::/0"] }, /private|reserved/],
+  // Cloud metadata outside link-local (the hard floor): IPv6 endpoints are unique-local, not link-local, so every
+  // range an operator might list to open fc00::/7 — or CGNAT / 192.0.0.0/24 for the IPv4 ones — must still refuse.
+  ...[
+    "http://[fd00:ec2::254]/latest/meta-data/",
+    "http://[fd20:ce::254]/computeMetadata/v1/",
+    "http://[fd00:c1::a9fe:a9fe]/opc/v2/instance/",
+    "http://100.100.100.200/latest/meta-data/",
+    "http://192.0.0.192/latest/"
+  ].flatMap((url) =>
+    [
+      ["::/0"],
+      ["fc00::/7"],
+      ["fd00::/8"],
+      ["0.0.0.0/0"],
+      ["0.0.0.0/0", "::/0"],
+      ["100.64.0.0/10", "192.0.0.0/24"],
+      [new URL(url).hostname.replace(/^\[|\]$/g, "")]
+    ].map((cidrs) => [url, { cidrs }, /private|reserved/])
+  ),
+  ["file:///etc/passwd", { hosts: ["hooks.corp"] }, /http or https/],
+  ["https://admin:hunter2@hooks.corp/", { hosts: ["hooks.corp"] }, /credentials/]
+];
+
+for (const [url, allowlist, reason] of STILL_REJECTED) {
+  test(`with allowlist ${JSON.stringify(allowlist)}, ${url} is still rejected without revealing the allowlist`, () => {
+    const result = parseStatusCallbackUrl(url, allowlist);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /^Invalid statusCallbackUrl: /);
+    assert.match(result.error, reason);
+    assert.doesNotMatch(result.error, /hunter2|OUTBOUND_WEBHOOK_ALLOWLIST|10\.1\.2\.0|branch\.lan|0\.0\.0\.0\/0/);
+    for (const entry of allowlist.cidrs ?? []) {
+      assert.equal(result.error.includes(entry), false, `the error reveals the allowlist entry ${entry}`);
+    }
+  });
+}
+
+test("an empty allowlist is today's behaviour exactly", () => {
+  const empty = { hosts: [], hostSuffixes: [], cidrs: [] };
+  for (const url of ["https://hooks.example.com/x", "http://hooks.corp/", "http://10.1.2.3/", undefined, "  "]) {
+    assert.deepEqual(parseStatusCallbackUrl(url, empty), parseStatusCallbackUrl(url), String(url));
+  }
+});

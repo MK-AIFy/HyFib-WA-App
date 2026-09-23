@@ -10,6 +10,8 @@ process.env.REDIS_PORT = "1";
 process.env.POSTGRES_HOST = "127.0.0.1";
 process.env.POSTGRES_PORT = "1";
 process.env.AUTH_ENABLED = "false";
+// Operator allowlist, read by loadConfig when the gateway module is evaluated (hence also before the imports).
+process.env.OUTBOUND_WEBHOOK_ALLOWLIST = "hooks.corp, *.branch.lan, 10.1.2.0/24";
 
 const { createGatewayHandler } = await import("../dist/index.js");
 const { parseStatusCallbackUrl } = await import("../dist/validation.js");
@@ -112,3 +114,52 @@ test("PUT whatsapp settings with a public statusCallbackUrl passes the check and
   assert.equal(response.status, 500);
   assert.ok(dbCalls.length > before, "a valid URL never reached the repository");
 });
+
+// ─── Operator allowlist (OUTBOUND_WEBHOOK_ALLOWLIST, set above) ─────────────
+//
+// The route validates with config.outboundWebhookAllowlist — the same allowlist the worker applies at delivery — so
+// a receiver the operator listed can be saved, everything else is still a 400, and no response reveals the list.
+
+const allowlist = loadConfig().outboundWebhookAllowlist;
+
+const ALLOWLISTED = [
+  "http://hooks.corp:8443/hyfib?token=abc",
+  "https://printer.branch.lan/cb",
+  "http://10.1.2.3/hyfib"
+];
+
+for (const statusCallbackUrl of ALLOWLISTED) {
+  test(`PUT whatsapp settings accepts the operator-allowlisted ${statusCallbackUrl} and reaches the repository`, async () => {
+    assert.equal(parseStatusCallbackUrl(statusCallbackUrl).ok, false, "precondition: refused without the allowlist");
+    const before = dbCalls.length;
+
+    const response = await putSettings({ statusCallbackUrl, retryMaxAttempts: 3 });
+
+    assert.equal(response.status, 500, "past the URL check, the refused-in-process database answers");
+    assert.ok(dbCalls.length > before, "an allowlisted URL never reached the repository");
+  });
+}
+
+const NOT_ALLOWLISTED = [
+  "http://other.corp/hyfib",
+  "http://a.hooks.corp/hyfib",
+  "http://branch.lan/",
+  "http://10.1.3.1/hyfib",
+  "http://[::ffff:10.1.2.3]/"
+];
+
+for (const statusCallbackUrl of NOT_ALLOWLISTED) {
+  test(`PUT whatsapp settings still rejects ${statusCallbackUrl} (not covered by the allowlist) without revealing it`, async () => {
+    const expected = parseStatusCallbackUrl(statusCallbackUrl, allowlist);
+    assert.equal(expected.ok, false, "precondition: the allowlist does not cover this value");
+    const before = dbCalls.length;
+
+    const response = await putSettings({ statusCallbackUrl, retryMaxAttempts: 3 });
+    const text = await response.text();
+
+    assert.equal(response.status, 400);
+    assert.deepEqual(JSON.parse(text), { error: expected.error });
+    assert.doesNotMatch(text, /OUTBOUND_WEBHOOK_ALLOWLIST|10\.1\.2\.0|branch\.lan|hooks\.corp/);
+    assert.deepEqual(dbCalls.slice(before), [], "the repository was called for a refused URL");
+  });
+}
