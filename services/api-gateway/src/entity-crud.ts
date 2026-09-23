@@ -313,8 +313,20 @@ const USER_STATUSES = new Set(["active", "invited", "suspended", "disabled"]);
 export interface UserPatch {
   status?: string;
   roles?: string[];
+  /**
+   * Keep the API keys the user created when this patch takes the user out (any status but active); by default they
+   * are revoked. Present only when the request sent it.
+   */
+  keepApiKeys?: boolean;
 }
 
+/**
+ * Other fields are ignored, as before. keepApiKeys: true is refused (not ignored) with a status of active or no status
+ * at all: it would do nothing there, and reactivating a user never restores a key its suspension revoked, so a client
+ * that sends it expecting either is told so instead of being answered 200. keepApiKeys: false asks for nothing (it is
+ * the default), so there it is accepted as a no-op and left out of the value — a client that always sends the boolean
+ * must not get a 400 on a roles edit or a reactivation.
+ */
 export function validateUserPatch(payload: unknown, validRoles: ReadonlySet<string>): Ok<UserPatch> | Err {
   if (!isPlainObject(payload)) {
     return err("body must be a JSON object");
@@ -336,8 +348,22 @@ export function validateUserPatch(payload: unknown, validRoles: ReadonlySet<stri
     }
     value.roles = [...new Set(payload.roles as string[])];
   }
+  if (payload.keepApiKeys !== undefined && typeof payload.keepApiKeys !== "boolean") {
+    return err("keepApiKeys must be a boolean");
+  }
   if (Object.keys(value).length === 0) {
     return err("at least one of status or roles is required");
+  }
+  if (payload.keepApiKeys !== undefined) {
+    const takesOut = value.status !== undefined && value.status !== "active";
+    if (takesOut) {
+      value.keepApiKeys = payload.keepApiKeys;
+    } else if (payload.keepApiKeys === true) {
+      const takeOut = [...USER_STATUSES].filter((status) => status !== "active");
+      return err(
+        `keepApiKeys applies only when status is one of: ${takeOut.join(", ")} (reactivating a user does not restore revoked API keys)`
+      );
+    }
   }
   return { ok: true, value };
 }
