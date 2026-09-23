@@ -3,7 +3,9 @@ name: CodeQL
 on:
   push:
     branches: ["main", "master"]
+  # Only pull requests into main (i.e. develop -> main): feature PRs into develop deliberately run no checks.
   pull_request:
+    branches: ["main", "master"]
   schedule:
     - cron: "0 3 * * 1"
 
