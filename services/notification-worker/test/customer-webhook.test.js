@@ -4,7 +4,7 @@ import { createHmac } from "node:crypto";
 import { createServer } from "node:http";
 import dns from "node:dns";
 import { createOutboundFetch } from "@hyfib/shared-core";
-import { signWebhookBody, deliverCustomerWebhook } from "../dist/customer-webhook.js";
+import { signWebhookBody, deliverCustomerWebhook, customerWebhookBlockHint } from "../dist/customer-webhook.js";
 
 test("signWebhookBody produces sha256=<hmac> over the exact body", () => {
   const body = '{"type":"message.status"}';
@@ -241,4 +241,147 @@ test("an injected fetch is asked not to follow redirects, and a 3xx it returns i
   );
   assert.equal(init.redirect, "manual");
   assert.deepEqual(result, { ok: false, status: 302 });
+});
+
+// ─── Operator allowlist (OUTBOUND_WEBHOOK_ALLOWLIST) ────────────────────────
+//
+// The worker passes config.outboundWebhookAllowlist in the options argument; the same allowlist governs the URL
+// re-check and the default transport, so an on-prem receiver the operator listed (host AND address) is delivered
+// to and everything else stays refused. Omitting the options is exactly the behaviour above.
+
+const recordingFetch = () => {
+  const calls = [];
+  const fetchImpl = async (url) => {
+    calls.push(url);
+    return { ok: true, status: 200 };
+  };
+  return { calls, fetchImpl };
+};
+
+test("an allowlisted internal host name passes the re-check and reaches the transport; unlisted it is refused", async () => {
+  const allowlist = { hosts: ["hooks.corp"], hostSuffixes: [], cidrs: [] };
+  const listed = recordingFetch();
+  const result = await deliverCustomerWebhook(
+    { url: "https://hooks.corp/h?token=abc", secret: "whsec_1" },
+    EVENT,
+    listed.fetchImpl,
+    { allowlist }
+  );
+  assert.deepEqual(result, { ok: true, status: 200 });
+  assert.deepEqual(listed.calls, ["https://hooks.corp/h?token=abc"]);
+
+  const unlisted = recordingFetch();
+  const refused = await deliverCustomerWebhook(
+    { url: "https://other.corp/h", secret: "whsec_1" },
+    EVENT,
+    unlisted.fetchImpl,
+    { allowlist }
+  );
+  assert.equal(refused.blocked, true);
+  assert.equal(refused.remedy, "host");
+  assert.equal(unlisted.calls.length, 0);
+});
+
+test("an allowlisted CIDR admits a private IP literal; the hard floor is refused even under 0.0.0.0/0", async () => {
+  const listed = recordingFetch();
+  const ok = await deliverCustomerWebhook({ url: "http://10.1.2.3:8080/h" }, EVENT, listed.fetchImpl, {
+    allowlist: { cidrs: ["10.1.2.0/24"] }
+  });
+  assert.equal(ok.ok, true);
+  assert.equal(listed.calls.length, 1);
+
+  const floor = recordingFetch();
+  const metadata = await deliverCustomerWebhook(
+    { url: "http://169.254.169.254/latest/meta-data/", secret: "whsec_TOPSECRET" },
+    EVENT,
+    floor.fetchImpl,
+    { allowlist: { cidrs: ["0.0.0.0/0", "::/0"] } }
+  );
+  assert.equal(metadata.blocked, true);
+  assert.equal(metadata.remedy, undefined, "the hard floor is never allowlistable");
+  assert.equal(floor.calls.length, 0);
+  assert.doesNotMatch(JSON.stringify(metadata), /whsec_TOPSECRET/);
+});
+
+test("a blocked result says which allowlist entry could help", async () => {
+  const cases = [
+    ["http://postgres:5432/", "host"],
+    ["http://10.9.9.9/h", "address"],
+    ["http://[fd00::7]/h", "address"],
+    ["http://169.254.169.254/", undefined],
+    ["file:///etc/passwd", undefined],
+    ["https://u:p@hooks.example.com/", undefined]
+  ];
+  for (const [url, remedy] of cases) {
+    const result = await deliverCustomerWebhook({ url }, EVENT, recordingFetch().fetchImpl);
+    assert.equal(result.blocked, true, url);
+    assert.equal(result.remedy, remedy, url);
+  }
+});
+
+test("the default transport honours the allowlist: host + address delivers, host alone is refused at connect", async () => {
+  const receiver = await startReceiver((_req, res) => {
+    res.statusCode = 200;
+    res.end("ok");
+  });
+  const resolver = stubResolver("127.0.0.1");
+  const globalFetch = forbidGlobalFetch();
+  try {
+    const url = receiver.url("/hooks/hyfib?token=abc").replace("receiver.customer.example", "receiver.corp");
+    const hostOnly = await deliverCustomerWebhook({ url, secret: "whsec_1" }, EVENT, undefined, {
+      allowlist: { hosts: ["receiver.corp"], hostSuffixes: [], cidrs: [] }
+    });
+    assert.equal(hostOnly.ok, false);
+    assert.equal(hostOnly.blocked, true);
+    assert.equal(hostOnly.remedy, "address");
+    assert.match(hostOnly.error, /127\.0\.0\.1/);
+    assert.equal(receiver.requests.length, 0);
+
+    const both = await deliverCustomerWebhook({ url, secret: "whsec_1" }, EVENT, undefined, {
+      allowlist: { hosts: ["receiver.corp"], hostSuffixes: [], cidrs: ["127.0.0.1/32"] }
+    });
+    assert.deepEqual(both, { ok: true, status: 200 });
+    assert.equal(receiver.requests.length, 1);
+    const [received] = receiver.requests;
+    assert.equal(received.url, "/hooks/hyfib?token=abc");
+    assert.equal(received.headers["x-hyfib-signature"], signWebhookBody("whsec_1", received.body));
+    assert.deepEqual(resolver.calls, ["receiver.corp", "receiver.corp"], "one resolution per delivery");
+    assert.equal(globalFetch.used(), 0);
+  } finally {
+    resolver.restore();
+    globalFetch.restore();
+    await receiver.close();
+  }
+});
+
+test("without the options argument nothing changes: the same internal receiver is refused", async () => {
+  const resolver = stubResolver("127.0.0.1");
+  try {
+    const result = await deliverCustomerWebhook({ url: "http://receiver.corp:1/h" }, EVENT);
+    assert.equal(result.blocked, true);
+    assert.equal(result.remedy, "host");
+    assert.deepEqual(resolver.calls, [], "refused by the name check before any resolution");
+  } finally {
+    resolver.restore();
+  }
+});
+
+test("customerWebhookBlockHint tells the operator what to allowlist, or that nothing can be", () => {
+  const host = customerWebhookBlockHint("host");
+  assert.match(host, /OUTBOUND_WEBHOOK_ALLOWLIST/);
+  assert.match(host, /host name/);
+  assert.match(host, /address/);
+
+  const address = customerWebhookBlockHint("address");
+  assert.match(address, /OUTBOUND_WEBHOOK_ALLOWLIST/);
+  // "its CIDR" misleads: the natural CIDR for an IPv6-wrapped IPv4 address (10.0.0.0/8 for [::ffff:10.0.0.1]) does
+  // not admit it, because entries only match their own address family. The exact address, as written, always does.
+  assert.match(address, /exact address/);
+  assert.match(address, /\/32 or \/128/);
+  assert.doesNotMatch(address, /its CIDR/);
+
+  const none = customerWebhookBlockHint(undefined);
+  assert.doesNotMatch(none, /add .* to OUTBOUND_WEBHOOK_ALLOWLIST/);
+  assert.match(none, /cannot be allowlisted/);
+  assert.match(none, /tenant/);
 });

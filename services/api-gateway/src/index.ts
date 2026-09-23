@@ -2681,8 +2681,9 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         sendJson(res, 400, { error: "statusCallbackSecret must be at most 128 characters" });
         return;
       }
-      // SSRF: the worker POSTs to this URL on every message event.
-      const callbackUrl = parseStatusCallbackUrl(payload.statusCallbackUrl);
+      // SSRF: the worker POSTs to this URL on every message event. Same
+      // operator allowlist as the worker's delivery-time check.
+      const callbackUrl = parseStatusCallbackUrl(payload.statusCallbackUrl, config.outboundWebhookAllowlist);
       if (!callbackUrl.ok) {
         logger.warn("whatsapp_settings_callback_url_rejected", {
           tenantId,

@@ -1,4 +1,9 @@
-import type { TemplateComponent, WhatsAppContactCard, WhatsAppInteractivePayload } from "@hyfib/shared-core";
+import type {
+  OutboundAllowlist,
+  TemplateComponent,
+  WhatsAppContactCard,
+  WhatsAppInteractivePayload
+} from "@hyfib/shared-core";
 import { validateOutboundUrl } from "@hyfib/shared-core";
 
 export type ValidationResult<T> = { ok: true; value: T } | { ok: false; error: string };
@@ -67,8 +72,15 @@ export function parseOptionalIsoDate(
  * every delivery (including each resolved address), so this is the early,
  * explicit rejection rather than the only line of defence. The value is kept
  * trimmed but otherwise as supplied.
+ *
+ * `allowlist` is the operator's OUTBOUND_WEBHOOK_ALLOWLIST — pass the same one
+ * the worker delivers with so the two decisions agree. The error never
+ * mentions it: the allowlist is operator config, not tenant-visible.
  */
-export function parseStatusCallbackUrl(value: unknown): ValidationResult<string | undefined> {
+export function parseStatusCallbackUrl(
+  value: unknown,
+  allowlist?: OutboundAllowlist
+): ValidationResult<string | undefined> {
   if (value === undefined || value === null) {
     return { ok: true, value: undefined };
   }
@@ -79,7 +91,7 @@ export function parseStatusCallbackUrl(value: unknown): ValidationResult<string 
   if (trimmed === "") {
     return { ok: true, value: undefined };
   }
-  const checked = validateOutboundUrl(trimmed);
+  const checked = validateOutboundUrl(trimmed, { allowlist });
   if (!checked.ok) {
     return { ok: false, error: `Invalid statusCallbackUrl: ${checked.error}` };
   }

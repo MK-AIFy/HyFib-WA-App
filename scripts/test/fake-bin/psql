@@ -4,6 +4,11 @@
 #   FAKE_PSQL_FAIL       any value -> behave like an unreachable server (exit 2)
 #   FAKE_PSQL_BYPASS     answer to the "does this role bypass RLS" query (default t)
 #   FAKE_PSQL_ROWS_FILE  file whose contents answer the whatsapp_channels token query
+#   FAKE_PSQL_SETTINGS_FILE  file whose contents answer the whatsapp_settings status_callback_url query
+#   FAKE_PSQL_LOG        file each invocation is appended to, as "<PGOPTIONS>|<arguments>"
+if [ -n "${FAKE_PSQL_LOG:-}" ]; then
+  printf '%s|%s\n' "${PGOPTIONS:-}" "$*" >> "$FAKE_PSQL_LOG"
+fi
 if [ -n "${FAKE_PSQL_FAIL:-}" ]; then
   echo "psql: error: connection to server failed" >&2
   exit 2
@@ -11,6 +16,7 @@ fi
 case "$*" in
   *rolsuper*) printf '%s\n' "${FAKE_PSQL_BYPASS:-t}" ;;
   *whatsapp_channels*) if [ -n "${FAKE_PSQL_ROWS_FILE:-}" ]; then cat "$FAKE_PSQL_ROWS_FILE"; fi ;;
+  *whatsapp_settings*) if [ -n "${FAKE_PSQL_SETTINGS_FILE:-}" ]; then cat "$FAKE_PSQL_SETTINGS_FILE"; fi ;;
   *schema_migrations*) echo "migrations applied: 33" ;;
   *tenants*) echo "tenants: 1" ;;
   *relforcerowsecurity*) echo "RLS forced on contacts: t" ;;
