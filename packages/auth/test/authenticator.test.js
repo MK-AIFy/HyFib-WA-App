@@ -477,3 +477,81 @@ test("a realm that answers is never overridden by the last good keys: a key it s
   assert.equal(error.status, 401);
   assert.equal(logger.lines.length, 0, "the realm answered: no outage, nothing logged");
 });
+
+test("a key the realm's set holds but jose cannot use fails that token alone: it starts no outage", async (t) => {
+  // A realm publishing a private key (a misconfiguration): a token whose header names that key cannot be checked,
+  // but the realm itself answered. Other tokens keep the normal path, and nothing reports an outage.
+  const realm = await startRealm(t);
+  const { privateKey: leaked } = await generateKeyPair("RS256", { extractable: true });
+  realm.keys = [publicJwk, { ...(await exportJWK(leaked)), kid: "leaked", alg: "RS256" }];
+  const { verify, logger } = outageReadyAuthenticator(realm);
+
+  const crafted = await sign({ key: leaked, kid: "leaked" });
+  const error = await rejectionOf(verify(crafted));
+  assert.ok(error instanceof AuthUnavailableError, `refused, got ${error?.name}: ${error?.message}`);
+  assert.equal(error.cause?.code, "ERR_JWKS_INVALID", error.cause?.message);
+
+  const asked = realm.requests;
+  assert.equal((await verify(await sign())).subject, "user-1", "a token under the realm's real key still verifies");
+  assert.equal(realm.requests, asked + 1, "on the normal path: the realm is asked (the cache is always expired here)");
+  assert.equal(logger.lines.length, 0, "the realm answered: no outage, nothing logged");
+});
+
+const FRESH_CACHE = { cacheMaxAge: 10 * 60 * 1000, cooldownDuration: 30_000, timeoutDuration: 200 };
+
+test("a key id the cached set does not hold makes the realm be asked again, at most once per cooldown", async (t) => {
+  const realm = await startRealm(t);
+  const { verify, clock } = outageReadyAuthenticator(realm, { remote: FRESH_CACHE });
+  await verify(await sign());
+  assert.equal(realm.requests, 1, "control: the first token fetched the key set");
+
+  // The realm publishes a second key; a token under it arrives while the cached set is still fresh.
+  realm.keys = [publicJwk, strangerJwk];
+  const newKeyToken = await sign({ key: strangerKeys.privateKey, kid: "k2" });
+  const early = await rejectionOf(verify(newKeyToken));
+  assert.ok(early instanceof AuthError, `within the cooldown the cached set's answer stands, got ${early?.name}`);
+  assert.equal(realm.requests, 1, "and the realm is not asked");
+
+  clock.advance(30_000);
+  assert.equal((await verify(newKeyToken)).subject, "user-1", "after the cooldown the realm is asked: the new key");
+  assert.equal(realm.requests, 2);
+  assert.equal((await verify(await sign())).subject, "user-1", "known keys are served from the cache");
+  assert.equal(realm.requests, 2, "without asking the realm");
+});
+
+test("when that refetch fails, the token is unavailable and an outage begins; known keys keep verifying", async (t) => {
+  const realm = await startRealm(t);
+  const { verify, clock, logger } = outageReadyAuthenticator(realm, { remote: FRESH_CACHE });
+  const known = await sign();
+  await verify(known);
+
+  realm.mode = "error_status";
+  clock.advance(30_000);
+  const unknown = await sign({ key: strangerKeys.privateKey, kid: "k2" });
+  assertUnavailable(await rejectionOf(verify(unknown)), unknown);
+  assert.equal(logger.named("keycloak_jwks_unavailable").length, 1, "the failed refetch starts an outage");
+  assert.equal((await verify(known)).subject, "user-1", "a token under a known key still verifies");
+});
+
+test("when the realm answers again after the last good keys ran out, the outage ends, whatever that token's answer", async (t) => {
+  const realm = await startRealm(t);
+  const { verify, clock, logger } = outageReadyAuthenticator(realm, { maxStaleMs: 60 * 60 * 1000 });
+  const oldKeyToken = await sign();
+  await verify(oldKeyToken);
+  realm.mode = "error_status";
+  await verify(oldKeyToken);
+  clock.advance(61 * 60 * 1000);
+  assertUnavailable(await rejectionOf(verify(oldKeyToken)), oldKeyToken);
+
+  // The realm comes back having rotated its key, and the first token to reach it is one it no longer accepts.
+  realm.keys = [strangerJwk];
+  realm.mode = "keys";
+  const refused = await rejectionOf(verify(oldKeyToken));
+  assert.ok(refused instanceof AuthError, `a withdrawn key is refused, got ${refused?.name}: ${refused?.message}`);
+  assert.equal(logger.named("keycloak_jwks_recovered").length, 1, "the realm answered: the outage is over");
+
+  const asked = realm.requests;
+  const newKeyToken = await sign({ key: strangerKeys.privateKey, kid: "k2" });
+  assert.equal((await verify(newKeyToken)).subject, "user-1", "the realm's current key is accepted");
+  assert.equal(realm.requests, asked + 1, "on the normal path: the realm is asked (the cache is always expired here)");
+});
