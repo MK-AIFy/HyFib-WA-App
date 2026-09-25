@@ -1,6 +1,10 @@
-import { createRemoteJWKSet, jwtVerify, type JWTPayload, type JWTVerifyGetKey } from "jose";
+import { jwtVerify, type JWTPayload, type JWTVerifyGetKey } from "jose";
 import type { PlatformConfig } from "@hyfib/config";
 import type { Role } from "@hyfib/shared-core";
+import { createRealmKeySet, type RealmKeySetOptions } from "./realm-key-set.js";
+import { isTokenVerdict } from "./token-verdict.js";
+
+export { DEFAULT_MAX_STALE_MS, DEFAULT_RETRY_INTERVAL_MS, type RealmKeySetOptions } from "./realm-key-set.js";
 
 export type CrmRole = "owner" | "admin" | "agent" | "viewer";
 
@@ -55,31 +59,6 @@ export class AuthUnavailableError extends Error {
   }
 }
 
-/**
- * jose's codes for a verdict on the token itself: expired, badly signed, for another issuer or audience, malformed,
- * signed under a key id the realm does not publish, or with an algorithm this deployment does not accept. Only these
- * are refusals (AuthError); anything else thrown while verifying means no verdict was reached.
- */
-const TOKEN_VERDICT_CODES: ReadonlySet<string> = new Set([
-  "ERR_JWT_EXPIRED",
-  "ERR_JWT_CLAIM_VALIDATION_FAILED",
-  "ERR_JWS_SIGNATURE_VERIFICATION_FAILED",
-  "ERR_JWS_INVALID",
-  "ERR_JWT_INVALID",
-  "ERR_JWK_INVALID",
-  "ERR_JWKS_NO_MATCHING_KEY",
-  "ERR_JWKS_MULTIPLE_MATCHING_KEYS",
-  "ERR_JOSE_ALG_NOT_ALLOWED",
-  "ERR_JOSE_NOT_SUPPORTED",
-  "ERR_JWE_INVALID",
-  "ERR_JWE_DECRYPTION_FAILED"
-]);
-
-function isTokenVerdict(error: unknown): boolean {
-  const code = typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
-  return typeof code === "string" && TOKEN_VERDICT_CODES.has(code);
-}
-
 interface KeycloakClaims extends JWTPayload {
   tenant_id?: string;
   email?: string;
@@ -117,10 +96,16 @@ export interface Authenticator {
 
 export interface AuthenticatorOptions {
   /**
-   * Resolves the key a token was signed with. Defaults to the realm's remote JWKS (`config.keycloak.jwksUri`); tests
-   * inject one to exercise failures that are slow to provoke over the network, such as a fetch timeout.
+   * Resolves the key a token was signed with. Defaults to the realm's JWKS (`config.keycloak.jwksUri`, see
+   * createRealmKeySet); tests inject one to exercise failures that are slow to provoke over the network, such as a
+   * fetch timeout.
    */
   keySet?: JWTVerifyGetKey;
+  /**
+   * How the realm's JWKS is fetched, cached, and ridden through an outage (see createRealmKeySet). Ignored when
+   * `keySet` is given.
+   */
+  realmKeySet?: RealmKeySetOptions;
 }
 
 /**
@@ -130,9 +115,12 @@ export interface AuthenticatorOptions {
  *
  * A refused token throws AuthError (401). A token that could not be checked,
  * because the JWKS could not be fetched, throws AuthUnavailableError instead.
+ * Through an outage of the JWKS endpoint, tokens are checked against the keys
+ * of its last successful fetch, for up to a day (see createRealmKeySet).
  */
 export function createAuthenticator(config: PlatformConfig, options: AuthenticatorOptions = {}): Authenticator {
-  const jwks: JWTVerifyGetKey = options.keySet ?? createRemoteJWKSet(new URL(config.keycloak.jwksUri));
+  const jwks: JWTVerifyGetKey =
+    options.keySet ?? createRealmKeySet(new URL(config.keycloak.jwksUri), options.realmKeySet);
 
   return {
     async authenticate(authorizationHeader): Promise<AuthContext> {
