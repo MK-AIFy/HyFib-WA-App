@@ -6,7 +6,7 @@
  * The two need different answers. A refused credential (missing, malformed, unknown, expired, revoked, bad signature,
  * wrong audience or issuer, a user who is not active) is a 401: the client must sign in again, and retrying the same
  * credential can never succeed. A backend the gateway could not ask (Postgres down, restarting, out of connections,
- * the pool exhausted, the identity provider's signing keys unreachable) is a 503: nothing is wrong with the
+ * the pool exhausted, the identity provider's signing keys unreachable or unusable) is a 503: nothing is wrong with the
  * credential, and the same request will succeed once the backend is back. Answering that with a 401, as every error
  * but an AuthError used to be, told clients their session was gone, and the web app signed its user out on a blip.
  *
@@ -94,8 +94,13 @@ const INFRASTRUCTURE_MESSAGES: ReadonlySet<string> = new Set([
   "Failed to parse the JSON Web Key Set HTTP response as JSON" // jose: it answered with an error page
 ]);
 
-/** jose's code for a JWKS fetch that timed out (JWKSTimeout). */
-const JWKS_TIMEOUT_CODE = "ERR_JWKS_TIMEOUT";
+/**
+ * jose's codes for an identity-provider key set (JWKS) the gateway could not use: the fetch timed out (JWKSTimeout),
+ * or what the realm serves is not a usable key set (JWKSInvalid: JSON that is not a key set, as a proxy's error body
+ * behind a 200 or a wrong JWKS URI would be, or a set holding a non-public key). That is the realm's state, never the
+ * caller's credential, and no new sign-in can fix it: a 401 would only sign every user out.
+ */
+const JWKS_UNAVAILABLE_CODES: ReadonlySet<string> = new Set(["ERR_JWKS_TIMEOUT", "ERR_JWKS_INVALID"]);
 
 /**
  * jose's codes for its verdicts on a token. None of these errors is an AuthError, and each means the token itself was
@@ -167,7 +172,7 @@ function isCredentialFailure(error: unknown): boolean {
 function isInfrastructureFailure(error: unknown): boolean {
   const code = codeOf(error);
   if (code !== undefined) {
-    if (NETWORK_ERROR_CODES.has(code) || code === JWKS_TIMEOUT_CODE) {
+    if (NETWORK_ERROR_CODES.has(code) || JWKS_UNAVAILABLE_CODES.has(code)) {
       return true;
     }
     if (SQLSTATE.test(code) && (TRANSIENT_SQLSTATE_CLASSES.has(code.slice(0, 2)) || TRANSIENT_SQLSTATES.has(code))) {

@@ -2,6 +2,7 @@ import test, { after, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { createHash, randomBytes, randomUUID, scryptSync } from "node:crypto";
 import { createServer } from "node:http";
+import { createRequire } from "node:module";
 
 /**
  * When the gateway cannot reach the store it checks credentials against, it answers 503 auth_unavailable with a
@@ -12,17 +13,53 @@ import { createServer } from "node:http";
  *
  * The persistence singletons the gateway imports are plain objects, so their methods are replaced below with
  * in-memory stand-ins that can be told to fail (and are restored afterwards). Nothing may reach a real Redis,
- * Postgres or Keycloak (other projects' instances listen on this machine's default ports), so all three are pointed
- * at 127.0.0.1:1 BEFORE the gateway, and with it the config, is imported. That also gives one test a genuine outage:
- * the real session repository, dialling a port where nothing listens.
+ * Postgres or Keycloak (other projects' instances listen on this machine's default ports), so Redis and Postgres are
+ * pointed at 127.0.0.1:1, and Keycloak's signing keys (JWKS) at a stand-in this file controls, BEFORE the gateway, and
+ * with it the config, is imported. That also gives one test a genuine outage: the real session repository, dialling
+ * a port where nothing listens.
  */
 const TENANT_ID = "12121212-1212-4121-8121-121212121212";
+
+// Keycloak's JWKS endpoint: a stand-in answering as `jwksMode` says. It answers 503 unless a test says otherwise, so a
+// request that reached for the realm's keys by accident would show up as a 503 instead of passing unnoticed.
+const jose = createRequire(new URL("../../../packages/auth/package.json", import.meta.url))("jose");
+const REALM_ISSUER = "https://idp.test/realms/hyfib-wa";
+const REALM_AUDIENCE = "hyfib-platform";
+const REALM_KID = "realm-k1";
+const realmKeys = await jose.generateKeyPair("RS256");
+const realmJwk = { ...(await jose.exportJWK(realmKeys.publicKey)), kid: REALM_KID, alg: "RS256", use: "sig" };
+let jwksMode = "error_status";
+let jwksRequests = 0;
+const jwksServer = createServer((_req, res) => {
+  jwksRequests += 1;
+  switch (jwksMode) {
+    case "keys":
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ keys: [realmJwk] }));
+      return;
+    case "error_page":
+      res.writeHead(200, { "Content-Type": "text/html" });
+      res.end("<html><body>502 Bad Gateway</body></html>");
+      return;
+    case "not_a_key_set":
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Realm does not exist" }));
+      return;
+    default:
+      res.writeHead(503);
+      res.end();
+  }
+});
+await new Promise((resolve) => jwksServer.listen(0, "127.0.0.1", resolve));
+
 process.env.AUTH_ENABLED = "true";
 process.env.REDIS_HOST = "127.0.0.1";
 process.env.REDIS_PORT = "1";
 process.env.POSTGRES_HOST = "127.0.0.1";
 process.env.POSTGRES_PORT = "1";
-process.env.KEYCLOAK_JWKS_URI = "http://127.0.0.1:1/protocol/openid-connect/certs";
+process.env.KEYCLOAK_JWKS_URI = `http://127.0.0.1:${jwksServer.address().port}/protocol/openid-connect/certs`;
+process.env.KEYCLOAK_ISSUER = REALM_ISSUER;
+process.env.KEYCLOAK_AUDIENCE = REALM_AUDIENCE;
 process.env.ORG_TENANT_ID = TENANT_ID;
 delete process.env.ORG_NAME;
 delete process.env.BOOTSTRAP_ADMIN_EMAIL;
@@ -199,6 +236,8 @@ after(async () => {
   }
   server.closeAllConnections();
   await new Promise((resolve) => server.close(resolve));
+  jwksServer.closeAllConnections();
+  await new Promise((resolve) => jwksServer.close(resolve));
   await closePool().catch(() => undefined);
 });
 
@@ -574,4 +613,63 @@ test("/auth/login keeps today's 500 for an error that is not recognisably an out
     { email: EMAIL, password: PASSWORD }
   );
   assertStatus(res, 500, "unrecognised login failure");
+});
+
+// ─── Keycloak: a realm whose signing keys cannot be had is an outage, not a bad token ────────────────────────
+//
+// A Keycloak access token is checked against the realm's published keys (JWKS), which the gateway fetches and then
+// caches. So the outages come first, and the two controls that let it fetch a valid key set run last: once the
+// gateway holds the realm's keys, it does not ask the stand-in again for a while.
+
+function realmToken({ kid = REALM_KID } = {}) {
+  return new jose.SignJWT({ tenant_id: TENANT_ID, email: EMAIL, realm_access: { roles: ["agent"] } })
+    .setProtectedHeader({ alg: "RS256", kid })
+    .setSubject(USER_ID)
+    .setIssuer(REALM_ISSUER)
+    .setAudience(REALM_AUDIENCE)
+    .setIssuedAt()
+    .setExpirationTime("5m")
+    .sign(realmKeys.privateKey);
+}
+
+test("a Keycloak token answers 503, not 401, for every way the realm's JWKS endpoint can fail", async () => {
+  const token = await realmToken();
+  for (const [mode, label, errorCode] of [
+    ["error_status", "the JWKS endpoint answers an error status", "ERR_JOSE_GENERIC"],
+    ["error_page", "the JWKS endpoint answers an HTML error page with 200", "ERR_JOSE_GENERIC"],
+    ["not_a_key_set", "the JWKS endpoint serves JSON that is not a key set (a misconfigured realm)", "ERR_JWKS_INVALID"]
+  ]) {
+    jwksMode = mode;
+    const asked = jwksRequests;
+    const before = await counterValue("jwt");
+    const { result: res, logs } = await captureLogs(() => send("GET", "/api/v1/teams", bearer(token)));
+
+    assertAuthUnavailable(res, label);
+    assert.ok(jwksRequests > asked, `${label}: the gateway asked the realm for its keys`);
+    assert.equal(calls["teams.list"], undefined, `${label}: the route must not run`);
+    const line = logs.find((entry) => entry.message === "auth_backend_unavailable");
+    assert.ok(line, `${label}: an auth_backend_unavailable line is logged (got ${logs.map((entry) => entry.message)})`);
+    assert.equal(line.authKind, "jwt", label);
+    assert.equal(line.errorName, "AuthUnavailableError", label);
+    assert.equal(line.errorCode, errorCode, label);
+    assert.equal(
+      logs.some((entry) => entry.message === "auth_failure_unclassified"),
+      false,
+      `${label}: recognised, not logged as unclassified`
+    );
+    assertNoSecretIn(logs, [token]);
+    assert.equal(await counterValue("jwt"), before + 1, `${label}: auth_backend_unavailable_total is counted`);
+  }
+});
+
+test("control: once the realm serves its keys, the same Keycloak token authenticates", async () => {
+  jwksMode = "keys";
+  assertStatus(await send("GET", "/api/v1/teams", bearer(await realmToken())), 200, "a token the realm signed");
+});
+
+test("control: a Keycloak token under a key id the realm does not publish is still a 401", async () => {
+  jwksMode = "keys";
+  const res = await send("GET", "/api/v1/teams", bearer(await realmToken({ kid: "not-published" })));
+  assertStatus(res, 401, "a key id the realm does not publish");
+  assert.equal(res.retryAfter, null, "a refusal carries no Retry-After");
 });
