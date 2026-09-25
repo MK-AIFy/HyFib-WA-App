@@ -72,6 +72,28 @@ describe("api client", () => {
     });
   });
 
+  it("carries the server's Retry-After, in seconds, on the ApiError it throws", async () => {
+    const unavailable = (retryAfter?: string) =>
+      new Response(JSON.stringify({ error: "auth_unavailable", retryAfterSeconds: 5 }), {
+        status: 503,
+        headers: {
+          "content-type": "application/json",
+          ...(retryAfter === undefined ? {} : { "retry-after": retryAfter })
+        }
+      });
+
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(unavailable("5")));
+    await expect(api.get("/auth/me")).rejects.toMatchObject({ status: 503, retryAfterSeconds: 5 });
+
+    // No header, or the HTTP-date form, which nothing here sends: no hint.
+    for (const retryAfter of [undefined, "Wed, 21 Oct 2026 07:28:00 GMT", "soon"]) {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(unavailable(retryAfter)));
+      const error = await api.get("/auth/me").catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(ApiError);
+      expect((error as ApiError).retryAfterSeconds, String(retryAfter)).toBeUndefined();
+    }
+  });
+
   it("clears the session and notifies the unauthorized handler on 401", async () => {
     writeSession({ tenantId: "t1", tenantName: "Acme", role: "tenant_admin" });
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(401, { error: "Not authenticated" })));

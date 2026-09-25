@@ -36,7 +36,13 @@ export function LoginPage() {
       await login(values.email, values.password);
       void navigate("/inbox", { replace: true });
     } catch (error) {
-      const message = error instanceof ApiError ? error.message : "Something went wrong. Try again.";
+      // 503: the server cannot check sign-ins right now (auth_unavailable); its error code means nothing to a user.
+      const message =
+        error instanceof ApiError
+          ? error.status === 503
+            ? "Sign-in is temporarily unavailable. Try again in a moment."
+            : error.message
+          : "Something went wrong. Try again.";
       setError("root", { message });
     }
   }

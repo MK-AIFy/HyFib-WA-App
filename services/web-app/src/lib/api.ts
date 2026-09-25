@@ -3,13 +3,22 @@ import { clearSession } from "./auth-storage";
 export class ApiError extends Error {
   status: number;
   detail?: string;
+  /** The server's Retry-After, in seconds, when it sent one (the gateway does with 503 auth_unavailable). */
+  retryAfterSeconds?: number;
 
-  constructor(status: number, message: string, detail?: string) {
+  constructor(status: number, message: string, detail?: string, retryAfterSeconds?: number) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.detail = detail;
+    this.retryAfterSeconds = retryAfterSeconds;
   }
+}
+
+/** A Retry-After given in seconds. The HTTP-date form, which this API never sends, is ignored. */
+function retryAfterSecondsOf(res: Response): number | undefined {
+  const value = res.headers.get("retry-after")?.trim();
+  return value !== undefined && /^\d+$/.test(value) ? Number(value) : undefined;
 }
 
 type UnauthorizedHandler = () => void;
@@ -56,7 +65,12 @@ async function request<T>(
 
   if (!res.ok) {
     const errBody = (data ?? {}) as { error?: string; detail?: string };
-    throw new ApiError(res.status, errBody.error ?? `Request failed (${res.status})`, errBody.detail);
+    throw new ApiError(
+      res.status,
+      errBody.error ?? `Request failed (${res.status})`,
+      errBody.detail,
+      retryAfterSecondsOf(res)
+    );
   }
 
   return data as T;
