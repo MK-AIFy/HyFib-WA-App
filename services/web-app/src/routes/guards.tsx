@@ -3,10 +3,15 @@ import type { Role } from "@hyfib/shared-core";
 import { useAuth } from "@/lib/auth-context";
 
 export function RequireAuth() {
-  const { user, isLoading } = useAuth();
+  const { user, isLoading, isUnavailable } = useAuth();
 
   if (isLoading) {
-    return <div className="flex min-h-screen items-center justify-center text-sm text-muted-foreground">Loading…</div>;
+    // An outage while the session is being checked is not a sign-out: say so, and keep the user here.
+    return (
+      <div role="status" className="flex min-h-screen items-center justify-center text-sm text-muted-foreground">
+        {isUnavailable ? "Can't reach the server. Retrying…" : "Loading…"}
+      </div>
+    );
   }
   if (!user) {
     return <Navigate to="/login" replace />;

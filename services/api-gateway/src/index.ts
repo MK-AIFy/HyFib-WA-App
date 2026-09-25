@@ -68,6 +68,7 @@ import {
   verifyWebhookToken,
   EventTopics,
   evaluateAutomationRules,
+  type ApiKey,
   type AutomationActionConfig,
   type AutomationActionType,
   type AutomationConditions,
@@ -92,6 +93,7 @@ import {
   parseListQuery,
   boundedText,
   parseOptionalIsoDate,
+  parseStatusCallbackUrl,
   clampInt,
   validateInteractivePayload,
   validateCampaignBody,
@@ -100,7 +102,19 @@ import {
   validateContactsPayload
 } from "./validation.js";
 import { filterSendableContacts, canTransition, transitionConflict, CAMPAIGN_TRANSITIONS } from "./campaign.js";
-import { canCreateContact, canCreateOrder } from "./authorization.js";
+import {
+  API_KEY_SUBJECT_PREFIX,
+  authorizeAccountStatus,
+  authorizeHumanCaller,
+  authorizeIdentityAdmin,
+  authorizePasswordSet,
+  authorizeRoleGrant,
+  authorizeUserUpdate,
+  canCreateContact,
+  canCreateOrder,
+  isSameUserId,
+  type AccessDecision
+} from "./authorization.js";
 import { buildMediaHeaders } from "./media-headers.js";
 import { mapMediaUploadProxyResult } from "./media-upload.js";
 import {
@@ -134,6 +148,8 @@ import { validateFlowDefinition } from "@hyfib/shared-core";
 import { resolveOrgTenant } from "./single-org.js";
 import { runOutboxRelayOnce } from "./outbox-relay.js";
 import { classifyRoute, API_RATE_LIMITS } from "./rate-limit.js";
+import { AUTH_UNAVAILABLE_RETRY_AFTER_SECONDS, classifyAuthFailure, summarizeAuthFailure } from "./auth-failure.js";
+import { requiresSessionWindow, evaluateSessionWindow, SESSION_WINDOW_MS } from "./session-window.js";
 import {
   SESSION_COOKIE,
   parseCookies,
@@ -719,18 +735,112 @@ function cookieHeaderOf(req: IncomingMessage): string | undefined {
 
 // ─── Auth resolution: Bearer token (session) → cookie (session) → Keycloak → dev fallback
 
-/** Resolves an opaque session token (Bearer or cookie) to an AuthContext, or undefined if unknown/expired. */
+/**
+ * Refuses a live session whose user is not active (suspended, disabled, invited, or not found). Setting a user's
+ * status revokes its sessions (PATCH /users/:id); this catches sessions that predate that revocation or race it, and
+ * deletes a refused session so that reactivating its user later does not bring it back. The delete is best-effort
+ * and only for a user that was found: the refusal never depends on it, and a tenant-scoped lookup that misses is
+ * not proof the session is dead (deleting a user cascades to its sessions anyway). Returns the refusal, if any.
+ */
+async function refuseInactiveSession(
+  hash: string,
+  session: { userId: string; tenantId: string },
+  user: User | undefined
+): Promise<Extract<AccessDecision, { ok: false }> | undefined> {
+  const account = authorizeAccountStatus(user?.status);
+  if (account.ok) {
+    return undefined;
+  }
+  logger.warn("session_refused_inactive_user", {
+    tenantId: session.tenantId,
+    userId: session.userId,
+    status: user?.status ?? "not_found"
+  });
+  // The user is out, so are its event streams on this instance: the status may have been changed through another
+  // instance, whose revocation could not reach the streams held here.
+  endUserStreams(session.tenantId, session.userId, "session_refused_inactive_user");
+  if (user) {
+    try {
+      await sessionRepository.deleteByToken(hash);
+    } catch (error) {
+      logger.error("inactive_session_revoke_failed", {
+        tenantId: session.tenantId,
+        userId: session.userId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+  return account;
+}
+
+/**
+ * Resolves an opaque session token (Bearer or cookie) to an AuthContext, or undefined if unknown/expired. Throws a
+ * 401 AuthError for a live session whose user is not active.
+ */
 async function resolveSessionToken(rawToken: string): Promise<AuthContext | undefined> {
-  const session = await sessionRepository.findByToken(tokenHash(rawToken));
+  const hash = tokenHash(rawToken);
+  const session = await sessionRepository.findByToken(hash);
   if (!session) return undefined;
   // Must resolve roles through a tenant-scoped read: users has FORCE RLS,
   // so a bare pool query silently returns zero rows (empty roles → 403s).
   const user = await userRepository.getById(session.tenantId, session.userId);
+  // The status arrives on the row already read for the roles, so checking it costs no query. A refused session
+  // throws rather than returning undefined: like a revoked API key, it must never fall through to the cookie,
+  // Keycloak or dev-header paths and be answered as some other caller.
+  const refusal = await refuseInactiveSession(hash, session, user);
+  if (refusal) {
+    throw new AuthError(refusal.error, 401);
+  }
   const roles = normalizeRoles(user?.roles ?? []);
   return { subject: session.userId, tenantId: session.tenantId, roles };
 }
 
-async function resolveAuth(req: IncomingMessage): Promise<AuthContext> {
+/**
+ * The token hash of the session a request authenticated with, for requests resolveAuth answered from a session
+ * (Bearer or cookie) and for no other. It tells an identity write that its caller is a users row whose status can
+ * be re-checked, and tags an event stream with the session that opened it so a logout can end that stream.
+ */
+const sessionKeyByRequest = new WeakMap<IncomingMessage, string>();
+
+/** Which credential was being checked, for the log line and metric of an auth-store outage. Never the credential. */
+type AuthKind = "none" | "api_key" | "bearer_session" | "cookie_session" | "jwt" | "session" | "password";
+
+/** Filled in by resolveAuth as it goes, so a caller handling its error knows which lookup failed. */
+interface AuthAttempt {
+  kind: AuthKind;
+}
+
+/**
+ * Answers 503 auth_unavailable (with Retry-After) for a store the gateway checks credentials against that it could
+ * not reach: the credential may be perfectly good, so the client should retry rather than sign in again. Logged at
+ * error and counted. Only the kind of credential is logged, never the credential. No cookie is set or cleared —
+ * only a genuine refusal may clear a session cookie — so any Set-Cookie staged before the failure is dropped.
+ */
+function sendAuthUnavailable(
+  res: ServerResponse,
+  request: { requestId: string; method: string; path: string },
+  authKind: AuthKind,
+  error: unknown
+): void {
+  const failure = summarizeAuthFailure(error);
+  logger.error("auth_backend_unavailable", {
+    requestId: request.requestId,
+    method: request.method,
+    path: request.path,
+    authKind,
+    errorName: failure.name,
+    errorCode: failure.code,
+    error: failure.message
+  });
+  incCounter("auth_backend_unavailable_total", "Requests refused 503 because the auth store could not be reached.", {
+    kind: authKind
+  });
+  res.removeHeader("Set-Cookie");
+  res.setHeader("Retry-After", String(AUTH_UNAVAILABLE_RETRY_AFTER_SECONDS));
+  sendJson(res, 503, { error: "auth_unavailable", retryAfterSeconds: AUTH_UNAVAILABLE_RETRY_AFTER_SECONDS });
+}
+
+async function resolveAuth(req: IncomingMessage, attempt: AuthAttempt = { kind: "none" }): Promise<AuthContext> {
   const authHeader = req.headers["authorization"];
 
   // 0. Public API key (Phase D): "Bearer hyfib_…". The key's bound roles
@@ -738,27 +848,43 @@ async function resolveAuth(req: IncomingMessage): Promise<AuthContext> {
   // unchanged. An unknown or revoked key fails HARD — it must never fall
   // through to weaker auth paths.
   if (authHeader?.startsWith("Bearer hyfib_") && orgTenantId) {
+    attempt.kind = "api_key";
     const apiKey = await apiKeyRepository.findActiveByHash(orgTenantId, hashApiKey(authHeader.slice(7)));
     if (!apiKey) {
       throw new AuthError("Invalid or revoked API key", 401);
     }
-    return { subject: `apikey:${apiKey.id}`, tenantId: orgTenantId, roles: normalizeRoles(apiKey.roles) };
+    // The subject prefix is what isApiKeyCaller keys on to keep API keys out of user management.
+    return {
+      subject: `${API_KEY_SUBJECT_PREFIX}${apiKey.id}`,
+      tenantId: orgTenantId,
+      roles: normalizeRoles(apiKey.roles)
+    };
   }
 
   // 1. Bearer session token (works in all modes) — takes precedence over the cookie.
   if (authHeader?.startsWith("Bearer ")) {
-    const authCtx = await resolveSessionToken(authHeader.slice(7));
-    if (authCtx) return authCtx;
+    const bearerToken = authHeader.slice(7);
+    attempt.kind = "bearer_session";
+    const authCtx = await resolveSessionToken(bearerToken);
+    if (authCtx) {
+      sessionKeyByRequest.set(req, tokenHash(bearerToken));
+      return authCtx;
+    }
   }
 
   // 2. HttpOnly session cookie (browser clients that have switched off Bearer).
   const cookieToken = parseCookies(cookieHeaderOf(req))[SESSION_COOKIE];
   if (cookieToken) {
+    attempt.kind = "cookie_session";
     const authCtx = await resolveSessionToken(cookieToken);
-    if (authCtx) return authCtx;
+    if (authCtx) {
+      sessionKeyByRequest.set(req, tokenHash(cookieToken));
+      return authCtx;
+    }
   }
 
   if (config.authEnabled) {
+    attempt.kind = "jwt";
     return authenticator.authenticate(authHeader);
   }
 
@@ -790,6 +916,242 @@ async function audit(
       error: error instanceof Error ? error.message : String(error)
     });
   }
+}
+
+/**
+ * Sends the 403 for a refused user or credential change (see authorization.ts). Logged at warn: an
+ * API key or a tenant_admin reaching for platform_owner power is exactly what should stand out.
+ */
+function refuseIdentityChange(
+  res: ServerResponse,
+  auth: AuthContext,
+  tenantId: string,
+  path: string,
+  decision: Extract<AccessDecision, { ok: false }>
+): void {
+  logger.warn("identity_change_refused", { tenantId, subject: auth.subject, path, error: decision.error });
+  sendJson(res, 403, decision.detail ? { error: decision.error, detail: decision.detail } : { error: decision.error });
+}
+
+/**
+ * Re-reads a session caller's account immediately before an identity write, and answers 401 (returning true) if it
+ * is no longer active. These routes authenticate when the headers arrive and read the body afterwards, so without
+ * this a request stalled in between completes for an admin suspended meanwhile. One tenant-scoped read, on routes
+ * that are rarely called. Only a session caller is re-checked: its subject is a users.id, which a Keycloak or
+ * dev-header subject need not be, and neither of those was checked against users.status to begin with.
+ */
+async function refuseDeactivatedCaller(
+  req: IncomingMessage,
+  res: ServerResponse,
+  auth: AuthContext,
+  tenantId: string,
+  path: string
+): Promise<boolean> {
+  const sessionKey = sessionKeyByRequest.get(req);
+  if (!sessionKey) {
+    return false;
+  }
+  const caller = await userRepository.getById(tenantId, auth.subject);
+  const refusal = await refuseInactiveSession(sessionKey, { userId: auth.subject, tenantId }, caller);
+  if (!refusal) {
+    return false;
+  }
+  logger.warn("identity_write_refused_inactive_caller", { tenantId, subject: auth.subject, path });
+  // The shape resolveAuth's refusal has, since that is the refusal this one completes.
+  sendJson(res, 401, { error: "unauthenticated", detail: refusal.error });
+  return true;
+}
+
+/**
+ * The same caller re-check as refuseDeactivatedCaller, made AFTER a write instead of before it and without answering:
+ * true when a session caller's account stopped being active while the write ran, so the caller can undo what it just
+ * created. Scoped the same way (session callers only). A failed lookup is not treated as deactivation — the check
+ * before the write already passed, and this one only closes a race.
+ */
+async function callerDeactivatedDuringWrite(
+  req: IncomingMessage,
+  auth: AuthContext,
+  tenantId: string
+): Promise<boolean> {
+  if (!sessionKeyByRequest.get(req)) {
+    return false;
+  }
+  try {
+    const caller = await userRepository.getById(tenantId, auth.subject);
+    return !authorizeAccountStatus(caller?.status).ok;
+  } catch (error) {
+    logger.error("caller_recheck_failed", {
+      tenantId,
+      subject: auth.subject,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return false;
+  }
+}
+
+/**
+ * Ends every session and event stream `userId` holds. A failed delete is logged and reported (false), never thrown:
+ * the caller has already written the change that makes it necessary, and every request's own status check still
+ * keeps an inactive user out of whatever sessions survive.
+ *
+ * Sessions go first, then streams. A user whose password was just set is still active, so the status check does not
+ * stop a reconnect: ending the streams first would let one reconnect, in the gap, on a session about to be deleted
+ * and keep a fresh stream until the lifetime cap. The streams end even if the delete fails.
+ */
+async function revokeUserSessions(
+  tenantId: string,
+  userId: string,
+  auth: AuthContext,
+  status: string,
+  reason: string
+): Promise<boolean> {
+  let revoked = true;
+  try {
+    await sessionRepository.deleteAllForUser(userId);
+  } catch (error) {
+    revoked = false;
+    logger.error("user_sessions_revoke_failed", {
+      tenantId,
+      userId,
+      status,
+      reason,
+      subject: auth.subject,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+  endUserStreams(tenantId, userId, reason);
+  if (revoked) {
+    logger.info("user_sessions_revoked", { tenantId, userId, status, reason, subject: auth.subject });
+  }
+  return revoked;
+}
+
+/** An API key as PATCH /users/:id reports it: enough to find and revoke it, never its secret or hash. */
+interface KeyCreatedByUser {
+  id: string;
+  name: string;
+  prefix: string;
+  createdAt: string;
+}
+
+function describeKey(key: ApiKey): KeyCreatedByUser {
+  return { id: key.id, name: key.name, prefix: key.keyPrefix, createdAt: key.createdAt };
+}
+
+/**
+ * The tenant's unrevoked API keys that `userId` created. Undefined when they could not be listed (logged at error):
+ * the status change that asked stands regardless.
+ */
+async function findActiveKeysCreatedBy(tenantId: string, userId: string): Promise<ApiKey[] | undefined> {
+  try {
+    return (await apiKeyRepository.list(tenantId)).filter(
+      (key) => !key.revokedAt && key.createdBy !== undefined && isSameUserId(key.createdBy, userId)
+    );
+  } catch (error) {
+    logger.error("user_keys_lookup_failed", {
+      tenantId,
+      userId,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return undefined;
+  }
+}
+
+/**
+ * The keys `userId` created, for a PATCH that takes the user out with keepApiKeys: true (a live customer
+ * integration, say): nothing is revoked, the suspending admin is shown them instead, and a warning is logged when
+ * there are any. Undefined when the keys could not be listed.
+ */
+async function activeKeysCreatedBy(
+  tenantId: string,
+  userId: string,
+  status: string
+): Promise<KeyCreatedByUser[] | undefined> {
+  const found = await findActiveKeysCreatedBy(tenantId, userId);
+  if (!found) {
+    return undefined;
+  }
+  const keys = found.map(describeKey);
+  if (keys.length > 0) {
+    logger.warn("user_suspended_with_active_keys", {
+      tenantId,
+      userId,
+      status,
+      count: keys.length,
+      keyIds: keys.map((key) => key.id)
+    });
+  }
+  return keys;
+}
+
+/** What taking a user out did to the API keys it created: `notRevoked` are the ones still live. */
+interface KeyRevocation {
+  revoked: KeyCreatedByUser[];
+  notRevoked: KeyCreatedByUser[];
+}
+
+/**
+ * Revokes every unrevoked API key `userId` created, with the repository call DELETE /api-keys/:id uses, audits each
+ * as that route does, and ends the event streams each key opened on this instance. The default for a PATCH that
+ * takes a user out: whoever is being cut off may have copied a key they made.
+ *
+ * Never throws, since the status change that asked for this is already written. A key whose revoke fails is logged
+ * at error and reported in notRevoked, for the admin to revoke by hand; one that turns out to be revoked already (a
+ * concurrent DELETE, which audited it) is in neither list. Undefined when the keys could not be listed at all.
+ */
+async function revokeKeysCreatedBy(
+  tenantId: string,
+  userId: string,
+  auth: AuthContext,
+  status: string
+): Promise<KeyRevocation | undefined> {
+  const keys = await findActiveKeysCreatedBy(tenantId, userId);
+  if (!keys) {
+    return undefined;
+  }
+  const revocation: KeyRevocation = { revoked: [], notRevoked: [] };
+  for (const key of keys) {
+    let revokedNow: boolean;
+    try {
+      revokedNow = await apiKeyRepository.revoke(tenantId, key.id);
+    } catch (error) {
+      revocation.notRevoked.push(describeKey(key));
+      logger.error("user_api_key_revoke_failed", {
+        tenantId,
+        userId,
+        keyId: key.id,
+        status,
+        subject: auth.subject,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      continue;
+    }
+    // Either way the key no longer authenticates, so whatever it has streaming here goes too.
+    endApiKeyStreams(tenantId, key.id, "api_key_revoked");
+    if (!revokedNow) {
+      logger.info("user_api_key_already_revoked", { tenantId, userId, keyId: key.id, subject: auth.subject });
+      continue;
+    }
+    revocation.revoked.push(describeKey(key));
+    await audit(tenantId, auth, {
+      action: "api_key.revoked",
+      resourceType: "ApiKey",
+      resourceId: key.id,
+      payload: { reason: "user_deactivated", userId, status }
+    });
+  }
+  if (revocation.revoked.length > 0) {
+    // warn, not info: an integration running on one of these keys now fails, and this is where to find out why.
+    logger.warn("user_suspended_api_keys_revoked", {
+      tenantId,
+      userId,
+      status,
+      count: revocation.revoked.length,
+      keyIds: revocation.revoked.map((key) => key.id),
+      subject: auth.subject
+    });
+  }
+  return revocation;
 }
 
 /**
@@ -878,12 +1240,23 @@ async function dispatchCampaign(
     };
   }
 
+  // Resolved before the policy check rather than after it: the 24h window is scoped to the channel the send
+  // goes out on, so it cannot be evaluated without knowing which channel that is. The only visible effect of
+  // the move is that a tenant with no active channel now gets its 409 before a policy 422.
+  const channel = await channelRepository.firstActive(tenantId);
+  if (!channel) {
+    return { status: 409, body: { error: "No active WhatsApp channel configured for tenant" } };
+  }
+
   const isOptedOut = knownContact.optedOut;
   const hasActiveConsent = await consentRepository.hasActiveConsent(tenantId, knownContact.id);
 
-  // Determine 24h window from last inbound message timestamp.
-  const lastInboundAt = await conversationRepository.lastInboundAt(tenantId, knownContact.id);
-  const isInside24hWindow = lastInboundAt ? Date.now() - lastInboundAt.getTime() < 24 * 60 * 60 * 1000 : false;
+  // The 24h window belongs to the business phone number the customer messaged, so it is read for THIS channel.
+  // The contact-wide MAX this replaced reported a window from any channel, which let an unapproved template
+  // through on a channel the customer had never written to — Meta then rejects it asynchronously, which is the
+  // silent failure the policy check exists to prevent.
+  const lastInboundAt = await conversationRepository.lastInboundAtForChannel(tenantId, knownContact.id, channel.id);
+  const isInside24hWindow = lastInboundAt ? Date.now() - lastInboundAt.getTime() < SESSION_WINDOW_MS : false;
 
   // Compute current local hour from contact timezone (fallback UTC).
   const tz = knownContact.timezone ?? "UTC";
@@ -912,11 +1285,6 @@ async function dispatchCampaign(
 
   if (!policy.allowed) {
     return { status: 422, body: { error: "campaign_blocked_by_policy", reason: policy.reason } };
-  }
-
-  const channel = await channelRepository.firstActive(tenantId);
-  if (!channel) {
-    return { status: 409, body: { error: "No active WhatsApp channel configured for tenant" } };
   }
 
   await withTenant(tenantId, async (client) => {
@@ -1217,6 +1585,37 @@ async function sendConversationMessage(
       return { status: 400, body: { error: validated.error } };
     }
     interactive = validated.value;
+  }
+
+  // Meta accepts a free-form message only inside the 24h customer-service window. The send is asynchronous,
+  // so without this the route answered 202 "message_enqueued", the outbox dispatched later, and Meta rejected
+  // it out of sight of the agent who typed it. Refuse it here instead, while there is still someone to tell.
+  // The window belongs to THIS conversation, not to the contact: it is scoped to the business phone number
+  // the customer messaged, and the send below goes out over conversation.channelId. A contact-wide lookup
+  // (MAX across their conversations) would let a recent inbound on one channel authorise a free-form send on
+  // another the customer has never written to — reopening the same silent rejection from the other side.
+  // conversationRepository.getById already returned this row, so scoping it correctly also costs one query
+  // fewer than asking the contact.
+  if (requiresSessionWindow(kind)) {
+    const lastInboundAt = conversation.lastInboundAt ? new Date(conversation.lastInboundAt) : undefined;
+    const sessionWindow = evaluateSessionWindow({ kind, lastInboundAt });
+    if (!sessionWindow.allowed) {
+      incCounter("outbound_blocked_total", "Outbound sends refused before dispatch.", { reason: "session_window" });
+      logger.info("outbound_blocked_session_window", {
+        tenantId,
+        conversationId,
+        kind,
+        lastInboundAt: sessionWindow.lastInboundAt
+      });
+      return {
+        status: 422,
+        body: {
+          error: "outside_session_window",
+          reason: sessionWindow.reason,
+          lastInboundAt: sessionWindow.lastInboundAt
+        }
+      };
+    }
   }
 
   await withTenant(tenantId, async (client) => {
@@ -1577,8 +1976,42 @@ class LruCache<K, V> {
   }
 }
 
-const sseHub = new SseHub();
+const sseHub = new SseHub({
+  // The lifetime cap is how a revocation made on another instance reaches streams held here; log it like the rest.
+  onExpired: (count) => logger.info("sse_streams_closed", { reason: "lifetime_cap", count })
+});
 const sseTenantByPhoneNumberId = new LruCache<string, string>(1_000);
+
+/**
+ * Ends the event streams `userId` opened on this instance. A stream is authorised only at connect, so whatever
+ * takes a user's sessions away must take its streams too; streams on other instances end at the hub's lifetime cap.
+ */
+function endUserStreams(tenantId: string, userId: string, reason: string): void {
+  const count = sseHub.closeUserStreams(userId);
+  if (count > 0) {
+    logger.info("sse_streams_closed", { tenantId, userId, reason, count });
+  }
+}
+
+/**
+ * Ends the event streams an API key opened on this instance (the hub records a key's stream under the key's subject,
+ * as resolveAuth spells it). Like a session's, a key's stream is authorised only at connect, so revoking the key must
+ * end it; streams on other instances end at the hub's lifetime cap.
+ */
+function endApiKeyStreams(tenantId: string, keyId: string, reason: string): void {
+  const count = sseHub.closeUserStreams(`${API_KEY_SUBJECT_PREFIX}${keyId}`);
+  if (count > 0) {
+    logger.info("sse_streams_closed", { tenantId, keyId, reason, count });
+  }
+}
+
+/** Ends the event streams opened with one session (identified by its token hash) on this instance. */
+function endSessionStreams(sessionKey: string, reason: string): void {
+  const count = sseHub.closeSessionStreams(sessionKey);
+  if (count > 0) {
+    logger.info("sse_streams_closed", { reason, count });
+  }
+}
 
 async function forwardEventToSse(event: EventEnvelope): Promise<void> {
   if (!sseHub.hasClients()) return;
@@ -1883,46 +2316,65 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 429, { error: "Too many login attempts. Try again later." });
       return;
     }
-    const found = await userRepository.findByEmailForAuth(body.email);
-    if (!found || !found.passwordHash) {
-      sendJson(res, 401, { error: "Invalid email or password" });
-      return;
-    }
-    if (found.status === "suspended") {
-      sendJson(res, 403, { error: "Account is suspended" });
-      return;
-    }
-    const valid = await verifyPassword(body.password, found.passwordHash);
-    if (!valid) {
-      sendJson(res, 401, { error: "Invalid email or password" });
-      return;
-    }
-    const tenant = await tenantRepository.getById(found.tenantId);
-    if (tenant?.status === "suspended") {
-      sendJson(res, 403, { error: "Organization account is suspended" });
-      return;
-    }
-    const rawToken = randomUUID() + randomUUID();
-    await sessionRepository.create({
-      userId: found.id,
-      tenantId: found.tenantId,
-      tokenHash: tokenHash(rawToken),
-      ttlSeconds: SESSION_TTL
-    });
-    setSessionCookie(res, rawToken, req);
-    logger.info("user_login", { tenantId: found.tenantId, userId: found.id, email: body.email });
-    sendJson(res, 200, {
-      token: rawToken,
-      user: {
-        id: found.id,
-        email: found.email,
-        displayName: found.displayName,
-        roles: found.roles,
-        tenantId: found.tenantId,
-        tenant
+    try {
+      const found = await userRepository.findByEmailForAuth(body.email);
+      if (!found || !found.passwordHash) {
+        sendJson(res, 401, { error: "Invalid email or password" });
+        return;
       }
-    });
-    return;
+      const valid = await verifyPassword(body.password, found.passwordHash);
+      if (!valid) {
+        sendJson(res, 401, { error: "Invalid email or password" });
+        return;
+      }
+      // Every status but active is refused. Checked only once the password is proven, so a caller without it cannot
+      // learn that the account exists or what state it is in.
+      const account = authorizeAccountStatus(found.status);
+      if (!account.ok) {
+        logger.warn("login_refused_inactive_account", {
+          tenantId: found.tenantId,
+          userId: found.id,
+          status: found.status
+        });
+        sendJson(res, 403, { error: account.error });
+        return;
+      }
+      const tenant = await tenantRepository.getById(found.tenantId);
+      if (tenant?.status === "suspended") {
+        sendJson(res, 403, { error: "Organization account is suspended" });
+        return;
+      }
+      const rawToken = randomUUID() + randomUUID();
+      await sessionRepository.create({
+        userId: found.id,
+        tenantId: found.tenantId,
+        tokenHash: tokenHash(rawToken),
+        ttlSeconds: SESSION_TTL
+      });
+      setSessionCookie(res, rawToken, req);
+      logger.info("user_login", { tenantId: found.tenantId, userId: found.id, email: body.email });
+      sendJson(res, 200, {
+        token: rawToken,
+        user: {
+          id: found.id,
+          email: found.email,
+          displayName: found.displayName,
+          roles: found.roles,
+          tenantId: found.tenantId,
+          tenant
+        }
+      });
+      return;
+    } catch (error) {
+      // An account or session store that could not be reached is not a wrong password: 503, not 401. The account
+      // lookup fails the same way whether or not the account exists, so this reveals nothing about it; a later
+      // failure comes only after the password is proven. Anything else propagates exactly as before.
+      if (classifyAuthFailure(error) !== "unavailable") {
+        throw error;
+      }
+      sendAuthUnavailable(res, { requestId: ctx.requestId, method, path }, "password", error);
+      return;
+    }
   }
 
   if (path === "/auth/logout" && method === "POST") {
@@ -1938,11 +2390,14 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     const authHeader = req.headers["authorization"];
     const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : undefined;
     const cookieToken = parseCookies(cookieHeaderOf(req))[SESSION_COOKIE];
+    // Each revoked session's event streams end with it; a stream of the user's other sessions stays open.
     if (bearerToken) {
       await sessionRepository.deleteByToken(tokenHash(bearerToken));
+      endSessionStreams(tokenHash(bearerToken), "logout");
     }
     if (cookieToken && cookieToken !== bearerToken) {
       await sessionRepository.deleteByToken(tokenHash(cookieToken));
+      endSessionStreams(tokenHash(cookieToken), "logout");
     }
     clearSessionCookie(res, req);
     sendJson(res, 200, { status: "logged_out" });
@@ -1957,56 +2412,99 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     // token (e.g. from before Task 18's cookie migration) 401'd callers who
     // had a perfectly valid cookie session. Fall through to the cookie only
     // when the bearer is present but doesn't resolve to a live session.
-    const authHeader = req.headers["authorization"];
-    const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : undefined;
-    const cookieToken = parseCookies(cookieHeaderOf(req))[SESSION_COOKIE];
+    try {
+      const authHeader = req.headers["authorization"];
+      const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : undefined;
+      const cookieToken = parseCookies(cookieHeaderOf(req))[SESSION_COOKIE];
 
-    let rawToken = bearerToken;
-    let session = rawToken ? await sessionRepository.findByToken(tokenHash(rawToken)) : undefined;
-    if (!session && cookieToken && cookieToken !== bearerToken) {
-      rawToken = cookieToken;
-      session = await sessionRepository.findByToken(tokenHash(rawToken));
-    }
-    if (!rawToken) {
-      sendJson(res, 401, { error: "Not authenticated" });
+      let rawToken = bearerToken;
+      let session = rawToken ? await sessionRepository.findByToken(tokenHash(rawToken)) : undefined;
+      if (!session && cookieToken && cookieToken !== bearerToken) {
+        rawToken = cookieToken;
+        session = await sessionRepository.findByToken(tokenHash(rawToken));
+      }
+      if (!rawToken) {
+        sendJson(res, 401, { error: "Not authenticated" });
+        return;
+      }
+      if (!session) {
+        sendJson(res, 401, { error: "Session expired or invalid" });
+        return;
+      }
+      const u = await userRepository.getById(session.tenantId, session.userId);
+      if (!u) {
+        sendJson(res, 401, { error: "User not found" });
+        return;
+      }
+      // Same rule as every other route (resolveSessionToken): a session of a user who is not active is not signed in.
+      const refusal = await refuseInactiveSession(tokenHash(rawToken), session, u);
+      if (refusal) {
+        // The refused session came from the cookie: drop the cookie too, as logout does, so the browser stops sending
+        // a credential that no longer works.
+        if (cookieToken !== undefined && cookieToken === rawToken) {
+          clearSessionCookie(res, req);
+        }
+        sendJson(res, 401, { error: refusal.error });
+        return;
+      }
+      const tenant = await tenantRepository.getById(session.tenantId);
+      // Silent upgrade: an existing localStorage/Bearer session gets an
+      // HttpOnly cookie issued the first time it hits /auth/me without one
+      // already present. Cookie-authenticated calls (bearerToken absent, or a
+      // stale bearer that fell through to a cookie above) never re-set —
+      // `!cookieToken` is false in both those cases, so nothing changed for
+      // them.
+      if (bearerToken && !cookieToken) {
+        setSessionCookie(res, bearerToken, req);
+      }
+      sendJson(res, 200, {
+        id: u.id,
+        email: u.email,
+        displayName: u.displayName,
+        roles: u.roles,
+        status: u.status,
+        tenantId: session.tenantId,
+        tenant
+      });
+      return;
+    } catch (error) {
+      // A session store that could not be reached says nothing about the session: 503 (the client retries), and the
+      // cookie is neither cleared nor revoked. Anything else propagates exactly as before.
+      if (classifyAuthFailure(error) !== "unavailable") {
+        throw error;
+      }
+      sendAuthUnavailable(res, { requestId: ctx.requestId, method, path }, "session", error);
       return;
     }
-    if (!session) {
-      sendJson(res, 401, { error: "Session expired or invalid" });
-      return;
-    }
-    const u = await userRepository.getById(session.tenantId, session.userId);
-    if (!u) {
-      sendJson(res, 401, { error: "User not found" });
-      return;
-    }
-    const tenant = await tenantRepository.getById(session.tenantId);
-    // Silent upgrade: an existing localStorage/Bearer session gets an
-    // HttpOnly cookie issued the first time it hits /auth/me without one
-    // already present. Cookie-authenticated calls (bearerToken absent, or a
-    // stale bearer that fell through to a cookie above) never re-set —
-    // `!cookieToken` is false in both those cases, so nothing changed for
-    // them.
-    if (bearerToken && !cookieToken) {
-      setSessionCookie(res, bearerToken, req);
-    }
-    sendJson(res, 200, {
-      id: u.id,
-      email: u.email,
-      displayName: u.displayName,
-      roles: u.roles,
-      status: u.status,
-      tenantId: session.tenantId,
-      tenant
-    });
-    return;
   }
 
   // ─── JWT / header auth ────────────────────────────────────────────────────
   let auth: AuthContext;
+  const authAttempt: AuthAttempt = { kind: "none" };
   try {
-    auth = await resolveAuth(req);
+    auth = await resolveAuth(req, authAttempt);
   } catch (error) {
+    // A store the credential is checked against that could not be reached is not a refused credential: 503, so the
+    // client retries instead of signing its user out. It is still a refusal: the request is not authenticated, and
+    // resolveAuth threw before any other credential or the dev-header fallback was tried.
+    if (classifyAuthFailure(error) === "unavailable") {
+      sendAuthUnavailable(res, { requestId: ctx.requestId, method, path }, authAttempt.kind, error);
+      return;
+    }
+    if (!(error instanceof AuthError)) {
+      // Not a deliberate refusal and not a recognised outage: answered 401 as it always was, and logged, so an
+      // outage shape missing from auth-failure.ts shows up instead of silently signing users out.
+      const failure = summarizeAuthFailure(error);
+      logger.warn("auth_failure_unclassified", {
+        requestId: ctx.requestId,
+        method,
+        path,
+        authKind: authAttempt.kind,
+        errorName: failure.name,
+        errorCode: failure.code,
+        error: failure.message
+      });
+    }
     const status = error instanceof AuthError ? error.status : 401;
     sendJson(res, status, { error: "unauthenticated", detail: error instanceof Error ? error.message : "auth failed" });
     return;
@@ -2063,7 +2561,12 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     res.setHeader("X-Accel-Buffering", "no");
     res.flushHeaders();
     res.write(": connected\n\n");
-    const clientId = sseHub.addClient(tenantId, res);
+    // Authorised here, once; the hub ends the stream when its user's or session's credential is revoked, and after
+    // its lifetime cap in any case (the web-app reconnects, and the reconnect is authorised afresh).
+    const clientId = sseHub.addClient(tenantId, res, {
+      userId: auth.subject,
+      sessionKey: sessionKeyByRequest.get(req)
+    });
     incCounter("sse_clients_connected_total", "SSE clients connected.", { service: "api-gateway" });
     req.on("close", () => sseHub.removeClient(tenantId, clientId));
     return;
@@ -2081,6 +2584,12 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return;
     }
     if (method === "POST") {
+      // A key minted by a key outlives the revocation of the key that minted it.
+      const gate = authorizeIdentityAdmin(auth);
+      if (!gate.ok) {
+        refuseIdentityChange(res, auth, tenantId, path, gate);
+        return;
+      }
       const body = await readJsonBody<{ name?: string; roles?: unknown }>(req);
       const nameCheck = boundedText(body.name, 120);
       if (!nameCheck.ok) {
@@ -2100,6 +2609,9 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         sendJson(res, 400, { error: `Unknown or disallowed roles: ${invalid.join(", ")}` });
         return;
       }
+      if (await refuseDeactivatedCaller(req, res, auth, tenantId, path)) {
+        return;
+      }
       const { key, record } = await apiKeyRepository.create(tenantId, {
         name: nameCheck.value,
         roles: [...new Set(body.roles as Role[])],
@@ -2111,6 +2623,35 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         resourceId: record.id,
         payload: { name: record.name, roles: record.roles, keyPrefix: record.keyPrefix }
       });
+      // Re-checked AFTER the insert as well: a suspension that wrote the status between the check above and this
+      // insert listed the creator's keys before this one existed, so it could not revoke it. Revoke it here and never
+      // show the secret — without the secret the key is unusable, so even a failed revoke leaks nothing.
+      if (await callerDeactivatedDuringWrite(req, auth, tenantId)) {
+        let revoked = false;
+        try {
+          revoked = await apiKeyRepository.revoke(tenantId, record.id);
+        } catch (error) {
+          logger.error("api_key_revoke_failed", {
+            tenantId,
+            keyId: record.id,
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
+        await audit(tenantId, auth, {
+          action: "api_key.revoked",
+          resourceType: "ApiKey",
+          resourceId: record.id,
+          payload: { reason: "caller_deactivated", revoked }
+        });
+        logger.warn("api_key_revoked_caller_deactivated", {
+          tenantId,
+          keyId: record.id,
+          subject: auth.subject,
+          revoked
+        });
+        sendJson(res, 401, { error: "unauthenticated", detail: "Account is not active" });
+        return;
+      }
       sendJson(res, 201, {
         key,
         note: "Store this key now — it is shown exactly once and only its hash is retained.",
@@ -2137,6 +2678,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 404, { error: "API key not found or already revoked" });
       return;
     }
+    endApiKeyStreams(tenantId, keyId, "api_key_revoked");
     await audit(tenantId, auth, { action: "api_key.revoked", resourceType: "ApiKey", resourceId: keyId, payload: {} });
     sendJson(res, 200, { status: "revoked", keyId });
     return;
@@ -2210,6 +2752,12 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         sendJson(res, 403, { error: "Only platform_owner/tenant_admin can create users" });
         return;
       }
+      // The response carries the new user's tempPassword: a human credential an API key must not mint.
+      const gate = authorizeIdentityAdmin(auth);
+      if (!gate.ok) {
+        refuseIdentityChange(res, auth, tenantId, path, gate);
+        return;
+      }
       const payload = await readJsonBody<CreateUserRequest>(req);
       if (!payload.email?.trim() || !payload.displayName?.trim() || !payload.roles?.length) {
         sendJson(res, 400, { error: "email, displayName, and roles are required" });
@@ -2229,9 +2777,17 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         sendJson(res, 400, { error: `Invalid roles: ${invalidRoles.join(", ")}` });
         return;
       }
+      const grant = authorizeRoleGrant(auth, payload.roles);
+      if (!grant.ok) {
+        refuseIdentityChange(res, auth, tenantId, path, grant);
+        return;
+      }
       const existingUser = await userRepository.findByEmailForAuth(emailTrimmed);
       if (existingUser) {
         sendJson(res, 409, { error: "A user with this email already exists" });
+        return;
+      }
+      if (await refuseDeactivatedCaller(req, res, auth, tenantId, path)) {
         return;
       }
       // Generate a temp password the admin must share with the invitee
@@ -2256,15 +2812,39 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
 
-  // POST /api/v1/users/:id/set-password — user sets their own password
+  // POST /api/v1/users/:id/set-password — a user sets their own password, or
+  // an admin resets the password of a user it could manage (never by API key)
   if (path.match(/^\/api\/v1\/users\/[^/]+\/set-password$/) && method === "POST") {
-    const userId = extractPathSegment(path, "/api/v1/users/");
-    if (!userId || !UUID.test(userId)) {
+    const rawUserId = extractPathSegment(path, "/api/v1/users/");
+    if (!rawUserId || !UUID.test(rawUserId)) {
       sendJson(res, 400, { error: "Invalid user id" });
       return;
     }
-    if (auth.subject !== userId && !hasAnyRole(auth, ["platform_owner", "tenant_admin"])) {
+    // UUID accepts either letter case; one canonical spelling for every comparison, write and audit row below.
+    const userId = rawUserId.toLowerCase();
+    if (!isSameUserId(auth.subject, userId) && !hasAnyRole(auth, ["platform_owner", "tenant_admin"])) {
       sendJson(res, 403, { error: "Can only change your own password" });
+      return;
+    }
+    // An API key is refused before the lookup, as on POST /users and PATCH
+    // /users/:id, so its answer never depends on the database and does not
+    // reveal whether the id exists.
+    const callerGate = authorizeHumanCaller(auth);
+    if (!callerGate.ok) {
+      refuseIdentityChange(res, auth, tenantId, path, callerGate);
+      return;
+    }
+    // The target's roles decide whether an admin may reset it; the lookup is
+    // tenant-scoped, so a foreign or unknown id stops here instead of a
+    // silent no-op update followed by an unscoped session wipe.
+    const target = await userRepository.getById(tenantId, userId);
+    if (!target) {
+      sendJson(res, 404, { error: "User not found" });
+      return;
+    }
+    const decision = authorizePasswordSet(auth, target);
+    if (!decision.ok) {
+      refuseIdentityChange(res, auth, tenantId, path, decision);
       return;
     }
     const body = await readJsonBody<{ password: string }>(req);
@@ -2272,8 +2852,18 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 400, { error: "Password must be at least 8 characters" });
       return;
     }
+    if (await refuseDeactivatedCaller(req, res, auth, tenantId, path)) {
+      return;
+    }
     await userRepository.updatePassword(tenantId, userId, await hashPassword(body.password));
-    await sessionRepository.deleteAllForUser(userId);
+    // A failed session delete must not turn a password that WAS changed into a 500 with no audit row.
+    const sessionsRevoked = await revokeUserSessions(tenantId, userId, auth, target.status, "password_set");
+    await audit(tenantId, auth, {
+      action: isSameUserId(auth.subject, userId) ? "user.password_changed" : "user.password_reset",
+      resourceType: "User",
+      resourceId: userId,
+      payload: { sessionsRevoked }
+    });
     sendJson(res, 200, { status: "password_updated" });
     return;
   }
@@ -2284,11 +2874,18 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 403, { error: "Insufficient role" });
       return;
     }
-    const userId = extractPathSegment(path, "/api/v1/users/");
-    if (!userId || !UUID.test(userId)) {
+    const gate = authorizeIdentityAdmin(auth);
+    if (!gate.ok) {
+      refuseIdentityChange(res, auth, tenantId, path, gate);
+      return;
+    }
+    const rawUserId = extractPathSegment(path, "/api/v1/users/");
+    if (!rawUserId || !UUID.test(rawUserId)) {
       sendJson(res, 400, { error: "Invalid user id" });
       return;
     }
+    // UUID accepts either letter case; one canonical spelling for every comparison, write and audit row below.
+    const userId = rawUserId.toLowerCase();
     const body = await readJsonBody<Record<string, unknown>>(req);
     const patch = validateUserPatch(body, VALID_ROLE_SET);
     if (!patch.ok) {
@@ -2297,7 +2894,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     }
     // Editing your own roles is how an admin locks themselves (or everyone)
     // out; require a second admin for role changes to self.
-    if (patch.value.roles && userId === auth.subject) {
+    if (patch.value.roles && isSameUserId(auth.subject, userId)) {
       sendJson(res, 403, { error: "cannot_change_own_roles" });
       return;
     }
@@ -2306,8 +2903,63 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 404, { error: "User not found" });
       return;
     }
-    if (patch.value.status) {
-      await userRepository.updateStatus(tenantId, userId, patch.value.status);
+    // Before any write: a tenant_admin can neither touch a platform_owner nor make one, and nobody changes their
+    // own status.
+    const decision = authorizeUserUpdate(auth, target, patch.value.roles, patch.value.status);
+    if (!decision.ok) {
+      refuseIdentityChange(res, auth, tenantId, path, decision);
+      return;
+    }
+    if (await refuseDeactivatedCaller(req, res, auth, tenantId, path)) {
+      return;
+    }
+    // Suspension is revocation: any status but active ends every session (and event stream) the user holds, now
+    // rather than at the session TTL. resolveSessionToken refuses such a user's sessions on every request as well,
+    // so a request that raced this one, or a revocation that failed after the status write, does not leave the user
+    // signed in. Reactivation revokes too: a session from before the suspension that was never presented since, one
+    // a failed revocation left behind, or one from a login that raced the suspension would otherwise come back.
+    //
+    // The API keys the user created go too, unless the admin sends keepApiKeys: true (validateUserPatch accepts it
+    // only with a status that takes the user out). Reactivation never restores a revoked key: the user, back, mints
+    // new ones.
+    let sessionsRevoked = false;
+    // What the response and the audit row say about the user's keys; empty unless the patch took the user out.
+    let keyReport: Record<string, unknown> = {};
+    let keyAudit: Record<string, unknown> = {};
+    const status = patch.value.status;
+    if (status !== undefined) {
+      const takesOut = !authorizeAccountStatus(status).ok;
+      if (!takesOut && !authorizeAccountStatus(target.status).ok) {
+        // Before the write: while the user is still inactive nobody can sign in as it, so everything this deletes
+        // is a leftover, and no session made after the reactivation is caught.
+        sessionsRevoked = await revokeUserSessions(tenantId, userId, auth, status, "user_reactivated");
+      }
+      await userRepository.updateStatus(tenantId, userId, status);
+      if (takesOut) {
+        sessionsRevoked = await revokeUserSessions(tenantId, userId, auth, status, "user_deactivated");
+        if (patch.value.keepApiKeys) {
+          const kept = await activeKeysCreatedBy(tenantId, userId, status);
+          keyReport = kept ? { keysCreatedByUser: kept } : {};
+          // The response keeps its shape, but the audit row must tell "listed, kept these" from "could not list".
+          keyAudit = {
+            keepApiKeys: true,
+            ...(kept ? { apiKeysKept: kept.map((key) => key.id) } : { apiKeysLookupFailed: true })
+          };
+        } else {
+          const revocation = await revokeKeysCreatedBy(tenantId, userId, auth, status);
+          if (revocation) {
+            keyReport = { apiKeysRevoked: revocation.revoked, apiKeysNotRevoked: revocation.notRevoked };
+            keyAudit = {
+              apiKeysRevoked: revocation.revoked.map((key) => key.id),
+              apiKeysNotRevoked: revocation.notRevoked.map((key) => key.id)
+            };
+          } else {
+            // Not listed, so none revoked: say so rather than answer an empty list that reads as "had none".
+            keyReport = { apiKeysLookupFailed: true };
+            keyAudit = { apiKeysLookupFailed: true };
+          }
+        }
+      }
     }
     let updated = patch.value.status ? { ...target, status: patch.value.status as User["status"] } : target;
     if (patch.value.roles) {
@@ -2320,9 +2972,12 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       action: "user.updated",
       resourceType: "User",
       resourceId: userId,
-      payload: { status: patch.value.status, roles: patch.value.roles }
+      payload: { status: patch.value.status, roles: patch.value.roles, sessionsRevoked, ...keyAudit }
     });
-    sendJson(res, 200, { ...updated });
+    // Key fields only when the user was taken out: apiKeysRevoked and apiKeysNotRevoked (or apiKeysLookupFailed) by
+    // default, keysCreatedByUser with keepApiKeys: true. Keys appear as id, name, prefix and createdAt, never a
+    // secret or hash. Every other response keeps the shape it had.
+    sendJson(res, 200, { ...updated, ...keyReport });
     return;
   }
 
@@ -2556,8 +3211,20 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         sendJson(res, 400, { error: "statusCallbackSecret must be at most 128 characters" });
         return;
       }
+      // SSRF: the worker POSTs to this URL on every message event. Same
+      // operator allowlist as the worker's delivery-time check.
+      const callbackUrl = parseStatusCallbackUrl(payload.statusCallbackUrl, config.outboundWebhookAllowlist);
+      if (!callbackUrl.ok) {
+        logger.warn("whatsapp_settings_callback_url_rejected", {
+          tenantId,
+          actor: auth.subject,
+          reason: callbackUrl.error
+        });
+        sendJson(res, 400, { error: callbackUrl.error });
+        return;
+      }
       const settings = await whatsappSettingsRepository.upsert(tenantId, {
-        statusCallbackUrl: payload.statusCallbackUrl?.trim() || undefined,
+        statusCallbackUrl: callbackUrl.value,
         statusCallbackSecret: payload.statusCallbackSecret?.trim() || undefined,
         graphVersion: payload.graphVersion?.trim() || config.whatsappGraphVersion,
         retryMaxAttempts: clampInt(payload.retryMaxAttempts, 1, 10, config.whatsappDefaultRetryMaxAttempts),

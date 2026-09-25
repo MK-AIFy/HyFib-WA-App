@@ -36,7 +36,9 @@ export const openApiSpec = {
       "(POST /auth/login) or a long-lived API key (Settings → API keys), both sent as " +
       "`Authorization: Bearer <token>`. All endpoints are tenant-scoped to your workspace. " +
       "Mutating requests are rate-limited per caller; responses use conventional status codes " +
-      "with `{error, detail?}` bodies on failure."
+      "with `{error, detail?}` bodies on failure. On any authenticated endpoint, 401 means the credential " +
+      "was refused (sign in again); 503 `auth_unavailable`, with a `Retry-After` header, means the server " +
+      "could not check it right now — retry the same credential after that many seconds."
   },
   servers: [{ url: "/", description: "This deployment" }],
   security: bearerAuth,
@@ -154,7 +156,17 @@ export const openApiSpec = {
         responses: {
           ...ok("Session created; token doubles as the Bearer credential"),
           "401": { description: "Invalid credentials" },
-          "429": { description: "Rate limited" }
+          "403": {
+            description:
+              "Correct credentials, but the account is not active (suspended, disabled or invited) or the organization is suspended"
+          },
+          "429": { description: "Rate limited" },
+          "503": {
+            description:
+              "auth_unavailable: the account store could not be reached, so the credentials were not checked. Retry after the Retry-After header's seconds.",
+            headers: { "Retry-After": { schema: { type: "integer" }, description: "Seconds to wait before retrying" } },
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } }
+          }
         }
       }
     },
@@ -342,7 +354,11 @@ export const openApiSpec = {
         parameters: [idParam("conversationId", "Conversation id")],
         responses: {
           "202": { description: "Enqueued on the durable outbox" },
-          "422": { description: "Contact opted out or payload invalid" }
+          "422": {
+            description:
+              "Contact opted out, payload invalid, or outside the 24h session window " +
+              "(error: outside_session_window — send a template instead)"
+          }
         }
       }
     },

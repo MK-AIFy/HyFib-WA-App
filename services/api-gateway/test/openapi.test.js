@@ -45,6 +45,16 @@ test("all $ref targets resolve to declared schemas", () => {
   }
 });
 
+test("an auth store that cannot be reached is documented as 503 with Retry-After, apart from a refused 401", () => {
+  const login = openApiSpec.paths["/auth/login"].post.responses;
+  assert.ok(login["401"], "login documents the refusal");
+  assert.ok(login["503"], "login documents the outage");
+  assert.match(login["503"].description, /auth_unavailable/);
+  assert.ok(login["503"].headers["Retry-After"], "the 503 carries a Retry-After");
+  assert.match(openApiSpec.info.description, /503 `auth_unavailable`/, "every authenticated endpoint can answer it");
+  assert.match(openApiSpec.info.description, /Retry-After/);
+});
+
 test("the core public surface is documented", () => {
   for (const path of [
     "/auth/login",

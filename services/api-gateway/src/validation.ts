@@ -1,4 +1,10 @@
-import type { TemplateComponent, WhatsAppContactCard, WhatsAppInteractivePayload } from "@hyfib/shared-core";
+import type {
+  OutboundAllowlist,
+  TemplateComponent,
+  WhatsAppContactCard,
+  WhatsAppInteractivePayload
+} from "@hyfib/shared-core";
+import { validateOutboundUrl } from "@hyfib/shared-core";
 
 export type ValidationResult<T> = { ok: true; value: T } | { ok: false; error: string };
 
@@ -56,6 +62,40 @@ export function parseOptionalIsoDate(
     return { ok: false, error: "date must be a valid ISO-8601 string" };
   }
   return { ok: true, value: new Date(ts).toISOString() };
+}
+
+/**
+ * Validates the tenant's statusCallbackUrl on the WhatsApp settings PUT
+ * (SSRF). Absent, null or blank still means "no callback"; anything else must
+ * pass the shared outbound-URL policy — http(s) only, no credentials, no
+ * private/reserved IP literals, no internal host names. The worker re-checks
+ * every delivery (including each resolved address), so this is the early,
+ * explicit rejection rather than the only line of defence. The value is kept
+ * trimmed but otherwise as supplied.
+ *
+ * `allowlist` is the operator's OUTBOUND_WEBHOOK_ALLOWLIST — pass the same one
+ * the worker delivers with so the two decisions agree. The error never
+ * mentions it: the allowlist is operator config, not tenant-visible.
+ */
+export function parseStatusCallbackUrl(
+  value: unknown,
+  allowlist?: OutboundAllowlist
+): ValidationResult<string | undefined> {
+  if (value === undefined || value === null) {
+    return { ok: true, value: undefined };
+  }
+  if (typeof value !== "string") {
+    return { ok: false, error: "statusCallbackUrl must be a string" };
+  }
+  const trimmed = value.trim();
+  if (trimmed === "") {
+    return { ok: true, value: undefined };
+  }
+  const checked = validateOutboundUrl(trimmed, { allowlist });
+  if (!checked.ok) {
+    return { ok: false, error: `Invalid statusCallbackUrl: ${checked.error}` };
+  }
+  return { ok: true, value: trimmed };
 }
 
 /** Clamps an optional integer into [min, max]; returns fallback when absent/invalid. */

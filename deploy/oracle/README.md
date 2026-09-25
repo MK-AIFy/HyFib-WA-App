@@ -70,6 +70,7 @@ Then `sudo systemctl restart hyfib-app`.
 | Restart app | `sudo systemctl restart hyfib-app` |
 | DB backup (manual run) | `sudo systemctl start hyfib-backup` — daily timer `hyfib-backup.timer` runs `scripts/backup.sh`; dumps in `/var/backups/hyfib` |
 | DB restore | `sudo bash -c "set -a; . /etc/hyfib/migrate.env; set +a; RESTORE_FORCE=1 bash /opt/hyfib/app/scripts/restore.sh /var/backups/hyfib/<dump>"` (stop `hyfib-app` first). It then verifies the channel-token key and exits 3 if the configured key cannot decrypt the restored tokens — see [DR-critical secrets](../../docs/runbooks/dr-drill.md#dr-critical-secrets). |
+| Tenant webhook URL audit (before deploying the SSRF guard or changing `OUTBOUND_WEBHOOK_ALLOWLIST`) | In the new build's checkout: `sudo bash -c "set -a; . /etc/hyfib/migrate.env; set +a; bash scripts/audit-status-callback-urls.sh --resolve"`. It is read-only and exits 1 if any stored callback URL would be blocked. See [outbound webhook allowlist](../../docs/runbooks/outbound-webhook-allowlist.md). |
 | Secrets / env | `/etc/hyfib/hyfib.env` (root-only, chmod 600). **Escrow `CHANNEL_ENCRYPTION_KEY` outside the VM and outside the backups** — it is in no dump; see [DR-critical secrets](../../docs/runbooks/dr-drill.md#dr-critical-secrets). |
 
 Layout on the VM: source is synced to `~/hyfib-src` (built there as the

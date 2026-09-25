@@ -1,3 +1,7 @@
+import { parseOutboundWebhookAllowlist, type OutboundWebhookAllowlist } from "./outbound-allowlist.js";
+
+export { parseOutboundWebhookAllowlist, type OutboundWebhookAllowlist } from "./outbound-allowlist.js";
+
 export interface DatabaseConfig {
   host: string;
   port: number;
@@ -70,6 +74,12 @@ export interface PlatformConfig {
   razorpayKeySecret: string;
   anthropicMaxTokens: number;
   aiDeterministicFallback: boolean;
+  /**
+   * Operator-only exceptions to the outbound-URL guard for tenant webhooks
+   * (OUTBOUND_WEBHOOK_ALLOWLIST). Empty lists mean no exceptions. Never
+   * tenant-settable and never returned by any API.
+   */
+  outboundWebhookAllowlist: OutboundWebhookAllowlist;
 }
 
 function parseNumber(name: string, value: string | undefined, fallback: number): number {
@@ -197,6 +207,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PlatformConfig
     razorpayKeyId: env.RAZORPAY_KEY_ID ?? "",
     razorpayKeySecret: env.RAZORPAY_KEY_SECRET ?? "",
     anthropicMaxTokens: parseNumber("ANTHROPIC_MAX_TOKENS", env.ANTHROPIC_MAX_TOKENS, 1500),
-    aiDeterministicFallback: parseBoolean(env.AI_DETERMINISTIC_FALLBACK, true)
+    aiDeterministicFallback: parseBoolean(env.AI_DETERMINISTIC_FALLBACK, true),
+    outboundWebhookAllowlist: parseOutboundWebhookAllowlist(env.OUTBOUND_WEBHOOK_ALLOWLIST)
   };
 }

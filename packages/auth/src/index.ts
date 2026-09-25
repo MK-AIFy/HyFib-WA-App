@@ -1,6 +1,10 @@
-import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
+import { jwtVerify, type JWTPayload, type JWTVerifyGetKey } from "jose";
 import type { PlatformConfig } from "@hyfib/config";
 import type { Role } from "@hyfib/shared-core";
+import { createRealmKeySet, type RealmKeySetOptions } from "./realm-key-set.js";
+import { isTokenVerdict } from "./token-verdict.js";
+
+export { DEFAULT_MAX_STALE_MS, DEFAULT_RETRY_INTERVAL_MS, type RealmKeySetOptions } from "./realm-key-set.js";
 
 export type CrmRole = "owner" | "admin" | "agent" | "viewer";
 
@@ -40,6 +44,21 @@ export class AuthError extends Error {
   }
 }
 
+/**
+ * The credential could not be checked, as opposed to being refused: verification reached no verdict on the token
+ * because something it depends on failed — most often the identity provider's signing keys (JWKS) could not be
+ * fetched: connection refused, timed out, an error status, a response that is not a key set. The same token may be
+ * accepted once that recovers, so this is deliberately not an AuthError, which callers answer with 401 and clients
+ * take as "sign in again". `cause` is the underlying error, for a caller that classifies it further (the gateway
+ * answers 503 only for outage shapes it recognises).
+ */
+export class AuthUnavailableError extends Error {
+  constructor(message: string, options: { cause: unknown }) {
+    super(message, options);
+    this.name = "AuthUnavailableError";
+  }
+}
+
 interface KeycloakClaims extends JWTPayload {
   tenant_id?: string;
   email?: string;
@@ -75,13 +94,33 @@ export interface Authenticator {
   authenticate(authorizationHeader: string | string[] | undefined): Promise<AuthContext>;
 }
 
+export interface AuthenticatorOptions {
+  /**
+   * Resolves the key a token was signed with. Defaults to the realm's JWKS (`config.keycloak.jwksUri`, see
+   * createRealmKeySet); tests inject one to exercise failures that are slow to provoke over the network, such as a
+   * fetch timeout.
+   */
+  keySet?: JWTVerifyGetKey;
+  /**
+   * How the realm's JWKS is fetched, cached, and ridden through an outage (see createRealmKeySet). Ignored when
+   * `keySet` is given.
+   */
+  realmKeySet?: RealmKeySetOptions;
+}
+
 /**
  * Builds an authenticator that validates Keycloak-issued JWTs against the
  * realm's published JWKS. Signature, issuer, audience and expiry are all
  * enforced by `jwtVerify`; there is no header-based trust fallback.
+ *
+ * A refused token throws AuthError (401). A token that could not be checked,
+ * because the JWKS could not be fetched, throws AuthUnavailableError instead.
+ * Through an outage of the JWKS endpoint, tokens are checked against the keys
+ * of its last successful fetch, for up to a day (see createRealmKeySet).
  */
-export function createAuthenticator(config: PlatformConfig): Authenticator {
-  const jwks = createRemoteJWKSet(new URL(config.keycloak.jwksUri));
+export function createAuthenticator(config: PlatformConfig, options: AuthenticatorOptions = {}): Authenticator {
+  const jwks: JWTVerifyGetKey =
+    options.keySet ?? createRealmKeySet(new URL(config.keycloak.jwksUri), options.realmKeySet);
 
   return {
     async authenticate(authorizationHeader): Promise<AuthContext> {
@@ -102,7 +141,11 @@ export function createAuthenticator(config: PlatformConfig): Authenticator {
         });
         payload = verified.payload;
       } catch (error) {
-        throw new AuthError(`Invalid token: ${error instanceof Error ? error.message : "verification failed"}`);
+        const detail = error instanceof Error ? error.message : "verification failed";
+        if (isTokenVerdict(error)) {
+          throw new AuthError(`Invalid token: ${detail}`);
+        }
+        throw new AuthUnavailableError(`Token could not be verified: ${detail}`, { cause: error });
       }
 
       if (!payload.sub) {
