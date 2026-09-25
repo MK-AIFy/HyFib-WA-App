@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { connect } from "node:net";
-import { AuthError } from "@hyfib/auth";
+import { AuthError, AuthUnavailableError } from "@hyfib/auth";
 import {
   AUTH_UNAVAILABLE_RETRY_AFTER_SECONDS,
   classifyAuthFailure,
@@ -194,6 +194,41 @@ test("failing to fetch the identity provider's signing keys (JWKS) is an outage,
   );
 });
 
+test("a key set the realm serves that jose cannot use is an outage: the realm's misconfiguration, never the token's", async () => {
+  // JSON that is not a key set at all: a proxy's JSON error body behind a 200, or a JWKS URI pointing elsewhere.
+  let notAKeySet;
+  try {
+    jose.createLocalJWKSet({ error: "Realm does not exist" });
+  } catch (caught) {
+    notAKeySet = caught;
+  }
+  assert.equal(notAKeySet?.code, "ERR_JWKS_INVALID", "jose accepts only a key set");
+  assert.equal(classifyAuthFailure(notAKeySet), "unavailable", `jose on a non-key-set: ${notAKeySet.message}`);
+
+  // A key set publishing a private key (the realm exposing a key's private half by mistake): a token's header can
+  // select that key, but only the realm put it there. Still a refusal either way; 503 only says a new sign-in will
+  // not help.
+  const { privateKey } = await jose.generateKeyPair("RS256", { extractable: true });
+  const token = await new jose.SignJWT({})
+    .setProtectedHeader({ alg: "RS256", kid: "p1" })
+    .setSubject("u")
+    .sign(privateKey);
+  const privateKeySet = jose.createLocalJWKSet({ keys: [{ ...(await jose.exportJWK(privateKey)), kid: "p1" }] });
+  const privateInSet = await jose.jwtVerify(token, privateKeySet).then(
+    () => assert.fail("jose refuses a key set member that is not a public key"),
+    (caught) => caught
+  );
+  assert.equal(privateInSet.code, "ERR_JWKS_INVALID", privateInSet.message);
+  assert.equal(classifyAuthFailure(privateInSet), "unavailable", privateInSet.message);
+
+  // As the authenticator (packages/auth) reports it: an AuthUnavailableError with jose's error as its cause.
+  const reported = new AuthUnavailableError(`Token could not be verified: ${notAKeySet.message}`, {
+    cause: notAKeySet
+  });
+  assert.equal(classifyAuthFailure(reported), "unavailable", "wrapped by the authenticator");
+  assert.equal(summarizeAuthFailure(reported).code, "ERR_JWKS_INVALID", "the log line names jose's code");
+});
+
 // ─── Credential: the gateway asked, and the answer was no ──────────────────
 
 test("an AuthError is a refusal made on purpose, and stays a credential failure whatever caused it", () => {
@@ -274,7 +309,6 @@ test("an error that cannot be positively identified as an outage keeps today's a
     ["a missing table", databaseError("42P01", 'relation "sessions" does not exist')],
     ["a permission problem", databaseError("42501", "permission denied for table sessions")],
     ["an unknown code", systemError("ESOMETHINGNEW")],
-    ["a malformed JWKS (a misconfigured identity provider, not a transient one)", new jose.errors.JWKSInvalid()],
     ["another JOSE failure", new jose.errors.JOSEError("something else")],
     ["a fetch failure with no cause", new TypeError("fetch failed")],
     ["an abort that is not a timeout", new DOMException("This operation was aborted", "AbortError")],
