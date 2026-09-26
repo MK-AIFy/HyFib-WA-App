@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Test double for pg_dump, used by scripts/test/*.test.mjs: writes a placeholder dump to --file=PATH, and appends
+# its invocation to FAKE_PSQL_LOG as "<PGOPTIONS>|pg_dump <arguments>", in the same log as the fake psql.
+#   FAKE_PG_DUMP_FAIL  any value -> fail as an unreachable server would (exit 1), writing nothing
+if [ -n "${FAKE_PSQL_LOG:-}" ]; then
+  printf '%s|pg_dump %s\n' "${PGOPTIONS:-}" "$*" >> "$FAKE_PSQL_LOG"
+fi
+if [ -n "${FAKE_PG_DUMP_FAIL:-}" ]; then
+  echo "pg_dump: error: connection to server failed" >&2
+  exit 1
+fi
+for arg in "$@"; do
+  case "$arg" in
+    --file=*) printf 'fake dump\n' > "${arg#--file=}" ;;
+  esac
+done
