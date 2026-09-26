@@ -12,9 +12,33 @@
 # Requires superuser/platform credentials (POSTGRES_USER/POSTGRES_PASSWORD) —
 # migrations run DDL and GRANT statements the low-privilege app role must not
 # hold. Run this at deploy time, not from application service startup.
+#
+# Usage: migrate.sh [--pending | --backup-first]
+#   (no argument)   apply every pending migration, in filename order
+#   --pending       list the pending migrations, one per line, and apply nothing
+#   --backup-first  if any migration is pending, first run scripts/backup.sh (BACKUP_DIR, BACKUP_RETENTION,
+#                   BACKUP_REMOTE_CMD as for that script), and apply nothing if the backup fails.
+#                   deploy/oracle/deploy.sh migrates this way.
+#
+# Every migration statement runs with lock_timeout (MIGRATE_LOCK_TIMEOUT, default 5s): a statement that cannot
+# get its lock in time fails, instead of queueing every app query on that table behind it for as long as it
+# waits. A file is recorded as applied only once all of it has run, so re-running retries a failed one from the
+# top: migrations must be safe to re-run (IF NOT EXISTS, CREATE OR REPLACE, ...). See docs/runbooks/rollback.md.
 set -euo pipefail
 
-INIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/infra/postgres/init"
+mode=apply
+case "${1:-}" in
+  "") ;;
+  --pending) mode=pending ;;
+  --backup-first) mode=backup-first ;;
+  *)
+    echo "usage: migrate.sh [--pending | --backup-first]" >&2
+    exit 2
+    ;;
+esac
+
+# MIGRATIONS_DIR: for tests; production always uses infra/postgres/init.
+INIT_DIR="${MIGRATIONS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/infra/postgres/init}"
 
 PGHOST="${POSTGRES_HOST:-localhost}"
 PGPORT="${POSTGRES_PORT:-5432}"
@@ -29,6 +53,42 @@ export POSTGRES_DB="$PGDATABASE"
 psql -v ON_ERROR_STOP=1 --username "$PGUSER" --dbname "$PGDATABASE" -c \
   "CREATE TABLE IF NOT EXISTS schema_migrations (filename TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now());" \
   >/dev/null
+
+# The migration files not yet recorded in schema_migrations, in filename order. It runs in a subshell, where
+# set -e does not reach, so a failed query is passed on explicitly rather than read as "not applied".
+pending_migrations() {
+  local file name applied
+  for file in "$INIT_DIR"/*; do
+    name="$(basename "$file")"
+    case "$name" in
+      *.sql|*.sh) ;;
+      *) continue ;;
+    esac
+    applied="$(psql -v ON_ERROR_STOP=1 --username "$PGUSER" --dbname "$PGDATABASE" -tAc \
+      "SELECT 1 FROM schema_migrations WHERE filename = '$name'")" || return 1
+    if [ "$applied" != "1" ]; then
+      echo "$name"
+    fi
+  done
+}
+
+if [ "$mode" != apply ]; then
+  pending="$(pending_migrations)"
+  if [ "$mode" = pending ]; then
+    if [ -n "$pending" ]; then
+      printf '%s\n' "$pending"
+    fi
+    exit 0
+  fi
+  if [ -n "$pending" ]; then
+    echo "Backing up before applying $(printf '%s\n' "$pending" | wc -l | tr -d ' ') pending migration(s)..."
+    bash "$(dirname "${BASH_SOURCE[0]}")/backup.sh"
+  fi
+fi
+
+# From here on, every statement a migration runs (a .sh migration's own psql calls included) gives up after
+# MIGRATE_LOCK_TIMEOUT waiting for a lock. Set after the backup: pg_dump must not give up on a lock that soon.
+export PGOPTIONS="${PGOPTIONS:+$PGOPTIONS }-c lock_timeout=${MIGRATE_LOCK_TIMEOUT:-5s}"
 
 applied_count=0
 skipped_count=0

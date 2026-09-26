@@ -39,6 +39,11 @@ The first run provisions the VM (~5–10 min: packages, secrets, firewall,
 systemd, Caddy) and then builds and starts the app. Re-run the same command
 any time to redeploy the current working tree.
 
+Every deploy checks the new build's config before touching the database,
+backs the database up first whenever a migration is pending, and, once the
+new build is healthy, records what it deployed in `/var/lib/hyfib/deploys.log`.
+To roll back, see the [rollback runbook](../../docs/runbooks/rollback.md).
+
 Afterwards:
 
 ```sh
@@ -70,6 +75,9 @@ Then `sudo systemctl restart hyfib-app`.
 | Restart app | `sudo systemctl restart hyfib-app` |
 | DB backup (manual run) | `sudo systemctl start hyfib-backup` — daily timer `hyfib-backup.timer` runs `scripts/backup.sh`; dumps in `/var/backups/hyfib` |
 | DB restore | `sudo bash -c "set -a; . /etc/hyfib/migrate.env; set +a; RESTORE_FORCE=1 bash /opt/hyfib/app/scripts/restore.sh /var/backups/hyfib/<dump>"` (stop `hyfib-app` first). It then verifies the channel-token key and exits 3 if the configured key cannot decrypt the restored tokens — see [DR-critical secrets](../../docs/runbooks/dr-drill.md#dr-critical-secrets). |
+| What is deployed / deploy history | `sudo tail -n 5 /var/lib/hyfib/deploys.log`: one line per deploy that came up healthy, giving the commit, the migrations it applied and the backup taken before them. The last line is what is running. |
+| Roll back a deploy | [Rollback runbook](../../docs/runbooks/rollback.md): redeploy the previous version (the usual case), or restore the pre-migration backup if data was damaged. |
+| Migration lock timeout | Each migration statement waits at most `MIGRATE_LOCK_TIMEOUT` (default `5s`) for a lock, then fails without being recorded, so the next deploy retries it. To change the timeout, set it in `/etc/hyfib/migrate.env`. |
 | Tenant webhook URL audit (before deploying the SSRF guard or changing `OUTBOUND_WEBHOOK_ALLOWLIST`) | In the new build's checkout: `sudo bash -c "set -a; . /etc/hyfib/migrate.env; set +a; bash scripts/audit-status-callback-urls.sh --resolve"`. It is read-only and exits 1 if any stored callback URL would be blocked. See [outbound webhook allowlist](../../docs/runbooks/outbound-webhook-allowlist.md). |
 | Secrets / env | `/etc/hyfib/hyfib.env` (root-only, chmod 600). **Escrow `CHANNEL_ENCRYPTION_KEY` outside the VM and outside the backups** — it is in no dump; see [DR-critical secrets](../../docs/runbooks/dr-drill.md#dr-critical-secrets). |
 
